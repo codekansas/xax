@@ -27,8 +27,6 @@ from tensorboard.plugins.mesh.plugin_data_pb2 import MeshPluginData
 from tensorboard.plugins.text.plugin_data_pb2 import TextPluginData
 from tensorboard.summary.writer.event_file_writer import EventFileWriter
 
-from xax.core.state import Phase
-
 ImageShape = Literal["HWC", "CHW", "HW", "NHWC", "NCHW", "NHW"]
 
 
@@ -581,18 +579,5 @@ class TensorboardWriters:
         }
 
     @functools.cached_property
-    def train_writer(self) -> TensorboardWriter:
-        return TensorboardWriter(self.log_directory / "train", **self.kwargs)
-
-    @functools.cached_property
-    def valid_writer(self) -> TensorboardWriter:
-        return TensorboardWriter(self.log_directory / "valid", **self.kwargs)
-
-    def writer(self, phase: Phase) -> TensorboardWriter:
-        match phase:
-            case "train":
-                return self.train_writer
-            case "valid":
-                return self.valid_writer
-            case _:
-                raise NotImplementedError(f"Unexpected phase: {phase}")
+    def writer(self) -> TensorboardWriter:
+        return TensorboardWriter(self.log_directory / "run", **self.kwargs)

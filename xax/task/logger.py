@@ -27,7 +27,6 @@ from typing import (
     Sequence,
     TypeVar,
     cast,
-    get_args,
 )
 
 import jax
@@ -38,7 +37,7 @@ from jaxtyping import Array
 from PIL import Image, ImageDraw, ImageFont
 from PIL.Image import Image as PILImage
 
-from xax.core.state import Phase, State
+from xax.core.state import State
 from xax.utils.experiments import ContextTimer, IntervalTicker
 from xax.utils.logging import LOG_ERROR_SUMMARY, LOG_PING, LOG_STATUS
 
@@ -460,7 +459,7 @@ class LoggerImpl(ABC):
         """
         super().__init__()
 
-        self.tickers = {phase: IntervalTicker(log_interval_seconds) for phase in get_args(Phase)}
+        self.ticker = IntervalTicker(log_interval_seconds)
 
     @abstractmethod
     def start(self) -> None: ...
@@ -527,7 +526,8 @@ class LoggerImpl(ABC):
             If the logger should log the current step.
         """
         elapsed_time = state.elapsed_time_s.item()
-        return self.tickers[state.phase].tick(elapsed_time)
+        should_log = self.ticker.tick(elapsed_time)
+        return should_log
 
 
 class ToastHandler(logging.Handler):

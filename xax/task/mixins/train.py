@@ -28,7 +28,7 @@ import optax
 from jaxtyping import Array, PRNGKeyArray, PyTree
 
 from xax.core.conf import field
-from xax.core.state import Batch, Output, Phase, State, StepKind
+from xax.core.state import Batch, Output, State, StepKind
 from xax.nn.functions import set_random_seed
 from xax.task.mixins.artifacts import ArtifactsConfig, ArtifactsMixin
 from xax.task.mixins.checkpointing import (
@@ -49,6 +49,7 @@ from xax.utils.experiments import (
     get_state_file_string,
     get_training_code,
 )
+from xax.utils.jax import jit as xax_jit
 from xax.utils.logging import LOG_PING, LOG_STATUS
 from xax.utils.types.frozen_dict import FrozenDict
 
@@ -105,6 +106,8 @@ class TrainConfig(
     ArtifactsConfig,
     RunnableConfig,
 ):
+    log_heavy_first_n_steps: int = field(1, help="Log heavy metrics for the first N steps")
+    log_heavy_every_n_seconds: int = field(60 * 5, help="Log heavy metrics every N seconds")
     max_steps: int | None = field(None, help="Maximum number of steps to run")
     step_kind: str = field("step", help=f"How to measure a step; one of [{', '.join(get_args(StepKind))}]")
     precision: Precision = field(Precision.BFLOAT16, help="Precision to use for the task")
@@ -124,7 +127,7 @@ class TrainMixin(
     Generic[Config, InitParamsT],
     ABC,
 ):
-    state_timers: dict[Phase, StateTimer]
+    state_timer: StateTimer
 
     _training_over_flag: bool
     _last_printed_remaining_time: float
@@ -137,7 +140,7 @@ class TrainMixin(
         set_random_seed(self.config.random_seed)
 
         # Timers for iterations.
-        self.state_timers = {phase: StateTimer() for phase in get_args(Phase)}
+        self.state_timer = StateTimer()
 
         # This flag can be toggled to end training from anywhere in the task.
         self._training_over_flag = False
@@ -170,17 +173,14 @@ class TrainMixin(
     def prng_key(self) -> PRNGKeyArray:
         return jax.random.PRNGKey(self.config.random_seed)
 
-    def log_train_step(
+    def log_light(
         self,
         model: PyTree,
         output: Output,
         metrics: FrozenDict[str, Array],
         state: State,
     ) -> None:
-        """Override this function to do logging during the training phase.
-
-        This function is called after the model forward pass and before the
-        backward pass. It is called in the training phase.
+        """Performs light-weight logging.
 
         Args:
             model: The current model.
@@ -190,17 +190,14 @@ class TrainMixin(
             state: The current training state.
         """
 
-    def log_valid_step(
+    def log_heavy(
         self,
         model: PyTree,
         output: Output,
         metrics: FrozenDict[str, Array],
         state: State,
     ) -> None:
-        """Override this function to do logging during the validation phase.
-
-        This function is called after the model forward pass. It is called in
-        the validation phase.
+        """Performs heavy-weight logging.
 
         Args:
             model: The current model.
@@ -211,7 +208,7 @@ class TrainMixin(
         """
 
     def log_state_timers(self, state: State) -> None:
-        timer = self.state_timers[state.phase]
+        timer = self.state_timer
         timer.step(state)
         for k, v in timer.log_dict().items():
             if isinstance(v, tuple):
@@ -220,14 +217,24 @@ class TrainMixin(
                 secondary = False
             self.logger.log_scalar(k, v, namespace="🕒 timers", secondary=secondary)
 
+    @xax_jit(static_argnames=["self"], donate_argnames=["state"], jit_level=3)
+    def get_log_mode(self, state: State) -> tuple[State, Array]:
+        log_heavy = jnp.where(
+            state.num_steps <= self.config.log_heavy_first_n_steps,
+            True,
+            state.elapsed_time_s - state.last_log_time_s >= self.config.log_heavy_every_n_seconds,
+        )
+        last_log_time_s = jnp.where(log_heavy, state.last_log_time_s, state.elapsed_time_s)
+        return state.replace(last_log_time_s=last_log_time_s), log_heavy
+
     def log_step(
         self,
         model: PyTree,
         output: Output,
         metrics: FrozenDict[str, Array],
         state: State,
-    ) -> None:
-        phase = state.phase
+    ) -> State:
+        state, log_heavy = self.get_log_mode(state)
 
         for k, v in metrics.items():
             if v.size == 1:
@@ -237,16 +244,14 @@ class TrainMixin(
 
         self.log_state_timers(state)
 
-        # Delegate to the appropriate logging function based on the phase.
-        match phase:
-            case "train":
-                self.log_train_step(model, output, metrics, state)
-            case "valid":
-                self.log_valid_step(model, output, metrics, state)
-            case _:
-                raise KeyError(f"Unknown phase: {phase}")
+        # Delegate to the appropriate logging function.
+        if log_heavy.item():
+            self.log_heavy(model, output, metrics, state)
+        else:
+            self.log_light(model, output, metrics, state)
 
         self.write_logs(state)
+        return state
 
     @abstractmethod
     def get_model(self, params: InitParamsT) -> PyTree | Sequence[PyTree]:

@@ -187,7 +187,6 @@ __all__ += [
     "LOG_STATUS",
     "NormType",
     "Output",
-    "Phase",
     "RawConfigType",
 ]
 
@@ -388,7 +387,6 @@ NAME_MAP.update(
         "LOG_STATUS": "utils.logging",
         "NormType": "nn.metrics",
         "Output": "task.mixins.output",
-        "Phase": "core.state",
         "RawConfigType": "task.base",
         "ActivationFunction": "nn.equinox",
         "DTYPE": "nn.equinox",
@@ -417,7 +415,7 @@ if IMPORT_ALL or TYPE_CHECKING:
         get_run_dir,
         load_user_config,
     )
-    from xax.core.state import Phase, State
+    from xax.core.state import State
     from xax.nn.attention import (
         AttentionCache,
         AttentionCacheDict,

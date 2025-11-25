@@ -67,7 +67,7 @@ class LoggingExample(xax.SupervisedTask[Config]):
         assert isinstance(mesh, trimesh.Trimesh)
         self.logger.log_mesh("test_mesh", vertices=np.array(mesh.vertices), faces=np.array(mesh.faces))
 
-    def get_data_iterator(self, phase: xax.Phase, key: PRNGKeyArray) -> Iterator[tuple[Array, Array]]:
+    def get_data_iterator(self, key: PRNGKeyArray) -> Iterator[tuple[Array, Array]]:
         xkey, ykey = jax.random.split(key)
         xs = jax.random.normal(xkey, (self.config.batch_size, self.config.dims))
         ys = jax.random.normal(ykey, (self.config.batch_size, self.config.dims))

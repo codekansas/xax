@@ -29,6 +29,7 @@ class Config(xax.SupervisedConfig):
     batch_size: int = xax.field(8)
     learning_rate: float = xax.field(1e-3)
     sequence_length: int = xax.field(1024)
+    log_heavy_every_n_seconds: int = xax.field(30)
     model_type: str = xax.field("lstm", help="The model to use")
 
 
@@ -249,7 +250,7 @@ class ShakespearePrediction(xax.SupervisedTask[Config]):
         y, yhat, mask = batch["input_ids"][:, 1:], output, batch["attention_mask"][:, 1:] == 1
         return optax.softmax_cross_entropy_with_integer_labels(logits=yhat, labels=y, where=mask).mean()
 
-    def log_valid_step(
+    def log_heavy(
         self,
         model: SequenceModel,
         output: Array,

@@ -224,7 +224,7 @@ class SupervisedMixin(
                     batches=tuple(itertools.islice(ds, self.config.updates_per_step)),
                     state=state,
                 )
-                self.log_step(eqx.combine(model_arr, model_static), output, metrics, state)
+                state = self.log_step(eqx.combine(model_arr, model_static), output, metrics, state)
                 self.on_step_end()
 
             state = state.replace(elapsed_time_s=state.elapsed_time_s + timer.elapsed_time)
@@ -286,12 +286,6 @@ class SupervisedMixin(
 
             # Shard the loaded samples.
             sharding = self.get_sharding()
-            # dl = DataLoader(ds, batch_size=self.config.batch_size)
-
-            # def dl_iter() -> Iterator[Batch]:
-            #     for batch in dl:
-            #         batch = jax.tree.map(lambda x: jnp.array(x.numpy()) if isinstance(x, Tensor) else x, batch)
-            #         yield jax.device_put(batch, sharding)
             ds = iter_samples(ds, sharding)
 
             try:

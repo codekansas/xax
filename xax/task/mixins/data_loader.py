@@ -3,12 +3,11 @@
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Callable, Generic, Iterator, TypeVar
+from typing import Any, Generic, Iterator, TypeVar
 
 import jax
 from datasets import Dataset, DatasetDict, IterableDataset, IterableDatasetDict
 from dpshdl.collate import collate
-from dpshdl.dataset import Dataset as DatasetWrapper
 from jax.sharding import NamedSharding
 from omegaconf import II
 
@@ -66,13 +65,10 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
 
     @abstractmethod
     def get_dataset(self) -> DatasetDict | Dataset | IterableDatasetDict | IterableDataset:
-        """Returns the dataset for the given phase.
-
-        Args:
-            phase: The phase for the dataset to return.
+        """Returns the dataset.
 
         Returns:
-            The dataset for the given phase.
+            The dataset to train on.
         """
 
     def get_data_iterator(self) -> IterableDataset:
