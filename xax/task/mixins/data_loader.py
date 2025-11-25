@@ -29,7 +29,6 @@ Tc_co = TypeVar("Tc_co", covariant=True)
 @dataclass
 class DataloadersConfig(ProcessConfig, BaseConfig):
     batch_size: int | None = field(None, help="Size of each batch")
-    drop_last_batch: bool = field(False, help="If set, drop the last batch if it is smaller than the batch size")
     raise_dataloader_errors: bool = field(False, help="If set, raise dataloader errors inside the worker processes")
     train_workers: int = field(II("xax.num_workers:-1"), help="Number of workers for loading training samples")
     valid_workers: int = field(1, help="Number of workers for loading validation samples")
@@ -101,11 +100,12 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
                 shuffle=phase == "train",
                 collate_fn=functools.partial(self.collate_fn, config=self.config),
                 num_workers=self.get_num_workers(phase),
-                drop_remainder=self.config.drop_last_batch,
+                drop_remainder=True,
                 prefetch=True,
                 num_test_batches=3,
             )
-            yield from map(_tf_to_jax, tfds)
+            while True:
+                yield from map(_tf_to_jax, tfds)
 
         elif isinstance(ds, IterableDataset):
             raise NotImplementedError("IterableDataset is not supported yet")

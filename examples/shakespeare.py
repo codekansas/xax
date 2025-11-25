@@ -258,13 +258,13 @@ class ShakespearePrediction(xax.SupervisedTask[Config]):
         metrics: xax.FrozenDict[str, Array],
         state: xax.State,
     ) -> None:
-        output_tokens = jnp.argmax(output, axis=-1)[0]
-        output_words = self.tokenizer.decode(output_tokens)
-        self.logger.log_string("teacher_forced_output", output_words)
+        # output_tokens = jnp.argmax(output, axis=-1)[0]
+        # output_words = self.tokenizer.decode(output_tokens)
+        # self.logger.log_string("teacher_forced_output", output_words)
 
         # Using the first few tokens from the batch, generate the rest of the sequence.
         prompt_seq = jnp.array(self.tokenizer.encode("To be"))
-        generated_tokens = model.generate_sequence(prompt_seq, max_len=500)
+        generated_tokens = model.generate_sequence(prompt_seq, max_len=32)
         generated_words = self.tokenizer.decode(generated_tokens)
         self.logger.log_string("prompt", self.tokenizer.decode(prompt_seq))
         self.logger.log_string("generated_output", generated_words)
