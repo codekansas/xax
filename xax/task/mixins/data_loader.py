@@ -38,15 +38,12 @@ Config = TypeVar("Config", bound=DataloadersConfig)
 
 
 def iter_samples(ds: IterableDataset, sharding: NamedSharding) -> Iterator[Batch]:
-    def _tf_to_jax_tree(arr: Any) -> Any:  # noqa: ANN401
-        return jax.device_put(arr, sharding)
-
     sample: Batch | None = None
     for next_sample in ds:
         if sample is None:
-            sample = _tf_to_jax_tree(next_sample)
+            sample = jax.device_put(next_sample, sharding)
             continue
-        next_sample = _tf_to_jax_tree(next_sample)
+        next_sample = jax.device_put(next_sample, sharding)
         yield sample
         sample = next_sample
 
