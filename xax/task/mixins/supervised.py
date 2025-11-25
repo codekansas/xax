@@ -216,15 +216,16 @@ class SupervisedMixin(
         while not self.is_training_over(state):
             with ContextTimer() as timer:
                 self.on_step_start()
+                batches = tuple(itertools.islice(ds, self.config.updates_per_step))
                 model_arr, opt_state, output, metrics, state = self.train_step(
                     model_arr=model_arr,
                     model_static=model_static,
                     optimizer=optimizer,
                     opt_state=opt_state,
-                    batches=tuple(itertools.islice(ds, self.config.updates_per_step)),
+                    batches=batches,
                     state=state,
                 )
-                state = self.log_step(eqx.combine(model_arr, model_static), output, metrics, state)
+                state = self.log_step(eqx.combine(model_arr, model_static), batches[-1], output, metrics, state)
                 self.on_step_end()
 
             state = state.replace(elapsed_time_s=state.elapsed_time_s + timer.elapsed_time)

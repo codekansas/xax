@@ -4,14 +4,22 @@ Run this example with `python -m examples.mnist`.
 """
 
 from dataclasses import dataclass
-from typing import Callable, Iterator
+from typing import Callable, TypedDict
 
 import equinox as eqx
 import jax
+import numpy as np
 import optax
+from datasets import Dataset, load_dataset
 from jaxtyping import Array, PRNGKeyArray, PyTree
+from PIL.Image import Image as PILImage
 
 import xax
+
+
+class Batch(TypedDict):
+    image: Array
+    label: Array
 
 
 @dataclass
@@ -78,50 +86,55 @@ class MnistClassification(xax.SupervisedTask[Config]):
     def get_optimizer(self) -> optax.GradientTransformation:
         return optax.adam(self.config.learning_rate)
 
-    def get_output(self, model: Model, batch: tuple[Array, Array], state: xax.State) -> Array:
-        x, _ = batch
-        return jax.vmap(model)(x)
+    def get_output(self, model: Model, batch: Batch, state: xax.State) -> Array:
+        return jax.vmap(model)(batch["image"])
 
-    def compute_loss(self, model: Model, batch: tuple[Array, Array], output: Array, state: xax.State) -> Array:
-        (_, y), yhat = batch, output
+    def compute_loss(self, model: Model, batch: Batch, output: Array, state: xax.State) -> Array:
+        y, yhat = batch["label"], output
         return xax.cross_entropy(y, yhat, axis=1)
 
     def compute_metrics(
         self,
         model: PyTree,
-        batch: tuple[Array, Array],
+        batch: Batch,
         output: Array,
         loss: Array,
         state: xax.State,
     ) -> dict[str, Array]:
-        _, y = batch
-        yhat = output.argmax(axis=1)
+        y, yhat = batch["label"], output.argmax(axis=1)
         return {
             "loss": loss,
             "acc": (yhat == y).astype(float).mean(),
         }
 
-    def log_valid_step(
+    def log_heavy(
         self,
         model: Model,
+        batch: Batch,
         output: Array,
         metrics: xax.FrozenDict[str, Array],
         state: xax.State,
     ) -> None:
         max_images = 16
         batch = jax.tree.map(lambda x: jax.device_get(x[:max_images]), batch)
-        (x, y), yhat = batch, output.argmax(axis=1)
+        x, y, yhat = batch["image"], batch["label"], output.argmax(axis=1)
         labels = [f"pred: {p}\ntrue: {t}" for p, t in zip(yhat[:max_images], y[:max_images], strict=True)]
         self.logger.log_labeled_images("predictions", (x, labels), max_images=max_images)
 
-    def get_data_iterator(self, key: PRNGKeyArray) -> Iterator:
-        ds = MNIST(train=phase == "train", root_dir=xax.get_data_dir() / "mnist", dtype="float32")
-        images, labels = jax.device_put((ds.images, ds.labels))
+    def get_dataset(self) -> Dataset:
+        ds = load_dataset("ylecun/mnist", split="train")
 
-        while True:
-            key, ind_key = jax.random.split(key)
-            indices = jax.random.randint(ind_key, (self.config.batch_size,), 0, images.shape[0])
-            yield images[indices], labels[indices]
+        def process_fn(example: dict) -> dict:
+            image: PILImage = example["image"]
+            label: int = example["label"]
+            return {
+                "image": np.array(image).astype(np.float32) / 255.0,
+                "label": label,
+            }
+
+        ds = ds.map(process_fn)
+        ds.set_format(type="numpy", columns=["image", "label"])
+        return ds
 
 
 if __name__ == "__main__":

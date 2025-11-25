@@ -193,36 +193,20 @@ class TrainMixin(
     def log_light(
         self,
         model: PyTree,
+        batch: Batch,
         output: Output,
         metrics: FrozenDict[str, Array],
         state: State,
-    ) -> None:
-        """Performs light-weight logging.
-
-        Args:
-            model: The current model.
-            batch: The batch from the dataloader.
-            output: The model output.
-            metrics: The metrics for the current batch.
-            state: The current training state.
-        """
+    ) -> None: ...
 
     def log_heavy(
         self,
         model: PyTree,
+        batch: Batch,
         output: Output,
         metrics: FrozenDict[str, Array],
         state: State,
-    ) -> None:
-        """Performs heavy-weight logging.
-
-        Args:
-            model: The current model.
-            batch: The batch from the dataloader.
-            output: The model output.
-            metrics: The metrics for the current batch.
-            state: The current training state.
-        """
+    ) -> None: ...
 
     def log_state_timers(self, state: State) -> None:
         timer = self.state_timer
@@ -247,6 +231,7 @@ class TrainMixin(
     def log_step(
         self,
         model: PyTree,
+        batch: Batch,
         output: Output,
         metrics: FrozenDict[str, Array],
         state: State,
@@ -264,9 +249,9 @@ class TrainMixin(
         # Delegate to the appropriate logging function.
         log_heavy_val = log_heavy.item()
         if log_heavy_val:
-            self.log_heavy(model, output, metrics, state)
+            self.log_heavy(model, batch, output, metrics, state)
         else:
-            self.log_light(model, output, metrics, state)
+            self.log_light(model, batch, output, metrics, state)
 
         self.write_logs(state, log_heavy_val)
         return state

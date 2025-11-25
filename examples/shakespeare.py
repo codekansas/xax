@@ -259,15 +259,15 @@ class ShakespearePrediction(xax.SupervisedTask[Config]):
     def log_heavy(
         self,
         model: SequenceModel,
+        batch: Batch,
         output: Array,
         metrics: xax.FrozenDict[str, Array],
         state: xax.State,
     ) -> None:
-        # Using the first few tokens from the batch, generate the rest of the sequence.
-        prompt_seq = jnp.array(self.tokenizer.encode("To be"))
-        generated_tokens = model.generate_sequence(prompt_seq, max_len=32)
+        prompt = "To be or not to be, that is the"
+        prompt_seq = jnp.array(self.tokenizer.encode(prompt))
+        generated_tokens = model.generate_sequence(prompt_seq, max_len=96)
         generated_words = self.tokenizer.decode(generated_tokens.tolist())
-        self.logger.log_string("prompt", self.tokenizer.decode(prompt_seq.tolist()))
         self.logger.log_string("generated_output", generated_words)
 
     def _tokenize(self, examples: dict[str, str]) -> dict[str, list[int]]:
