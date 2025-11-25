@@ -69,7 +69,8 @@ __all__ = [
     "SSMBlock",
     "BaseLauncher",
     "CliLauncher",
-    "SingleProcessLauncher",
+    "MultiDeviceLauncher",
+    "SingleDeviceLauncher",
     "LogDistribution",
     "LogError",
     "LogErrorSummary",
@@ -91,11 +92,13 @@ __all__ = [
     "TensorboardLogger",
     "load_ckpt",
     "CPUStatsOptions",
-    "DataloaderConfig",
+    "DataloadersConfig",
+    "DataloadersMixin",
     "GPUStatsOptions",
+    "ParallelConfig",
+    "ParallelMixin",
     "StepContext",
     "InitParams",
-    "ValidStepTimer",
     "Script",
     "ScriptConfig",
     "Config",
@@ -269,7 +272,8 @@ NAME_MAP: dict[str, str] = {
     "SSMBlock": "nn.ssm",
     "BaseLauncher": "task.launchers.base",
     "CliLauncher": "task.launchers.cli",
-    "SingleProcessLauncher": "task.launchers.single_process",
+    "MultiDeviceLauncher": "task.launchers.multi_device",
+    "SingleDeviceLauncher": "task.launchers.single_device",
     "LogDistribution": "task.logger",
     "LogError": "task.logger",
     "LogErrorSummary": "task.logger",
@@ -291,11 +295,13 @@ NAME_MAP: dict[str, str] = {
     "TensorboardLogger": "task.loggers.tensorboard",
     "load_ckpt": "task.mixins.checkpointing",
     "CPUStatsOptions": "task.mixins.cpu_stats",
-    "DataloaderConfig": "task.mixins.data_loader",
+    "DataloadersConfig": "task.mixins.data_loader",
+    "DataloadersMixin": "task.mixins.data_loader",
     "GPUStatsOptions": "task.mixins.gpu_stats",
+    "ParallelConfig": "task.mixins.parallel",
+    "ParallelMixin": "task.mixins.parallel",
     "StepContext": "task.mixins.step_wrapper",
     "InitParams": "task.mixins.train",
-    "ValidStepTimer": "task.mixins.train",
     "Script": "task.script",
     "ScriptConfig": "task.script",
     "Config": "task.task",
@@ -467,7 +473,8 @@ if IMPORT_ALL or TYPE_CHECKING:
     from xax.task.base import RawConfigType
     from xax.task.launchers.base import BaseLauncher
     from xax.task.launchers.cli import CliLauncher
-    from xax.task.launchers.single_process import SingleProcessLauncher
+    from xax.task.launchers.multi_device import MultiDeviceLauncher
+    from xax.task.launchers.single_device import SingleDeviceLauncher
     from xax.task.logger import (
         LogDistribution,
         LogError,
@@ -491,10 +498,11 @@ if IMPORT_ALL or TYPE_CHECKING:
     from xax.task.loggers.tensorboard import TensorboardLogger
     from xax.task.mixins.checkpointing import load_ckpt
     from xax.task.mixins.cpu_stats import CPUStatsOptions
-    from xax.task.mixins.data_loader import DataloaderConfig
+    from xax.task.mixins.data_loader import DataloadersConfig, DataloadersMixin
     from xax.task.mixins.gpu_stats import GPUStatsOptions
+    from xax.task.mixins.parallel import ParallelConfig, ParallelMixin
     from xax.task.mixins.step_wrapper import StepContext
-    from xax.task.mixins.train import Batch, InitParams, Output, ValidStepTimer
+    from xax.task.mixins.train import Batch, InitParams, Output
     from xax.task.script import Script, ScriptConfig
     from xax.task.task import Config, SupervisedConfig, SupervisedTask, Task
     from xax.utils.data.collate import CollateMode, collate, collate_non_null

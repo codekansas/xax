@@ -1,4 +1,4 @@
-"""Defines a mixin for running the training loop."""
+"""Defines a mixin for running the supervised training loop."""
 
 import bdb
 import itertools
@@ -282,11 +282,13 @@ class SupervisedMixin(
             # Handle user-defined interrupts during the training loop.
             self.add_signal_handler(on_exit, signal.SIGUSR1, signal.SIGTERM)
 
-            ds = self.get_data_iterator()
+            # Gets the sharding strategy.
+            mesh = self.get_mesh()
+            data_sharding = self.get_data_sharding(mesh)
+            model_sharding = self.get_model_sharding(mesh)
 
-            # Shard the loaded samples.
-            sharding = self.get_sharding()
-            ds = iter_samples(ds, sharding)
+            ds = self.get_data_iterator()
+            ds = iter_samples(ds, data_sharding)
 
             try:
                 self.train_loop(

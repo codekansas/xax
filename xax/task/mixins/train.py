@@ -39,6 +39,7 @@ from xax.task.mixins.checkpointing import (
 )
 from xax.task.mixins.data_loader import DataloadersConfig, DataloadersMixin
 from xax.task.mixins.logger import LoggerConfig, LoggerMixin
+from xax.task.mixins.parallel import ParallelConfig, ParallelMixin
 from xax.task.mixins.runnable import RunnableConfig, RunnableMixin
 from xax.task.mixins.step_wrapper import StepContextConfig, StepContextMixin
 from xax.utils.experiments import (
@@ -105,6 +106,7 @@ class TrainConfig(
     StepContextConfig,
     ArtifactsConfig,
     RunnableConfig,
+    ParallelConfig,
 ):
     log_heavy_first_n_steps: int = field(1, help="Log heavy metrics for the first N steps")
     log_heavy_every_n_seconds: int = field(60 * 5, help="Log heavy metrics every N seconds")
@@ -118,6 +120,7 @@ Config = TypeVar("Config", bound=TrainConfig)
 
 
 class TrainMixin(
+    ParallelMixin[Config],
     CheckpointingMixin[Config],
     DataloadersMixin[Config],
     LoggerMixin[Config],

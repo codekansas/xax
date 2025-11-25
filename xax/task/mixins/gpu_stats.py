@@ -4,10 +4,8 @@ This logs GPU memory and utilization in a background process using
 ``nvidia-smi``, if a GPU is available in the system.
 """
 
-import functools
 import logging
 import os
-import re
 import shutil
 import subprocess
 from ctypes import Structure, c_double, c_uint32
@@ -15,13 +13,14 @@ from dataclasses import dataclass
 from multiprocessing.context import BaseContext, Process
 from multiprocessing.managers import SyncManager, ValueProxy
 from multiprocessing.synchronize import Event
-from typing import Generic, Iterable, Pattern, TypeVar
+from typing import Generic, Iterable, TypeVar
 
 import jax
 
 from xax.core.conf import field
 from xax.task.mixins.logger import LoggerConfig, LoggerMixin
 from xax.task.mixins.process import ProcessConfig, ProcessMixin
+from xax.utils.devices import get_num_gpus, parse_number
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -40,8 +39,6 @@ class GPUStatsConfig(ProcessConfig, LoggerConfig):
 
 
 Config = TypeVar("Config", bound=GPUStatsConfig)
-
-NUMBER_REGEX: Pattern[str] = re.compile(r"[\d\.]+")
 
 
 class GPUStats(Structure):
@@ -68,29 +65,6 @@ class GPUStatsInfo:
             temperature=stats.temperature,
             utilization=stats.utilization,
         )
-
-
-@functools.lru_cache(maxsize=None)
-def get_num_gpus() -> int:
-    command = "nvidia-smi --query-gpu=index --format=csv --format=csv,noheader"
-
-    try:
-        with subprocess.Popen(command.split(), stdout=subprocess.PIPE, universal_newlines=True) as proc:
-            stdout = proc.stdout
-            assert stdout is not None
-            rows = iter(stdout.readline, "")
-            return len(list(rows))
-
-    except Exception:
-        logger.exception("Caught exception while trying to query `nvidia-smi`")
-        return 0
-
-
-def parse_number(s: str) -> float:
-    match = NUMBER_REGEX.search(s)
-    if match is None:
-        raise ValueError(s)
-    return float(match.group())
 
 
 def parse_gpu_stats(row: str) -> GPUStats:

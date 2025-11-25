@@ -10,7 +10,7 @@ import jax
 
 from xax.task.base import RawConfigType
 from xax.task.launchers.base import BaseLauncher
-from xax.task.mixins.gpu_stats import get_num_gpus
+from xax.utils.devices import get_num_gpus
 from xax.utils.logging import configure_logging
 
 if TYPE_CHECKING:
