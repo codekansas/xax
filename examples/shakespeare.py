@@ -241,10 +241,13 @@ class ShakespearePrediction(xax.SupervisedTask[Config]):
                 raise ValueError(f"Unknown model type: {self.config.model_type}")
 
     def get_optimizer(self) -> optax.GradientTransformation:
-        return optax.adamw(
+        opt = optax.adamw(
             learning_rate=self.config.learning_rate,
             weight_decay=0.01,
         )
+
+        # Gradient accumulation.
+        return optax.MultiSteps(opt, every_k_schedule=8)
 
     def get_output(self, model: SequenceModel, batch: Batch, state: xax.State) -> Array:
         return jax.vmap(model.predict_sequence)(batch["input_ids"][:, :-1])

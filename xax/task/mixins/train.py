@@ -13,11 +13,13 @@ from typing import (
     Generic,
     Literal,
     Mapping,
+    Protocol,
     Sequence,
     TypeVar,
     cast,
     get_args,
     overload,
+    runtime_checkable,
 )
 
 import equinox as eqx
@@ -57,6 +59,18 @@ from xax.utils.types.frozen_dict import FrozenDict
 logger = logging.getLogger(__name__)
 
 PRINT_FINISH_TIME_EVERY_N_SECONDS = 60 * 2
+
+
+@runtime_checkable
+class Optimizer(Protocol):
+    def init(self, params: optax.Params) -> optax.OptState: ...
+
+    def update(
+        self,
+        updates: optax.Updates,
+        state: optax.OptState,
+        params: optax.Params | None = None,
+    ) -> tuple[optax.Updates, optax.OptState]: ...
 
 
 def cast_step_kind(s: str) -> StepKind:
@@ -280,25 +294,28 @@ class TrainMixin(
         return models
 
     @abstractmethod
-    def get_optimizer(self) -> optax.GradientTransformation | Sequence[optax.GradientTransformation]:
+    def get_optimizer(self) -> Optimizer | Sequence[Optimizer]:
         """Gets the optimizer for the model.
 
         Returns:
             The optimizer to use to train the model.
         """
 
-    def _get_optimizers(self) -> list[optax.GradientTransformation]:
+    def _get_optimizers(self) -> list[Optimizer]:
         optimizers = self.get_optimizer()
-        if isinstance(optimizers, optax.GradientTransformation):
+        if isinstance(optimizers, Optimizer):
             optimizers = [optimizers]
         elif isinstance(optimizers, Sequence):
             optimizers = list(optimizers)
+        for opt in optimizers:
+            if not isinstance(opt, Optimizer):
+                raise ValueError(f"Optimizer {opt} is not a valid optimizer")
         return optimizers
 
     def get_initial_opt_state(
         self,
         models: list[PyTree],
-        optimizers: list[optax.GradientTransformation],
+        optimizers: list[Optimizer],
     ) -> list[optax.OptState]:
         return [opt.init(eqx.filter(model, eqx.is_array)) for model, opt in zip(models, optimizers, strict=True)]
 
@@ -316,17 +333,14 @@ class TrainMixin(
         params: InitParamsT,
         load_optimizer: Literal[True],
         model_sharding: jax.sharding.NamedSharding | None = None,
-    ) -> tuple[list[PyTree], list[optax.GradientTransformation], list[optax.OptState], State]: ...
+    ) -> tuple[list[PyTree], list[Optimizer], list[optax.OptState], State]: ...
 
     def load_initial_state(
         self,
         params: InitParamsT,
         load_optimizer: bool = False,
         model_sharding: jax.sharding.NamedSharding | None = None,
-    ) -> (
-        tuple[list[PyTree], State]
-        | tuple[list[PyTree], list[optax.GradientTransformation], list[optax.OptState], State]
-    ):
+    ) -> tuple[list[PyTree], State] | tuple[list[PyTree], list[Optimizer], list[optax.OptState], State]:
         init_ckpt_path = self.get_init_ckpt_path()
 
         def _shard(x: Any) -> Any:  # noqa: ANN401
@@ -376,7 +390,7 @@ class TrainMixin(
         init_params: InitParamsT,
         *,
         part: Literal["all"],
-    ) -> tuple[list[PyTree], list[optax.GradientTransformation], list[optax.OptState], State, Config]: ...
+    ) -> tuple[list[PyTree], list[Optimizer], list[optax.OptState], State, Config]: ...
 
     @overload
     def load_ckpt(
@@ -403,7 +417,7 @@ class TrainMixin(
         init_params: InitParamsT,
         *,
         part: Literal["opt"],
-    ) -> list[optax.GradientTransformation]: ...
+    ) -> list[Optimizer]: ...
 
     @overload
     def load_ckpt(
@@ -413,7 +427,7 @@ class TrainMixin(
         *,
         part: Literal["opt_state"],
         model: PyTree | None = None,
-        optimizer: optax.GradientTransformation | None = None,
+        optimizer: Optimizer | None = None,
     ) -> list[optax.OptState]: ...
 
     @overload
@@ -441,12 +455,12 @@ class TrainMixin(
         *,
         part: CheckpointPart = "all",
         model: PyTree | None = None,
-        optimizer: optax.GradientTransformation | None = None,
+        optimizer: Optimizer | None = None,
     ) -> (
-        tuple[list[PyTree], list[optax.GradientTransformation], list[optax.OptState], State, Config]
+        tuple[list[PyTree], list[Optimizer], list[optax.OptState], State, Config]
         | tuple[list[PyTree], State, Config]
         | list[PyTree]
-        | list[optax.GradientTransformation]
+        | list[Optimizer]
         | list[optax.OptState]
         | State
         | Config
