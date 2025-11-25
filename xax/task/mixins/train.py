@@ -224,7 +224,7 @@ class TrainMixin(
             True,
             state.elapsed_time_s - state.last_log_time_s >= self.config.log_heavy_every_n_seconds,
         )
-        last_log_time_s = jnp.where(log_heavy, state.last_log_time_s, state.elapsed_time_s)
+        last_log_time_s = jnp.where(log_heavy, state.elapsed_time_s, state.last_log_time_s)
         return state.replace(last_log_time_s=last_log_time_s), log_heavy
 
     def log_step(
@@ -245,12 +245,13 @@ class TrainMixin(
         self.log_state_timers(state)
 
         # Delegate to the appropriate logging function.
-        if log_heavy.item():
+        log_heavy_val = log_heavy.item()
+        if log_heavy_val:
             self.log_heavy(model, output, metrics, state)
         else:
             self.log_light(model, output, metrics, state)
 
-        self.write_logs(state)
+        self.write_logs(state, log_heavy_val)
         return state
 
     @abstractmethod

@@ -288,6 +288,7 @@ class LogGraph:
 @dataclass(kw_only=True)
 class LogLine:
     state: State
+    heavy: bool
     scalars: dict[str, dict[str, LogScalar]]
     distributions: dict[str, dict[str, LogDistribution]]
     histograms: dict[str, dict[str, LogHistogram]]
@@ -593,9 +594,10 @@ class Logger:
         """
         self.loggers.extend(logger)
 
-    def pack(self, state: State) -> LogLine:
+    def pack(self, state: State, heavy: bool) -> LogLine:
         return LogLine(
             state=state,
+            heavy=heavy,
             scalars={k: {kk: v() for kk, v in v.items()} for k, v in self.scalars.items()},
             distributions={k: {kk: v() for kk, v in v.items()} for k, v in self.distributions.items()},
             histograms={k: {kk: v() for kk, v in v.items()} for k, v in self.histograms.items()},
@@ -614,7 +616,7 @@ class Logger:
         self.videos.clear()
         self.meshes.clear()
 
-    def write(self, state: State) -> None:
+    def write(self, state: State, heavy: bool) -> None:
         """Writes the current step's logging information.
 
         Args:
@@ -624,7 +626,7 @@ class Logger:
         if not any(should_log):
             self.clear()
             return
-        line = self.pack(state)
+        line = self.pack(state, heavy)
         self.clear()
         for lg in (lg for lg, should_log in zip(self.loggers, should_log, strict=False) if should_log):
             lg.write(line)

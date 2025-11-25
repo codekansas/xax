@@ -579,5 +579,12 @@ class TensorboardWriters:
         }
 
     @functools.cached_property
-    def writer(self) -> TensorboardWriter:
-        return TensorboardWriter(self.log_directory / "run", **self.kwargs)
+    def light_writer(self) -> TensorboardWriter:
+        return TensorboardWriter(self.log_directory / "light", **self.kwargs)
+
+    @functools.cached_property
+    def heavy_writer(self) -> TensorboardWriter:
+        return TensorboardWriter(self.log_directory / "heavy", **self.kwargs)
+
+    def writer(self, heavy: bool) -> TensorboardWriter:
+        return self.heavy_writer if heavy else self.light_writer

@@ -143,9 +143,9 @@ class TensorboardLogger(LoggerImpl):
     def __del__(self) -> None:
         self.cleanup()
 
-    def get_writer(self) -> TensorboardWriter:
+    def get_writer(self, heavy: bool) -> TensorboardWriter:
         self._start()
-        return self.writers.writer
+        return self.writers.writer(heavy)
 
     def log_file(self, name: str, contents: str) -> None:
         if not is_master():
@@ -156,7 +156,7 @@ class TensorboardLogger(LoggerImpl):
         if not is_master():
             return
 
-        writer = self.get_writer()
+        writer = self.get_writer(line.heavy)
 
         global_step = line.state.num_steps.item()
         walltime = line.state.start_time_s.item() + line.state.elapsed_time_s.item()
