@@ -2,50 +2,19 @@
 """Trains a state space model on a character-level tokenized dataset of Shakespeare."""
 
 from dataclasses import dataclass
-from typing import Iterator, Protocol
+from functools import partial
+from typing import Protocol
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import optax
-import tensorflow_datasets as tfds
+from datasets import Dataset, load_dataset
 from jaxtyping import Array, PRNGKeyArray, PyTree
+from transformers import AutoTokenizer
+from transformers.models.qwen2.tokenization_qwen2_fast import Qwen2TokenizerFast
 
 import xax
-
-
-@dataclass(frozen=True)
-class ShakespeareDataset:
-    text: str
-    vocab: list[str]
-    token_to_id: dict[str, int]
-    id_to_token: dict[int, str]
-
-
-def load_shakespeare_text() -> ShakespeareDataset:
-    """Loads the Tiny Shakespeare dataset.
-
-    This function loads the tiny_shakespeare dataset from tfds, extracts the
-    text, and builds a character-level tokenizer.
-
-    Returns:
-        The loaded dataset.
-    """
-    ds = tfds.load("tiny_shakespeare", split="train", as_supervised=False)
-
-    # tiny_shakespeare consists of a single example with the full text.
-    for example in tfds.as_numpy(ds):
-        # the text field might be bytes, so decode if necessary.
-        text = example["text"]
-        if isinstance(text, bytes):
-            text = text.decode("utf-8")
-        break
-
-    # Build vocabulary from unique characters in the text.
-    vocab = sorted(list(set(text)))
-    token_to_id = {ch: i for i, ch in enumerate(vocab)}
-    id_to_token = {i: ch for i, ch in enumerate(vocab)}
-    return ShakespeareDataset(text, vocab, token_to_id, id_to_token)
 
 
 @dataclass
@@ -203,8 +172,7 @@ class ShakespearePrediction(xax.SupervisedTask[Config]):
     def __init__(self, config: Config) -> None:
         super().__init__(config)
 
-        self.ds = load_shakespeare_text()
-        self.token_ids = jnp.array([self.ds.token_to_id[c] for c in self.ds.text], dtype=jnp.int32)
+        self.tokenizer: Qwen2TokenizerFast = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
 
     def compute_metrics(
         self,
@@ -287,45 +255,41 @@ class ShakespearePrediction(xax.SupervisedTask[Config]):
         state: xax.State,
     ) -> None:
         output_tokens = jnp.argmax(output, axis=-1)[0]
-        output_words = "".join([self.ds.id_to_token[int(token)] for token in output_tokens])
+        output_words = self.tokenizer.decode(output_tokens)
         self.logger.log_string("teacher_forced_output", output_words)
 
         # Using the first few tokens from the batch, generate the rest of the sequence.
-        prompt_seq = jnp.array([self.ds.token_to_id[c] for c in "To be"])
+        prompt_seq = jnp.array(self.tokenizer.encode("To be"))
         generated_tokens = model.generate_sequence(prompt_seq, max_len=500)
-        generated_words = "".join([self.ds.id_to_token[int(token)] for token in generated_tokens])
-        self.logger.log_string("prompt", "".join([self.ds.id_to_token[int(token)] for token in prompt_seq]))
+        generated_words = self.tokenizer.decode(generated_tokens)
+        self.logger.log_string("prompt", self.tokenizer.decode(prompt_seq))
         self.logger.log_string("generated_output", generated_words)
 
-    def get_data_iterator(self, phase: xax.Phase, key: PRNGKeyArray) -> Iterator[tuple[Array, Array]]:
-        """Returns an iterator over batches of tokenized Shakespeare text.
+    def _tokenize(self, examples: dict[str, str]) -> dict[str, list[int]]:
+        return self.tokenizer(
+            examples["Text"],
+            truncation=True,
+            padding="max_length",
+            max_length=1024,
+        )
 
-        Args:
-            phase: The phase of the data iterator to return.
-            key: The PRNG key to use for the data iterator.
+    def get_dataset(self, phase: xax.Phase) -> Dataset:
+        ds = load_dataset("Trelis/tiny-shakespeare", split="train")
+        # Use functools.partial to create a serializable function for dataset fingerprinting
+        tokenize_fn = partial(_tokenize_with_tokenizer, tokenizer=self.tokenizer)
+        ds = ds.map(tokenize_fn, batched=True, remove_columns=ds.column_names)
+        ds.set_format(type="jax", columns=["input_ids", "attention_mask"])
+        return ds
 
-        Returns:
-            An iterator over batches of tokenized Shakespeare text, with
-            each batch consisting of a tuple of the input tokens and the
-            target tokens (shifted by one position).
-        """
-        seq_len = self.config.sequence_length
-        # Split the token_ids into training and validation sets.
-        if phase == "train":
-            token_ids = self.token_ids[: int(0.95 * len(self.token_ids))]
-        else:
-            token_ids = self.token_ids[int(0.95 * len(self.token_ids)) :]
-        n_tokens = token_ids.shape[0]
 
-        while True:
-            key, subkey = jax.random.split(key)
-            # Sample starting indices for each sequence in the batch.
-            idx = jax.random.randint(subkey, (self.config.batch_size,), 0, n_tokens - seq_len - 1)
-            # Build the batch: for each starting index, extract a sequence of length seq_len + 1.
-            batch_x = jnp.stack([token_ids[i : i + seq_len] for i in idx])
-            batch_y = jnp.stack([token_ids[i + 1 : i + seq_len + 1] for i in idx])
-            # One-hot encode the input sequences.
-            yield batch_x, batch_y
+def _tokenize_with_tokenizer(examples: dict[str, str], tokenizer: Qwen2TokenizerFast) -> dict[str, list[int]]:
+    """Standalone tokenization function that can be properly hashed for dataset fingerprinting."""
+    return tokenizer(
+        examples["Text"],
+        truncation=True,
+        padding="max_length",
+        max_length=1024,
+    )
 
 
 if __name__ == "__main__":
@@ -336,3 +300,4 @@ if __name__ == "__main__":
             model_type="ssm",
         )
     )
+

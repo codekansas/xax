@@ -213,7 +213,7 @@ def get_unused_port(default: int | None = None) -> int:
     return sock.getsockname()[1]
 
 
-OmegaConf.register_new_resolver("mlfab.unused_port", get_unused_port, replace=True)
+OmegaConf.register_new_resolver("xax.unused_port", get_unused_port, replace=True)
 
 
 def port_is_busy(port: int) -> int:

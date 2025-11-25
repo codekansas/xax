@@ -850,4 +850,4 @@ def num_workers(default: int) -> int:
     return min(default, max_workers)
 
 
-OmegaConf.register_new_resolver("mlfab.num_workers", num_workers, replace=True)
+OmegaConf.register_new_resolver("xax.num_workers", num_workers, replace=True)

@@ -2,7 +2,7 @@
 
 import time
 from dataclasses import dataclass
-from typing import Literal, NotRequired, TypedDict, Unpack, cast
+from typing import Any, Literal, NotRequired, TypedDict, Unpack, cast
 
 import jax
 import jax.numpy as jnp
@@ -12,6 +12,15 @@ from omegaconf import MISSING
 from xax.core.conf import field
 
 Phase = Literal["train", "valid"]
+
+
+# Batch = TypeVar("Batch")
+# Output = TypeVar("Output")
+
+Batch = Any
+Output = Any
+
+StepKind = Literal["step", "sample", "second"]
 
 
 def _phase_to_int(phase: Phase) -> int:

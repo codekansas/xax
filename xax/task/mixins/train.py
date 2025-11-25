@@ -1,5 +1,6 @@
 """Defines a mixin for running the training loop."""
 
+import enum
 import functools
 import itertools
 import logging
@@ -26,7 +27,7 @@ import optax
 from jaxtyping import Array, PRNGKeyArray, PyTree
 
 from xax.core.conf import field
-from xax.core.state import Phase, State
+from xax.core.state import Batch, Output, Phase, State, StepKind
 from xax.nn.functions import set_random_seed
 from xax.task.mixins.artifacts import ArtifactsConfig, ArtifactsMixin
 from xax.task.mixins.checkpointing import (
@@ -52,20 +53,17 @@ from xax.utils.types.frozen_dict import FrozenDict
 
 logger = logging.getLogger(__name__)
 
-# Batch = TypeVar("Batch")
-# Output = TypeVar("Output")
-
-Batch = Any
-Output = Any
-
-StepKind = Literal["step", "sample", "second"]
-
 PRINT_FINISH_TIME_EVERY_N_SECONDS = 60 * 2
 
 
 def cast_step_kind(s: str) -> StepKind:
     assert s in get_args(StepKind), f"`step_kind` must be one of {get_args(StepKind)}, not {s}"
     return cast(StepKind, s)
+
+
+class Precision(enum.Enum):
+    FLOAT32 = "float32"
+    BFLOAT16 = "bfloat16"
 
 
 @functools.lru_cache(maxsize=None)
@@ -169,6 +167,7 @@ class TrainConfig(
     valid_first_n_seconds: float | None = field(60.0, help="Run first validation after N seconds")
     max_steps: int | None = field(None, help="Maximum number of steps to run")
     step_kind: str = field("step", help=f"How to measure a step; one of [{', '.join(get_args(StepKind))}]")
+    precision: Precision = field(Precision.BFLOAT16, help="Precision to use for the task")
     random_seed: int = field(1337, help="Random seed for the task")
 
 
@@ -216,6 +215,15 @@ class TrainMixin(
 
         # The kind of step that was specified in the config.
         self._step_kind = cast_step_kind(self.config.step_kind)
+
+        # Update Jax configuration based on the precision.
+        match self.config.precision:
+            case Precision.FLOAT32:
+                jax.config.update("jax_default_matmul_precision", "float32")
+            case Precision.BFLOAT16:
+                jax.config.update("jax_default_matmul_precision", "bfloat16")
+            case _:
+                raise ValueError(f"Invalid precision: {self.config.precision}")
 
     def prng_key(self) -> PRNGKeyArray:
         return jax.random.PRNGKey(self.config.random_seed)

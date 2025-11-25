@@ -9,7 +9,6 @@ from typing import Callable, Iterator
 import equinox as eqx
 import jax
 import optax
-from dpshdl.impl.mnist import MNIST
 from jaxtyping import Array, PRNGKeyArray, PyTree
 
 import xax

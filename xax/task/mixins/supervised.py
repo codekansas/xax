@@ -1,7 +1,6 @@
 """Defines a mixin for running the training loop."""
 
 import bdb
-import contextlib
 import itertools
 import logging
 import signal
@@ -12,7 +11,6 @@ from abc import ABC
 from dataclasses import dataclass
 from threading import Thread
 from typing import (
-    Generator,
     Generic,
     Iterator,
     Sequence,
@@ -23,7 +21,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import optax
-from jaxtyping import Array, PRNGKeyArray, PyTree
+from jaxtyping import Array, PyTree
 
 from xax.core.conf import field
 from xax.core.state import State
@@ -199,8 +197,8 @@ class SupervisedMixin(
         models: Sequence[PyTree],
         optimizers: Sequence[optax.GradientTransformation],
         opt_states: Sequence[optax.OptState],
-        train_pf: Iterator[Batch],
-        valid_pf: Iterator[Batch],
+        train_ds: Iterator[Batch],
+        valid_ds: Iterator[Batch],
         state: State,
     ) -> None:
         if len(models) != 1 or len(optimizers) != 1 or len(opt_states) != 1:
@@ -219,7 +217,7 @@ class SupervisedMixin(
             if valid_step:
                 with ContextTimer() as timer:
                     state = state.replace(phase="valid")
-                    valid_batch = next(valid_pf)
+                    valid_batch = next(valid_ds)
                     output, metrics = self.val_step(model_arr, model_static, valid_batch, state)
                     self.log_step(eqx.combine(model_arr, model_static), valid_batch, output, metrics, state)
 
@@ -232,7 +230,7 @@ class SupervisedMixin(
             with ContextTimer() as timer:
                 state = self.on_step_start(state)
                 state = state.replace(phase="train")
-                train_batches = list(itertools.islice(train_pf, self.config.updates_per_step))
+                train_batches = list(itertools.islice(train_ds, self.config.updates_per_step))
                 model_arr, opt_state, output, metrics = self.train_step(
                     model_arr=model_arr,
                     model_static=model_static,
@@ -260,44 +258,6 @@ class SupervisedMixin(
         # After finishing training, save the final checkpoint.
         model = eqx.combine(model_arr, model_static)
         self.save_checkpoint(models=[model], optimizers=[optimizer], opt_states=[opt_state], state=state)
-
-    @contextlib.contextmanager
-    def get_train_iterator(self, key: PRNGKeyArray) -> Generator[Iterator[Batch], None, None]:
-        try:
-            train_iterator: Iterator[Batch] = self.get_data_iterator("train", key=key)
-            yield train_iterator
-            return
-        except NotImplementedError:
-            pass
-
-        train_ds = self.get_dataset("train")
-        train_dl = self.get_dataloader(train_ds, "train", prefetch_factor=self.config.updates_per_step + 1)
-        train_pf = self.get_prefetcher(train_dl)
-
-        try:
-            with train_pf as train_pf_ctx:
-                yield train_pf_ctx
-        finally:
-            logger.info("Closing train prefetcher")
-
-    @contextlib.contextmanager
-    def get_valid_iterator(self, key: PRNGKeyArray) -> Generator[Iterator[Batch], None, None]:
-        try:
-            valid_iterator: Iterator[Batch] = self.get_data_iterator("valid", key=key)
-            yield valid_iterator
-            return
-        except NotImplementedError:
-            pass
-
-        valid_ds = self.get_dataset("valid")
-        valid_dl = self.get_dataloader(valid_ds, "valid")
-        valid_pf = self.get_prefetcher(valid_dl)
-
-        try:
-            with valid_pf as valid_pf_ctx:
-                yield valid_pf_ctx
-        finally:
-            logger.info("Closing valid prefetcher")
 
     def run(self) -> None:
         self.run_training()
@@ -336,33 +296,34 @@ class SupervisedMixin(
             # Handle user-defined interrupts during the training loop.
             self.add_signal_handler(on_exit, signal.SIGUSR1, signal.SIGTERM)
 
-            key, tkey, vkey = jax.random.split(key, 3)
-            with self.get_train_iterator(tkey) as train_pf, self.get_valid_iterator(vkey) as valid_pf:
-                try:
-                    self.train_loop(
-                        models=models,
-                        optimizers=optimizers,
-                        opt_states=opt_states,
-                        train_pf=train_pf,
-                        valid_pf=valid_pf,
-                        state=state,
-                    )
+            train_ds = self.get_data_iterator("train")
+            valid_ds = self.get_data_iterator("valid")
 
-                except TrainingFinishedError:
-                    if is_master():
-                        num_steps, num_samples = int(state.num_steps), int(state.num_samples)
-                        show_info(f"Finished training after {num_steps} steps, {num_samples} samples", important=True)
-                    self.save_checkpoint(models=models, optimizers=optimizers, opt_states=opt_states, state=state)
+            try:
+                self.train_loop(
+                    models=models,
+                    optimizers=optimizers,
+                    opt_states=opt_states,
+                    train_ds=train_ds,
+                    valid_ds=valid_ds,
+                    state=state,
+                )
 
-                except (KeyboardInterrupt, bdb.BdbQuit):
-                    if is_master():
-                        show_info("Interrupted training", important=True)
+            except TrainingFinishedError:
+                if is_master():
+                    num_steps, num_samples = int(state.num_steps), int(state.num_samples)
+                    show_info(f"Finished training after {num_steps} steps, {num_samples} samples", important=True)
+                self.save_checkpoint(models=models, optimizers=optimizers, opt_states=opt_states, state=state)
 
-                except BaseException:
-                    exception_tb = textwrap.indent(highlight_exception_message(traceback.format_exc()), "  ")
-                    sys.stdout.write(f"Caught exception during training loop:\n\n{exception_tb}\n")
-                    sys.stdout.flush()
-                    self.save_checkpoint(models=models, optimizers=optimizers, opt_states=opt_states, state=state)
+            except (KeyboardInterrupt, bdb.BdbQuit):
+                if is_master():
+                    show_info("Interrupted training", important=True)
 
-                finally:
-                    state = self.on_training_end(state)
+            except BaseException:
+                exception_tb = textwrap.indent(highlight_exception_message(traceback.format_exc()), "  ")
+                sys.stdout.write(f"Caught exception during training loop:\n\n{exception_tb}\n")
+                sys.stdout.flush()
+                self.save_checkpoint(models=models, optimizers=optimizers, opt_states=opt_states, state=state)
+
+            finally:
+                state = self.on_training_end(state)

@@ -163,7 +163,7 @@ class BaseTask(Generic[Config]):
         raise ValueError(
             "The config class could not be parsed from the generic type, which usually means that the task is not "
             "being instantiated correctly. Your class should be defined as follows:\n\n"
-            "  class ExampleTask(mlfab.Task[Config]):\n      ...\n\nThis lets the both the task and the type "
+            "  class ExampleTask(xax.SupervisedTask[Config]):\n      ...\n\nThis lets the both the task and the type "
             "checker know what config the task is using."
         )
 

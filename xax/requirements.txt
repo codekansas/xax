@@ -3,13 +3,13 @@
 # Core ML/JAX dependencies
 attrs
 chex
-dpshdl
 equinox
 importlib-resources
 jax
 jaxtyping
 optax
 orbax-checkpoint
+tensorflow
 
 # Data processing and serialization
 pillow
