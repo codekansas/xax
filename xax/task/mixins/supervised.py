@@ -149,7 +149,7 @@ class SupervisedMixin(
 
     @xax_jit(
         static_argnames=["self", "model_static", "optimizer"],
-        donate_argnames=["model_arr", "opt_state", "batches", "state"],
+        donate_argnames=["model_arr", "opt_state", "batches"],
         jit_level=3,
     )
     def train_step(
@@ -191,7 +191,7 @@ class SupervisedMixin(
 
     @xax_jit(
         static_argnames=["self", "model_static"],
-        donate_argnames=["model_arr", "batch", "state"],
+        donate_argnames=["batch"],
         jit_level=3,
     )
     def val_step(
