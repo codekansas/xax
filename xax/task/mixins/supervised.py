@@ -126,7 +126,11 @@ class SupervisedMixin(
         metrics = self.compute_metrics(model, batch, output, loss, state)
         return loss, (output, metrics)
 
-    @xax_jit(static_argnames=["self", "model_static", "optimizer"], jit_level=3)
+    @xax_jit(
+        static_argnames=["self", "model_static", "optimizer"],
+        donate_argnames=["model_arr", "opt_state", "batch", "state"],
+        jit_level=3,
+    )
     def update(
         self,
         model_arr: PyTree,
@@ -143,7 +147,11 @@ class SupervisedMixin(
         model_arr = eqx.apply_updates(model_arr, updates)
         return model_arr, opt_state, output, metrics
 
-    @xax_jit(static_argnames=["self", "model_static", "optimizer"], jit_level=3)
+    @xax_jit(
+        static_argnames=["self", "model_static", "optimizer"],
+        donate_argnames=["model_arr", "opt_state", "batches", "state"],
+        jit_level=3,
+    )
     def train_step(
         self,
         model_arr: PyTree,
@@ -181,7 +189,11 @@ class SupervisedMixin(
 
         return model_arr, opt_state, output, metrics
 
-    @xax_jit(static_argnames=["self", "model_static"], jit_level=3)
+    @xax_jit(
+        static_argnames=["self", "model_static"],
+        donate_argnames=["model_arr", "batch", "state"],
+        jit_level=3,
+    )
     def val_step(
         self,
         model_arr: PyTree,

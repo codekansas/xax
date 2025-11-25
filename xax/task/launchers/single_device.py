@@ -1,4 +1,4 @@
-"""Defines a launcher to train a model locally, in a single process."""
+"""Defines a launcher to train a model locally, on a single device."""
 
 import logging
 import os
@@ -116,7 +116,7 @@ def configure_devices(logger: logging.Logger | None = None) -> None:
         configure_gpu_devices(logger)
 
 
-def run_single_process_training(
+def run_training(
     task: "type[RunnableMixin[Config]]",
     *cfgs: RawConfigType,
     use_cli: bool | list[str] = True,
@@ -129,7 +129,7 @@ def run_single_process_training(
     task_obj.run()
 
 
-class SingleProcessLauncher(BaseLauncher):
+class SingleDeviceLauncher(BaseLauncher):
     def launch(
         self,
         task: "type[RunnableMixin[Config]]",
@@ -138,4 +138,4 @@ class SingleProcessLauncher(BaseLauncher):
     ) -> None:
         logger = configure_logging()
         configure_devices(logger)
-        run_single_process_training(task, *cfgs, use_cli=use_cli, logger=logger)
+        run_training(task, *cfgs, use_cli=use_cli, logger=logger)

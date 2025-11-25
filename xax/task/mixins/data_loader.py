@@ -1,5 +1,6 @@
 """Defines a mixin for instantiating dataloaders."""
 
+import functools
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ import jax
 import tensorflow as tf
 from datasets import Dataset, DatasetDict, IterableDataset, IterableDatasetDict
 from datasets.utils.tf_utils import minimal_tf_collate_fn
+from jax.sharding import NamedSharding, PartitionSpec as P
 from jaxtyping import Array
 from omegaconf import II
 
@@ -73,37 +75,47 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
             The dataset for the given phase.
         """
 
-    def _tf_to_jax(self, arr: Any) -> Array:  # noqa: ANN401
+    def get_sharding(self) -> NamedSharding:
+        ndevices = jax.local_device_count()
+        mesh = jax.make_mesh((ndevices,), axis_names=("batch",))
+        return jax.sharding.NamedSharding(mesh, P("batch"))
+
+    def _tf_to_jax(self, arr: Any, sharding: NamedSharding) -> Array:  # noqa: ANN401
         if isinstance(arr, tf.Tensor):
-            dl = tf.experimental.dlpack.to_dlpack(arr)
-            return jax.dlpack.from_dlpack(dl)
+            return jax.device_put(arr.numpy(), sharding)
         return arr
 
     def get_data_iterator(self, phase: Phase) -> Iterator[Batch]:
         ds = self.get_dataset(phase)
+        sharding = self.get_sharding()
+
+        def _tf_to_jax(arr: Any) -> Any:  # noqa: ANN401
+            return jax.tree.map(functools.partial(self._tf_to_jax, sharding=sharding), arr)
+
         if isinstance(ds, DatasetDict):
             raise NotImplementedError("DatasetDict is not supported yet")
+
         elif isinstance(ds, Dataset):
             tfds = ds.to_tf_dataset(
                 batch_size=self.batch_size,
                 shuffle=phase == "train",
-                collate_fn=self.collate_fn,
+                collate_fn=functools.partial(self.collate_fn, config=self.config),
                 num_workers=self.get_num_workers(phase),
                 drop_remainder=self.config.drop_last_batch,
                 prefetch=True,
                 num_test_batches=3,
             )
-            tfds = tfds.batch(self.batch_size).prefetch(tf.data.AUTOTUNE)
-            for sample in tfds:
-                sample = jax.tree.map(self._tf_to_jax, sample)
-                breakpoint()
-                yield sample
+            yield from map(_tf_to_jax, tfds)
+
         elif isinstance(ds, IterableDataset):
             raise NotImplementedError("IterableDataset is not supported yet")
+
         elif isinstance(ds, IterableDatasetDict):
             raise NotImplementedError("IterableDatasetDict is not supported yet")
+
         else:
             raise NotImplementedError(f"Unsupported dataset type: {type(ds)}")
 
-    def collate_fn(self, features: Any) -> Batch:  # noqa: ANN401
-        return minimal_tf_collate_fn(features)
+    @classmethod
+    def collate_fn(cls, items: list[Any], config: Config) -> Batch:
+        return minimal_tf_collate_fn(items)

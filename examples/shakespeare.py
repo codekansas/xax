@@ -3,7 +3,7 @@
 
 from dataclasses import dataclass
 from functools import partial
-from typing import Protocol
+from typing import Protocol, TypedDict
 
 import equinox as eqx
 import jax
@@ -17,10 +17,13 @@ from transformers.models.qwen2.tokenization_qwen2_fast import Qwen2TokenizerFast
 import xax
 
 
+class Batch(TypedDict):
+    attention_mask: Array
+    input_ids: Array
+
+
 @dataclass
 class Config(xax.SupervisedConfig):
-    input_size: int = xax.field(65)
-    output_size: int = xax.field(65)
     num_layers: int = xax.field(4)
     hidden_size: int = xax.field(256)
     batch_size: int = xax.field(12)
@@ -174,16 +177,19 @@ class ShakespearePrediction(xax.SupervisedTask[Config]):
 
         self.tokenizer: Qwen2TokenizerFast = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
 
+    @property
+    def vocab_size(self) -> int:
+        return len(self.tokenizer)
+
     def compute_metrics(
         self,
         model: PyTree,
-        batch: tuple[Array, Array],
+        batch: Batch,
         output: Array,
         loss: Array,
         state: xax.State,
     ) -> dict[str, Array]:
-        _, y = batch
-        yhat = output.argmax(axis=-1)
+        y, yhat = batch["input_ids"][:, 1:], output.argmax(axis=-1)
         return {
             "loss": loss,
             "acc": (yhat == y).astype(float).mean(),
@@ -193,25 +199,25 @@ class ShakespearePrediction(xax.SupervisedTask[Config]):
         match self.config.model_type:
             case "rnn":
                 return RNN(
-                    input_size=self.config.input_size,
+                    input_size=self.vocab_size,
                     hidden_size=self.config.hidden_size,
-                    output_size=self.config.output_size,
+                    output_size=self.vocab_size,
                     num_layers=self.config.num_layers,
                     key=params.key,
                 )
             case "lstm":
                 return LSTM(
-                    input_size=self.config.input_size,
+                    input_size=self.vocab_size,
                     hidden_size=self.config.hidden_size,
-                    output_size=self.config.output_size,
+                    output_size=self.vocab_size,
                     num_layers=self.config.num_layers,
                     key=params.key,
                 )
             case "ssm":
                 return xax.SSM(
-                    input_size=self.config.input_size,
+                    input_size=self.vocab_size,
                     hidden_size=self.config.hidden_size,
-                    output_size=self.config.output_size,
+                    output_size=self.vocab_size,
                     num_layers=self.config.num_layers,
                     block_type="diagonal",
                     skip_connections=True,
@@ -220,12 +226,12 @@ class ShakespearePrediction(xax.SupervisedTask[Config]):
                 )
             case "transformer":
                 return xax.Transformer(
-                    vocab_size=self.config.input_size,
+                    vocab_size=self.vocab_size,
                     embed_dim=self.config.hidden_size,
                     num_heads=self.config.hidden_size // 64,
                     ff_dim=self.config.hidden_size * 4,
                     num_layers=self.config.num_layers,
-                    output_size=self.config.output_size,
+                    output_size=self.vocab_size,
                     key=params.key,
                 )
             case _:
@@ -237,14 +243,12 @@ class ShakespearePrediction(xax.SupervisedTask[Config]):
             weight_decay=0.01,
         )
 
-    def get_output(self, model: SequenceModel, batch: tuple[Array, Array], state: xax.State) -> Array:
-        x_batched, _ = batch
-        return jax.vmap(model.predict_sequence)(x_batched)
+    def get_output(self, model: SequenceModel, batch: Batch, state: xax.State) -> Array:
+        return jax.vmap(model.predict_sequence)(batch["input_ids"][:, :-1])
 
-    def compute_loss(self, model: SequenceModel, batch: tuple[Array, Array], output: Array, state: xax.State) -> Array:
-        (_, y), yhat = batch, output
-        labels = jax.nn.one_hot(y, yhat.shape[-1])
-        return optax.softmax_cross_entropy(logits=yhat, labels=labels).mean()
+    def compute_loss(self, model: SequenceModel, batch: Batch, output: Array, state: xax.State) -> Array:
+        y, yhat, mask = batch["input_ids"][:, 1:], output, batch["attention_mask"][:, 1:] == 1
+        return optax.softmax_cross_entropy_with_integer_labels(logits=yhat, labels=y, where=mask).mean()
 
     def log_valid_step(
         self,
@@ -300,4 +304,3 @@ if __name__ == "__main__":
             model_type="ssm",
         )
     )
-
