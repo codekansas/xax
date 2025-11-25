@@ -345,9 +345,9 @@ class TrainMixin(
             if not load_optimizer:
                 return model, state
 
-            optimizer = self.load_ckpt(init_ckpt_path, params, part="opt")
-            opt_state = self.load_ckpt(init_ckpt_path, params, part="opt_state", model=model, optimizer=optimizer)
-            return model, optimizer, opt_state, state
+            optimizers = self.load_ckpt(init_ckpt_path, params, part="opt")
+            opt_states = self.load_ckpt(init_ckpt_path, params, part="opt_state", model=model, optimizer=optimizers)
+            return model, optimizers, opt_states, state
 
         logger.info("Starting a new training run")
         models = self._get_models(params)
@@ -411,8 +411,8 @@ class TrainMixin(
         init_params: InitParamsT,
         *,
         part: Literal["opt_state"],
-        model: PyTree | None = None,
-        optimizer: Optimizer | None = None,
+        model: PyTree | list[PyTree] | None = None,
+        optimizer: Optimizer | list[Optimizer] | None = None,
     ) -> list[optax.OptState]: ...
 
     @overload
@@ -439,8 +439,8 @@ class TrainMixin(
         init_params: InitParamsT,
         *,
         part: CheckpointPart = "all",
-        model: PyTree | None = None,
-        optimizer: Optimizer | None = None,
+        model: PyTree | list[PyTree] | None = None,
+        optimizer: Optimizer | list[Optimizer] | None = None,
     ) -> (
         tuple[list[PyTree], list[Optimizer], list[optax.OptState], State, Config]
         | tuple[list[PyTree], State, Config]
@@ -473,8 +473,10 @@ class TrainMixin(
                     model = load_ckpt(path, part="model", model_templates=model_specs)
                 if optimizer is None:
                     optimizer_specs = eqx.filter_eval_shape(self._get_optimizers)
-                    optimizer = load_ckpt(path, part="opt", optimizer_templates=optimizer_specs)
-                opt_state_specs = eqx.filter_eval_shape(self.get_initial_opt_state, model, optimizer)
+                    optimizers = load_ckpt(path, part="opt", optimizer_templates=optimizer_specs)
+                else:
+                    optimizers = optimizer if isinstance(optimizer, list) else [optimizer]
+                opt_state_specs = eqx.filter_eval_shape(self.get_initial_opt_state, model, optimizers)
                 return load_ckpt(path, part="opt_state", opt_state_templates=opt_state_specs)
 
             case "state":
@@ -487,12 +489,12 @@ class TrainMixin(
                 model_specs = eqx.filter_eval_shape(self._get_models, init_params)
                 model = load_ckpt(path, part="model", model_templates=model_specs)
                 optimizer_specs = eqx.filter_eval_shape(self._get_optimizers)
-                optimizer = load_ckpt(path, part="opt", optimizer_templates=optimizer_specs)
-                opt_state_specs = eqx.filter_eval_shape(self.get_initial_opt_state, model, optimizer)
-                opt_state = load_ckpt(path, part="opt_state", opt_state_templates=opt_state_specs)
+                optimizers = load_ckpt(path, part="opt", optimizer_templates=optimizer_specs)
+                opt_state_specs = eqx.filter_eval_shape(self.get_initial_opt_state, model, optimizers)
+                opt_states = load_ckpt(path, part="opt_state", opt_state_templates=opt_state_specs)
                 state = load_ckpt(path, part="state")
                 config = self.get_config(load_ckpt(path, part="config"), use_cli=False)
-                return model, optimizer, opt_state, state, config
+                return model, optimizers, opt_states, state, config
 
             case _:
                 raise ValueError(f"Unknown checkpoint part: {part}")
