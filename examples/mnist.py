@@ -104,7 +104,6 @@ class MnistClassification(xax.SupervisedTask[Config]):
     def log_valid_step(
         self,
         model: Model,
-        batch: tuple[Array, Array],
         output: Array,
         metrics: xax.FrozenDict[str, Array],
         state: xax.State,

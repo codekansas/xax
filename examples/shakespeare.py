@@ -26,10 +26,9 @@ class Batch(TypedDict):
 class Config(xax.SupervisedConfig):
     num_layers: int = xax.field(4)
     hidden_size: int = xax.field(256)
-    batch_size: int = xax.field(12)
+    batch_size: int = xax.field(8)
     learning_rate: float = xax.field(1e-3)
     sequence_length: int = xax.field(1024)
-    valid_every_n_seconds: float = xax.field(30.0)
     model_type: str = xax.field("lstm", help="The model to use")
 
 
@@ -253,20 +252,15 @@ class ShakespearePrediction(xax.SupervisedTask[Config]):
     def log_valid_step(
         self,
         model: SequenceModel,
-        batch: tuple[Array, Array],
         output: Array,
         metrics: xax.FrozenDict[str, Array],
         state: xax.State,
     ) -> None:
-        # output_tokens = jnp.argmax(output, axis=-1)[0]
-        # output_words = self.tokenizer.decode(output_tokens)
-        # self.logger.log_string("teacher_forced_output", output_words)
-
         # Using the first few tokens from the batch, generate the rest of the sequence.
         prompt_seq = jnp.array(self.tokenizer.encode("To be"))
         generated_tokens = model.generate_sequence(prompt_seq, max_len=32)
-        generated_words = self.tokenizer.decode(generated_tokens)
-        self.logger.log_string("prompt", self.tokenizer.decode(prompt_seq))
+        generated_words = self.tokenizer.decode(generated_tokens.tolist())
+        self.logger.log_string("prompt", self.tokenizer.decode(prompt_seq.tolist()))
         self.logger.log_string("generated_output", generated_words)
 
     def _tokenize(self, examples: dict[str, str]) -> dict[str, list[int]]:
@@ -274,15 +268,15 @@ class ShakespearePrediction(xax.SupervisedTask[Config]):
             examples["Text"],
             truncation=True,
             padding="max_length",
-            max_length=1024,
+            max_length=self.config.sequence_length,
         )
 
-    def get_dataset(self, phase: xax.Phase) -> Dataset:
+    def get_dataset(self) -> Dataset:
         ds = load_dataset("Trelis/tiny-shakespeare", split="train")
         # Use functools.partial to create a serializable function for dataset fingerprinting
         tokenize_fn = partial(_tokenize_with_tokenizer, tokenizer=self.tokenizer)
         ds = ds.map(tokenize_fn, batched=True, remove_columns=ds.column_names)
-        ds.set_format(type="jax", columns=["input_ids", "attention_mask"])
+        ds.set_format(type="numpy", columns=["input_ids", "attention_mask"])
         return ds
 
 

@@ -20,7 +20,6 @@ from typing import Generic, Iterable, Pattern, TypeVar
 import jax
 
 from xax.core.conf import field
-from xax.core.state import State
 from xax.task.mixins.logger import LoggerConfig, LoggerMixin
 from xax.task.mixins.process import ProcessConfig, ProcessMixin
 
@@ -243,25 +242,23 @@ class GPUStatsMixin(ProcessMixin[Config], LoggerMixin[Config], Generic[Config]):
         else:
             self._gpu_stats_monitor = None
 
-    def on_training_start(self, state: State) -> State:
-        state = super().on_training_start(state)
+    def on_training_start(self) -> None:
+        super().on_training_start()
 
         if (monitor := self._gpu_stats_monitor) is not None:
             monitor.start()
-        return state
 
-    def on_training_end(self, state: State) -> State:
-        state = super().on_training_end(state)
+    def on_training_end(self) -> None:
+        super().on_training_end()
 
         if (monitor := self._gpu_stats_monitor) is not None:
             monitor.stop()
-        return state
 
-    def on_step_start(self, state: State) -> State:
-        state = super().on_step_start(state)
+    def on_step_start(self) -> None:
+        super().on_step_start()
 
         if (monitor := self._gpu_stats_monitor) is None:
-            return state
+            return
         stats = monitor.get_if_set() if self.config.gpu_stats.only_log_once else monitor.get()
 
         for gpu_stat in stats.values():
@@ -270,5 +267,3 @@ class GPUStatsMixin(ProcessMixin[Config], LoggerMixin[Config], Generic[Config]):
             self.logger.log_scalar(f"mem/{gpu_stat.index}", gpu_stat.memory_used, namespace="🔧 gpu", secondary=True)
             self.logger.log_scalar(f"temp/{gpu_stat.index}", gpu_stat.temperature, namespace="🔧 gpu", secondary=True)
             self.logger.log_scalar(f"util/{gpu_stat.index}", gpu_stat.utilization, namespace="🔧 gpu", secondary=True)
-
-        return state

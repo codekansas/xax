@@ -10,7 +10,6 @@ from typing import Self, TypeVar
 import jax
 
 from xax.core.conf import field, get_run_dir
-from xax.core.state import State
 from xax.nn.parallel import is_master
 from xax.task.base import BaseConfig, BaseTask
 from xax.utils.experiments import stage_environment
@@ -103,13 +102,11 @@ class ArtifactsMixin(BaseTask[Config]):
             self._stage_dir = stage_dir
         return self._stage_dir
 
-    def on_training_end(self, state: State) -> State:
-        state = super().on_training_end(state)
+    def on_training_end(self) -> None:
+        super().on_training_end()
 
         if is_master():
             if self._exp_dir is None:
                 show_info("Exiting training job", important=True)
             else:
                 show_info(f"Exiting training job for {self.exp_dir}", important=True)
-
-        return state

@@ -3,6 +3,7 @@
 # Core ML/JAX dependencies
 attrs
 chex
+dpshdl
 equinox
 importlib-resources
 jax

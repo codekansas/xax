@@ -1,10 +1,8 @@
 """Defines some utility functions for interfacing with Jax."""
 
 import functools
-import inspect
 import logging
 import os
-import time
 from functools import wraps
 from typing import Any, Callable, Hashable, Iterable, ParamSpec, Sequence, TypeVar, cast
 
@@ -33,6 +31,10 @@ Y = TypeVar("Y")
 
 F = TypeVar("F", bound=Callable)
 AxisName = Hashable
+
+
+class RecompileError(RuntimeError):
+    pass
 
 
 @functools.lru_cache(maxsize=None)
@@ -84,6 +86,7 @@ def jit(
     abstracted_axes: Any | None = None,  # noqa: ANN401
     compiler_options: dict[str, Any] | None = None,
     jit_level: int | None = None,
+    error_on_recompile: bool = False,
 ) -> Callable[[Callable[P, R]], Callable[P, R]]:
     """Wrapper function that provides utility improvements over Jax's JIT.
 
@@ -97,13 +100,6 @@ def jit(
         return lambda fn: fn  # Identity function.
 
     def decorator(fn: Callable[P, R]) -> Callable[P, R]:
-        class JitState:
-            compilation_count = 0
-            last_arg_dict: dict[str, int] | None = None
-
-        sig = inspect.signature(fn)
-        param_names = list(sig.parameters.keys())
-
         jitted_fn = jax.jit(
             fn,
             in_shardings=in_shardings,
@@ -120,51 +116,21 @@ def jit(
             compiler_options=compiler_options,
         )
 
+        cache: dict[tuple[Any, tuple[str, ...]], int] = {}
+
         @wraps(fn)
         def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
-            if os.environ.get("DEBUG", "0") == "1":  # skipping during debug
-                return fn(*args, **kwargs)
-
-            do_profile = os.environ.get("JIT_PROFILE", "0") == "1"
-
-            if do_profile:
-                class_name = (args[0].__class__.__name__) + "." if fn.__name__ == "__call__" else ""
-                logger.info(
-                    "Currently running %s (count: %s)",
-                    f"{class_name}{fn.__name__}",
-                    JitState.compilation_count,
-                )
-
-            start_time = time.time()
-            res = jitted_fn(*args, **kwargs)
-            end_time = time.time()
-            runtime = end_time - start_time
-
-            # if this is true, if runtime is higher than COMPILE_TIMEOUT, we recompile
-            # TODO: we should probably reimplement the lower-level jitting logic to avoid this
-            if do_profile:
-                arg_dict = {}
-                for i, arg in enumerate(args):
-                    if i < len(param_names):
-                        arg_dict[param_names[i]] = get_hash(arg)
-                for k, v in kwargs.items():
-                    arg_dict[k] = get_hash(v)
-
-                logger.info("Hashing took %s seconds", runtime)
-                JitState.compilation_count += 1
-
-                if JitState.last_arg_dict is not None:
-                    all_keys = set(arg_dict.keys()) | set(JitState.last_arg_dict.keys())
-                    for k in all_keys:
-                        prev = JitState.last_arg_dict.get(k, "N/A")
-                        curr = arg_dict.get(k, "N/A")
-
-                        if prev != curr:
-                            logger.info("- Arg '%s' hash changed: %s -> %s", k, prev, curr)
-
-                JitState.last_arg_dict = arg_dict
-
-            return cast(R, res)
+            if not error_on_recompile:
+                return jitted_fn(*args, **kwargs)
+            lowered = jitted_fn.lower(*args, **kwargs)
+            in_avals = lowered.in_avals
+            in_tree = lowered.in_tree
+            key = (in_tree, tuple(str(a) for a in in_avals))
+            compiled = lowered.compile()
+            cid = id(compiled)
+            if key in cache and cache[key] != cid:
+                raise RecompileError(f"Recompilation detected for {key!r}. Old compiled id={cache[key]}, new id={cid}")
+            return cast(R, jitted_fn(*args, **kwargs))
 
         return wrapped
 

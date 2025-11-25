@@ -67,17 +67,17 @@ class BaseTask(Generic[Config]):
 
         self.config = config
 
-    def on_step_start(self, state: State) -> State:
-        return state
+    def on_step_start(self) -> None:
+        pass
 
-    def on_step_end(self, state: State) -> State:
-        return state
+    def on_step_end(self) -> None:
+        pass
 
-    def on_training_start(self, state: State) -> State:
-        return state
+    def on_training_start(self) -> None:
+        pass
 
-    def on_training_end(self, state: State) -> State:
-        return state
+    def on_training_end(self) -> None:
+        pass
 
     def on_after_checkpoint_save(self, ckpt_path: Path, state: State | None) -> State | None:
         return state

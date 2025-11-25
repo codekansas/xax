@@ -21,11 +21,13 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import optax
+from jax.sharding import NamedSharding, PartitionSpec as P
 from jaxtyping import Array, PyTree
 
 from xax.core.conf import field
 from xax.core.state import State
 from xax.nn.parallel import is_master
+from xax.task.mixins.data_loader import iter_samples
 from xax.task.mixins.train import Batch, InitParams, Output, TrainConfig, TrainMixin
 from xax.utils.experiments import (
     ContextTimer,
@@ -149,7 +151,7 @@ class SupervisedMixin(
 
     @xax_jit(
         static_argnames=["self", "model_static", "optimizer"],
-        donate_argnames=["model_arr", "opt_state"],
+        donate_argnames=["model_arr", "opt_state", "state"],
         jit_level=3,
     )
     def train_step(
@@ -158,14 +160,14 @@ class SupervisedMixin(
         model_static: PyTree,
         optimizer: optax.GradientTransformation,
         opt_state: optax.OptState,
-        batches: Batch,
+        batches: tuple[Batch, ...],
         state: State,
-    ) -> tuple[PyTree, optax.OptState, Output, FrozenDict[str, Array]]:
+    ) -> tuple[PyTree, optax.OptState, Output, FrozenDict[str, Array], State]:
         def update_fn(
-            carry: tuple[PyTree, optax.OptState],
+            carry: tuple[PyTree, optax.OptState, State],
             batch: Batch,
-        ) -> tuple[tuple[PyTree, optax.OptState], tuple[Output, FrozenDict[str, Array]]]:
-            model_arr, opt_state = carry
+        ) -> tuple[tuple[PyTree, optax.OptState, State], tuple[Output, FrozenDict[str, Array]]]:
+            model_arr, opt_state, state = carry
             model_arr, opt_state, output, metrics = self.update(
                 model_arr,
                 model_static,
@@ -174,12 +176,16 @@ class SupervisedMixin(
                 batch,
                 state,
             )
-            return (model_arr, opt_state), (output, FrozenDict(metrics))
+            state = state.replace(
+                num_steps=state.num_steps + 1,
+                num_samples=state.num_samples + (self.get_size_of_batch(batch) or 0),
+            )
+            return (model_arr, opt_state, state), (output, FrozenDict(metrics))
 
-        (model_arr, opt_state), (output, metrics) = xax_scan(
+        (model_arr, opt_state, state), (output, metrics) = xax_scan(
             update_fn,
-            (model_arr, opt_state),
-            batches,
+            (model_arr, opt_state, state),
+            jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *batches),
             jit_level=3,
         )
 
@@ -187,26 +193,14 @@ class SupervisedMixin(
         output = jax.tree.map(lambda x: x[-1], output)
         metrics = jax.tree.map(lambda x: x[-1], metrics)
 
-        return model_arr, opt_state, output, metrics
-
-    @xax_jit(static_argnames=["self", "model_static"], jit_level=3)
-    def val_step(
-        self,
-        model_arr: PyTree,
-        model_static: PyTree,
-        batch: Batch,
-        state: State,
-    ) -> tuple[Output, FrozenDict[str, Array]]:
-        _, (output, metrics) = self.get_output_and_loss(model_arr, model_static, batch, state)
-        return output, FrozenDict(metrics)
+        return model_arr, opt_state, output, metrics, state
 
     def train_loop(
         self,
         models: Sequence[PyTree],
         optimizers: Sequence[optax.GradientTransformation],
         opt_states: Sequence[optax.OptState],
-        train_ds: Iterator[Batch],
-        valid_ds: Iterator[Batch],
+        ds: Iterator[Batch],
         state: State,
     ) -> None:
         if len(models) != 1 or len(optimizers) != 1 or len(opt_states) != 1:
@@ -220,41 +214,20 @@ class SupervisedMixin(
         opt_state = opt_states[0]
 
         while not self.is_training_over(state):
-            valid_step = self.valid_step_timer(state)
-
-            if valid_step:
-                with ContextTimer() as timer:
-                    state = state.replace(phase="valid")
-                    valid_batch = next(valid_ds)
-                    output, metrics = self.val_step(model_arr, model_static, valid_batch, state)
-                    self.log_step(eqx.combine(model_arr, model_static), valid_batch, output, metrics, state)
-
-                state = state.replace(
-                    num_steps=state.num_steps + 1,
-                    num_samples=state.num_samples + (self.get_size_of_batch(valid_batch) or 0),
-                    elapsed_time_s=state.elapsed_time_s + timer.elapsed_time,
-                )
-
             with ContextTimer() as timer:
-                state = self.on_step_start(state)
-                state = state.replace(phase="train")
-                train_batches = list(itertools.islice(train_ds, self.config.updates_per_step))
-                model_arr, opt_state, output, metrics = self.train_step(
+                self.on_step_start()
+                model_arr, opt_state, output, metrics, state = self.train_step(
                     model_arr=model_arr,
                     model_static=model_static,
                     optimizer=optimizer,
                     opt_state=opt_state,
-                    batches=jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *train_batches),
+                    batches=tuple(itertools.islice(ds, self.config.updates_per_step)),
                     state=state,
                 )
-                self.log_step(eqx.combine(model_arr, model_static), train_batches[-1], output, metrics, state)
-                state = self.on_step_end(state)
+                self.log_step(eqx.combine(model_arr, model_static), output, metrics, state)
+                self.on_step_end()
 
-            state = state.replace(
-                num_steps=state.num_steps + 1,
-                num_samples=state.num_samples + (self.get_size_of_batch(train_batches[-1]) or 0),
-                elapsed_time_s=state.elapsed_time_s + timer.elapsed_time,
-            )
+            state = state.replace(elapsed_time_s=state.elapsed_time_s + timer.elapsed_time)
 
             if state.num_steps <= 3:
                 logger.log(LOG_PING, "Step %d took %.2f second", state.num_steps, timer.elapsed_time)
@@ -269,6 +242,11 @@ class SupervisedMixin(
 
     def run(self) -> None:
         self.run_training()
+
+    def get_sharding(self) -> NamedSharding:
+        ndevices = jax.local_device_count()
+        mesh = jax.make_mesh((ndevices,), axis_names=("batch",))
+        return jax.sharding.NamedSharding(mesh, P("batch"))
 
     def run_training(self) -> None:
         """Runs the training loop.
@@ -296,7 +274,7 @@ class SupervisedMixin(
             logger.info("Model size: %s", f"{get_pytree_param_count(models):,}")
             logger.info("Optimizer size: %s", f"{get_pytree_param_count(opt_states):,}")
 
-            state = self.on_training_start(state)
+            self.on_training_start()
 
             def on_exit() -> None:
                 self.save_checkpoint(models=models, optimizers=optimizers, opt_states=opt_states, state=state)
@@ -304,16 +282,24 @@ class SupervisedMixin(
             # Handle user-defined interrupts during the training loop.
             self.add_signal_handler(on_exit, signal.SIGUSR1, signal.SIGTERM)
 
-            train_ds = self.get_data_iterator("train")
-            valid_ds = self.get_data_iterator("valid")
+            ds = self.get_data_iterator()
+
+            # Shard the loaded samples.
+            sharding = self.get_sharding()
+            # dl = DataLoader(ds, batch_size=self.config.batch_size)
+
+            # def dl_iter() -> Iterator[Batch]:
+            #     for batch in dl:
+            #         batch = jax.tree.map(lambda x: jnp.array(x.numpy()) if isinstance(x, Tensor) else x, batch)
+            #         yield jax.device_put(batch, sharding)
+            ds = iter_samples(ds, sharding)
 
             try:
                 self.train_loop(
                     models=models,
                     optimizers=optimizers,
                     opt_states=opt_states,
-                    train_ds=train_ds,
-                    valid_ds=valid_ds,
+                    ds=ds,
                     state=state,
                 )
 
@@ -334,4 +320,4 @@ class SupervisedMixin(
                 self.save_checkpoint(models=models, optimizers=optimizers, opt_states=opt_states, state=state)
 
             finally:
-                state = self.on_training_end(state)
+                self.on_training_end()

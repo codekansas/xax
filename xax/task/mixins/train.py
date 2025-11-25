@@ -22,6 +22,7 @@ from typing import (
 
 import equinox as eqx
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 from jaxtyping import Array, PRNGKeyArray, PyTree
@@ -84,63 +85,6 @@ def batches_per_step_schedule(schedule: list[int] | None) -> list[int] | None:
     return list(itertools.accumulate([0] + schedule))
 
 
-class ValidStepTimer:
-    def __init__(
-        self,
-        valid_every_n_steps: int | None = None,
-        valid_first_n_steps: int = 0,
-        valid_every_n_seconds: float | None = None,
-        valid_first_n_seconds: float | None = None,
-    ) -> None:
-        super().__init__()
-
-        self.valid_every_n_steps = valid_every_n_steps
-        self.valid_first_n_steps = valid_first_n_steps
-        self.valid_every_n_seconds = valid_every_n_seconds
-        self.valid_first_n_seconds = valid_first_n_seconds
-        self.first_valid_step_flag = True
-
-        self.last_valid_time: float | None = None
-        self.last_valid_step: int | None = None
-
-    def _reset(self, state: State) -> None:
-        self.last_valid_time = state.elapsed_time_s.item()
-        self.last_valid_step = state.num_steps.item()
-
-    def __call__(self, state: State) -> bool:
-        if state.num_steps < self.valid_first_n_steps:
-            return True
-
-        if self.last_valid_time is None or self.last_valid_step is None:
-            self._reset(state)
-            return False
-
-        # Step-based validation.
-        valid_every_n_steps = self.valid_every_n_steps
-        if valid_every_n_steps is not None and state.num_steps >= valid_every_n_steps + self.last_valid_step:
-            self._reset(state)
-            return True
-
-        # Time-based validation.
-        valid_every_n_seconds = self.valid_every_n_seconds
-        if (
-            valid_every_n_seconds is not None
-            and state.elapsed_time_s.item() - self.last_valid_time >= valid_every_n_seconds
-        ):
-            self._reset(state)
-            return True
-
-        # Time-based validation for first validation step.
-        if self.first_valid_step_flag:
-            valid_first_n_seconds = self.valid_first_n_seconds
-            if valid_first_n_seconds is not None and state.elapsed_time_s.item() >= valid_first_n_seconds:
-                self._reset(state)
-                self.first_valid_step_flag = False
-                return True
-
-        return False
-
-
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class InitParams:
@@ -161,10 +105,6 @@ class TrainConfig(
     ArtifactsConfig,
     RunnableConfig,
 ):
-    valid_every_n_steps: int | None = field(None, help="Number of training steps to run per validation step")
-    valid_first_n_steps: int = field(0, help="Treat the first N steps as validation steps")
-    valid_every_n_seconds: float | None = field(60.0 * 10.0, help="Run validation every N seconds")
-    valid_first_n_seconds: float | None = field(60.0, help="Run first validation after N seconds")
     max_steps: int | None = field(None, help="Maximum number of steps to run")
     step_kind: str = field("step", help=f"How to measure a step; one of [{', '.join(get_args(StepKind))}]")
     precision: Precision = field(Precision.BFLOAT16, help="Precision to use for the task")
@@ -184,7 +124,6 @@ class TrainMixin(
     Generic[Config, InitParamsT],
     ABC,
 ):
-    valid_step_timer: ValidStepTimer
     state_timers: dict[Phase, StateTimer]
 
     _training_over_flag: bool
@@ -196,14 +135,6 @@ class TrainMixin(
 
         # Sets the random seed whenever we instantiate a new train mixin.
         set_random_seed(self.config.random_seed)
-
-        # Timer for validation steps.
-        self.valid_step_timer = ValidStepTimer(
-            valid_every_n_steps=config.valid_every_n_steps,
-            valid_first_n_steps=config.valid_first_n_steps,
-            valid_every_n_seconds=config.valid_every_n_seconds,
-            valid_first_n_seconds=config.valid_first_n_seconds,
-        )
 
         # Timers for iterations.
         self.state_timers = {phase: StateTimer() for phase in get_args(Phase)}
@@ -225,13 +156,23 @@ class TrainMixin(
             case _:
                 raise ValueError(f"Invalid precision: {self.config.precision}")
 
+    def cast_dtype(self, x: Any) -> Array:  # noqa: ANN401
+        if isinstance(x, Array) and jnp.issubdtype(x.dtype, jnp.floating):
+            match self.config.precision:
+                case Precision.FLOAT32:
+                    return x.astype(jnp.float32)
+                case Precision.BFLOAT16:
+                    return x.astype(jnp.bfloat16)
+                case _:
+                    raise ValueError(f"Invalid precision: {self.config.precision}")
+        return x
+
     def prng_key(self) -> PRNGKeyArray:
         return jax.random.PRNGKey(self.config.random_seed)
 
     def log_train_step(
         self,
         model: PyTree,
-        batch: Batch,
         output: Output,
         metrics: FrozenDict[str, Array],
         state: State,
@@ -252,7 +193,6 @@ class TrainMixin(
     def log_valid_step(
         self,
         model: PyTree,
-        batch: Batch,
         output: Output,
         metrics: FrozenDict[str, Array],
         state: State,
@@ -283,7 +223,6 @@ class TrainMixin(
     def log_step(
         self,
         model: PyTree,
-        batch: Batch,
         output: Output,
         metrics: FrozenDict[str, Array],
         state: State,
@@ -301,9 +240,9 @@ class TrainMixin(
         # Delegate to the appropriate logging function based on the phase.
         match phase:
             case "train":
-                self.log_train_step(model, batch, output, metrics, state)
+                self.log_train_step(model, output, metrics, state)
             case "valid":
-                self.log_valid_step(model, batch, output, metrics, state)
+                self.log_valid_step(model, output, metrics, state)
             case _:
                 raise KeyError(f"Unknown phase: {phase}")
 
@@ -395,6 +334,9 @@ class TrainMixin(
         logger.info("Starting a new training run")
         models = self._get_models(params)
         state = State.init_state()
+
+        # Casts the model to the desired dtype.
+        models = jax.tree.map(self.cast_dtype, models)
 
         if not load_optimizer:
             return models, state
@@ -534,29 +476,30 @@ class TrainMixin(
             case _:
                 raise ValueError(f"Unknown checkpoint part: {part}")
 
-    def get_size_of_batch(self, batch: Batch) -> int | None:
+    def get_size_of_batch(self, batch: Batch, index: int = 0) -> int | None:
         """Gets the batch size for the current batch.
 
         Args:
             batch: The current minibatch of samples.
+            index: The index of the batch to get the size of.
 
         Returns:
             The parsed batch size, or None if the batch size could not be
             determined.
         """
-        if isinstance(batch, (np.ndarray, Array)):
-            return batch.shape[0]
+        if isinstance(batch, (np.ndarray, Array)) and len(batch.shape) > index:
+            return batch.shape[index]
         if is_dataclass(batch):
             for v in batch.__dict__.values():
-                if bsz := self.get_size_of_batch(v):
+                if bsz := self.get_size_of_batch(v, index):
                     return bsz
         if isinstance(batch, Mapping):
             for v in batch.values():
-                if bsz := self.get_size_of_batch(v):
+                if bsz := self.get_size_of_batch(v, index):
                     return bsz
         if isinstance(batch, Sequence):
             for i in batch:
-                if bsz := self.get_size_of_batch(i):
+                if bsz := self.get_size_of_batch(i, index):
                     return bsz
         return None
 
