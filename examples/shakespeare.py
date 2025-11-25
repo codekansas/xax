@@ -29,8 +29,8 @@ class Config(xax.SupervisedConfig):
     batch_size: int = xax.field(8)
     learning_rate: float = xax.field(1e-3)
     sequence_length: int = xax.field(1024)
-    log_heavy_every_n_seconds: int = xax.field(30)
-    model_type: str = xax.field("lstm", help="The model to use")
+    log_heavy_every_n_seconds: int = xax.field(120)
+    model_type: str = xax.field("ssm", help="The model to use")
 
 
 class SequenceModel(Protocol):
@@ -41,7 +41,7 @@ class SequenceModel(Protocol):
 
 class RNN(eqx.Module):
     vocab_embedding: eqx.nn.Embedding
-    rnn_cells: list[eqx.nn.GRUCell]
+    rnn_cells: tuple[eqx.nn.GRUCell, ...]
     output_layer: eqx.nn.Linear
 
     def __init__(
@@ -55,9 +55,9 @@ class RNN(eqx.Module):
         vocab_key, rnn_key = jax.random.split(key, 2)
         self.vocab_embedding = eqx.nn.Embedding(input_size, hidden_size, key=vocab_key)
         keys = jax.random.split(rnn_key, num_layers)
-        self.rnn_cells = [
+        self.rnn_cells = tuple(
             eqx.nn.GRUCell(input_size=hidden_size, hidden_size=hidden_size, key=keys[i]) for i in range(num_layers)
-        ]
+        )
         self.output_layer = eqx.nn.Linear(hidden_size, output_size, key=keys[-1])
 
     def __call__(self, hs: list[Array], x: Array) -> tuple[list[Array], Array]:
@@ -107,7 +107,7 @@ class RNN(eqx.Module):
 
 class LSTM(eqx.Module):
     vocab_embedding: eqx.nn.Embedding
-    rnn_cells: list[eqx.nn.LSTMCell]
+    rnn_cells: tuple[eqx.nn.LSTMCell, ...]
     output_layer: eqx.nn.Linear
 
     def __init__(
@@ -121,9 +121,9 @@ class LSTM(eqx.Module):
         vocab_key, rnn_key = jax.random.split(key, 2)
         self.vocab_embedding = eqx.nn.Embedding(input_size, hidden_size, key=vocab_key)
         keys = jax.random.split(rnn_key, num_layers)
-        self.rnn_cells = [
+        self.rnn_cells = tuple(
             eqx.nn.LSTMCell(input_size=hidden_size, hidden_size=hidden_size, key=keys[i]) for i in range(num_layers)
-        ]
+        )
         self.output_layer = eqx.nn.Linear(hidden_size, output_size, key=keys[-1])
 
     def __call__(self, hs: list[tuple[Array, Array]], x: Array) -> tuple[list[tuple[Array, Array]], Array]:
@@ -232,6 +232,9 @@ class ShakespearePrediction(xax.SupervisedTask[Config]):
                     ff_dim=self.config.hidden_size * 4,
                     num_layers=self.config.num_layers,
                     output_size=self.vocab_size,
+                    context_length=self.config.sequence_length,
+                    causal=True,
+                    use_rotary_embeddings=True,
                     key=params.key,
                 )
             case _:
@@ -294,8 +297,4 @@ def _tokenize_with_tokenizer(examples: dict[str, str], tokenizer: Qwen2Tokenizer
 if __name__ == "__main__":
     # Launch the training task.
     #   python -m examples.shakespeare
-    ShakespearePrediction.launch(
-        Config(
-            model_type="ssm",
-        )
-    )
+    ShakespearePrediction.launch()

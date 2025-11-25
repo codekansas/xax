@@ -906,7 +906,8 @@ class Transformer(eqx.Module):
         output_seq = output_seq.at[:prompt_len].set(prompt_seq)
 
         # Initialize cache with prompt
-        cache = self.init_cache()
+        dtype = self.token_embedding.weight.dtype
+        cache = self.init_cache(dtype=dtype)
         mask = self.init_mask(prompt_len, add_cache=True, batch_dim=False)
         _, cache = self.encode(prompt_seq, cache=cache, mask=mask)
 

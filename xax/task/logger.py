@@ -460,7 +460,7 @@ class LoggerImpl(ABC):
         """
         super().__init__()
 
-        self.ticker = IntervalTicker(log_interval_seconds)
+        self.ticker = {k: IntervalTicker(log_interval_seconds) for k in [True, False]}
 
     @abstractmethod
     def start(self) -> None: ...
@@ -517,17 +517,18 @@ class LoggerImpl(ABC):
             contents: The contents of the file.
         """
 
-    def should_log(self, state: State) -> bool:
+    def should_log(self, state: State, heavy: bool) -> bool:
         """Function that determines if the logger should log the current step.
 
         Args:
             state: The current step's state.
+            heavy: If the current step is heavy.
 
         Returns:
             If the logger should log the current step.
         """
         elapsed_time = state.elapsed_time_s.item()
-        should_log = self.ticker.tick(elapsed_time)
+        should_log = self.ticker[heavy].tick(elapsed_time)
         return should_log
 
 
@@ -621,8 +622,9 @@ class Logger:
 
         Args:
             state: The current step's state.
+            heavy: If the current step is heavy.
         """
-        should_log = [lg.should_log(state) for lg in self.loggers]
+        should_log = [lg.should_log(state, heavy) for lg in self.loggers]
         if not any(should_log):
             self.clear()
             return
