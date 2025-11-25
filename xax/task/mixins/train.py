@@ -307,6 +307,7 @@ class TrainMixin(
         self,
         params: InitParamsT,
         load_optimizer: Literal[False] = False,
+        model_sharding: jax.sharding.NamedSharding | None = None,
     ) -> tuple[PyTree, State]: ...
 
     @overload
@@ -314,21 +315,30 @@ class TrainMixin(
         self,
         params: InitParamsT,
         load_optimizer: Literal[True],
+        model_sharding: jax.sharding.NamedSharding | None = None,
     ) -> tuple[list[PyTree], list[optax.GradientTransformation], list[optax.OptState], State]: ...
 
     def load_initial_state(
         self,
         params: InitParamsT,
         load_optimizer: bool = False,
+        model_sharding: jax.sharding.NamedSharding | None = None,
     ) -> (
         tuple[list[PyTree], State]
         | tuple[list[PyTree], list[optax.GradientTransformation], list[optax.OptState], State]
     ):
         init_ckpt_path = self.get_init_ckpt_path()
 
+        def _shard(x: Any) -> Any:  # noqa: ANN401
+            if isinstance(x, Array):
+                return jax.device_put(x, src=model_sharding)
+            return x
+
         if init_ckpt_path is not None:
             logger.info("Loading checkpoint from %s", init_ckpt_path)
             model, state, config = self.load_ckpt(init_ckpt_path, params, part="model_state_config")
+            if model_sharding is not None:
+                model = jax.tree.map(_shard, model)
             config_diff = get_diff_string(diff_configs(asdict(config), asdict(self.config)))
             if config_diff:
                 logger.warning("Loaded config differs from current config:\n%s", config_diff)
@@ -346,6 +356,9 @@ class TrainMixin(
 
         # Casts the model to the desired dtype.
         models = jax.tree.map(self.cast_dtype, models)
+
+        if model_sharding is not None:
+            models = jax.tree.map(_shard, models)
 
         if not load_optimizer:
             return models, state

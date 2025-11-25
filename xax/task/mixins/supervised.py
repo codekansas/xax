@@ -268,9 +268,18 @@ class SupervisedMixin(
             if is_master():
                 Thread(target=self.log_state, daemon=True).start()
 
+            # Gets the sharding strategy.
+            mesh = self.get_mesh()
+            data_sharding = self.get_data_sharding(mesh)
+            model_sharding = self.get_model_sharding(mesh)
+
             key, model_key = jax.random.split(key)
             init_params = InitParams(key=model_key)
-            models, optimizers, opt_states, state = self.load_initial_state(init_params, load_optimizer=True)
+            models, optimizers, opt_states, state = self.load_initial_state(
+                init_params,
+                load_optimizer=True,
+                model_sharding=model_sharding,
+            )
             logger.info("Model size: %s", f"{get_pytree_param_count(models):,}")
             logger.info("Optimizer size: %s", f"{get_pytree_param_count(opt_states):,}")
 
@@ -281,11 +290,6 @@ class SupervisedMixin(
 
             # Handle user-defined interrupts during the training loop.
             self.add_signal_handler(on_exit, signal.SIGUSR1, signal.SIGTERM)
-
-            # Gets the sharding strategy.
-            mesh = self.get_mesh()
-            data_sharding = self.get_data_sharding(mesh)
-            model_sharding = self.get_model_sharding(mesh)
 
             ds = self.get_data_iterator()
             ds = iter_samples(ds, data_sharding)
