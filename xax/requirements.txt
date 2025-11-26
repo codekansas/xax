@@ -5,6 +5,7 @@ attrs
 chex
 datasets
 equinox
+etils
 importlib-resources
 jax
 jaxtyping

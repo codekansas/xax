@@ -342,19 +342,19 @@ class TrainMixin(
 
         if init_ckpt_path is not None:
             logger.info("Loading checkpoint from %s", init_ckpt_path)
-            model, state, config = self.load_ckpt(init_ckpt_path, params, part="model_state_config")
+            models, state, config = self.load_ckpt(init_ckpt_path, params, part="model_state_config")
             if model_sharding is not None:
-                model = jax.tree.map(_shard, model)
+                models = jax.tree.map(_shard, models)
             config_diff = get_diff_string(diff_configs(asdict(config), asdict(self.config)))
             if config_diff:
                 logger.warning("Loaded config differs from current config:\n%s", config_diff)
 
             if not load_optimizer:
-                return model, state
+                return models, state
 
             optimizers = self._get_optimizers()
-            opt_states = self.load_ckpt(init_ckpt_path, params, part="opt_state", model=model, optimizers=optimizers)
-            return model, optimizers, opt_states, state
+            opt_states = self.load_ckpt(init_ckpt_path, params, part="opt_state", models=models, optimizers=optimizers)
+            return models, optimizers, opt_states, state
 
         logger.info("Starting a new training run")
         models = self._get_models(params)
@@ -409,7 +409,8 @@ class TrainMixin(
         init_params: InitParamsT,
         *,
         part: Literal["opt_state"],
-        model: PyTree | list[PyTree] | None = None,
+        models: list[PyTree] | None = None,
+        optimizers: list[Optimizer] | None = None,
     ) -> list[optax.OptState]: ...
 
     @overload
@@ -436,7 +437,7 @@ class TrainMixin(
         init_params: InitParamsT,
         *,
         part: CheckpointPart = "all",
-        model: PyTree | list[PyTree] | None = None,
+        models: list[PyTree] | None = None,
         optimizers: list[Optimizer] | None = None,
     ) -> (
         tuple[list[PyTree], list[optax.OptState], State, Config]
@@ -450,11 +451,14 @@ class TrainMixin(
 
         match part:
             case "model_state_config":
-                model_shape = eqx.filter_eval_shape(self._get_models, init_params)
-                model_specs = jax.tree_util.tree_map(as_shape_dtype, model_shape)
-                model, state, config = load_ckpt(path, part="model_state_config", model_templates=model_specs)
+                if models is None:
+                    models_shape = eqx.filter_eval_shape(self._get_models, init_params)
+                    models_specs = jax.tree_util.tree_map(as_shape_dtype, models_shape)
+                else:
+                    models_specs = jax.tree_util.tree_map(as_shape_dtype, models)
+                models, state, config = load_ckpt(path, part="model_state_config", model_templates=models_specs)
                 config = self.get_config(config, use_cli=False)
-                return model, state, config
+                return models, state, config
 
             case "model":
                 model_shape = eqx.filter_eval_shape(self._get_models, init_params)
@@ -462,13 +466,13 @@ class TrainMixin(
                 return load_ckpt(path, part="model", model_templates=model_specs)
 
             case "opt_state":
-                if model is None:
+                if models is None:
                     model_shape = eqx.filter_eval_shape(self._get_models, init_params)
                     model_specs = jax.tree_util.tree_map(as_shape_dtype, model_shape)
-                    model = load_ckpt(path, part="model", model_templates=model_specs)
+                    models = load_ckpt(path, part="model", model_templates=model_specs)
                 if optimizers is None:
                     optimizers = self._get_optimizers()
-                opt_state_specs = eqx.filter_eval_shape(self.get_initial_opt_state, model, optimizers)
+                opt_state_specs = eqx.filter_eval_shape(self.get_initial_opt_state, models, optimizers)
                 return load_ckpt(path, part="opt_state", opt_state_templates=opt_state_specs)
 
             case "state":
@@ -478,16 +482,17 @@ class TrainMixin(
                 return self.get_config(load_ckpt(path, part="config"), use_cli=False)
 
             case "all":
-                model_shape = eqx.filter_eval_shape(self._get_models, init_params)
-                model_specs = jax.tree_util.tree_map(as_shape_dtype, model_shape)
-                model = load_ckpt(path, part="model", model_templates=model_specs)
+                if models is None:
+                    models_shape = eqx.filter_eval_shape(self._get_models, init_params)
+                    models_specs = jax.tree_util.tree_map(as_shape_dtype, models_shape)
+                    models = load_ckpt(path, part="model", model_templates=models_specs)
                 if optimizers is None:
                     optimizers = self._get_optimizers()
-                opt_state_specs = eqx.filter_eval_shape(self.get_initial_opt_state, model, optimizers)
+                opt_state_specs = eqx.filter_eval_shape(self.get_initial_opt_state, models, optimizers)
                 opt_states = load_ckpt(path, part="opt_state", opt_state_templates=opt_state_specs)
                 state = load_ckpt(path, part="state")
                 config = self.get_config(load_ckpt(path, part="config"), use_cli=False)
-                return model, opt_states, state, config
+                return models, opt_states, state, config
 
             case _:
                 raise ValueError(f"Unknown checkpoint part: {part}")

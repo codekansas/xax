@@ -104,7 +104,7 @@ def load_ckpt(
     model_templates: Sequence[PyTree] | None = None,
     opt_state_templates: Sequence[optax.OptState] | None = None,
 ) -> (
-    tuple[list[PyTree], list[optax.GradientTransformation], list[optax.OptState], State, DictConfig]
+    tuple[list[PyTree], list[optax.OptState], State, DictConfig]
     | tuple[list[PyTree], State, DictConfig]
     | list[PyTree]
     | list[optax.OptState]
