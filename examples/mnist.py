@@ -139,4 +139,8 @@ class MnistClassification(xax.SupervisedTask[Config]):
 
 if __name__ == "__main__":
     # python -m examples.mnist
-    MnistClassification.launch(Config())
+    MnistClassification.launch(
+        Config(
+            log_heavy_every_n_seconds=120,
+        ),
+    )

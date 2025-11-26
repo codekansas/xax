@@ -26,12 +26,10 @@ class Batch(TypedDict):
 class Config(xax.SupervisedConfig):
     num_layers: int = xax.field(4)
     hidden_size: int = xax.field(256)
-    batch_size: int = xax.field(8)
     learning_rate: float = xax.field(1e-4)
     min_learning_rate: float = xax.field(1e-5, help="Minimum learning rate for cosine decay")
     warmup_steps: int = xax.field(1000, help="Number of warmup steps")
     sequence_length: int = xax.field(1024)
-    log_heavy_every_n_seconds: int = xax.field(120)
     model_type: str = xax.field("ssm", help="The model to use")
 
 
@@ -328,4 +326,9 @@ def _tokenize_with_tokenizer(examples: dict[str, str], tokenizer: Qwen2Tokenizer
 if __name__ == "__main__":
     # Launch the training task.
     #   python -m examples.shakespeare
-    ShakespearePrediction.launch()
+    ShakespearePrediction.launch(
+        Config(
+            batch_size=8,
+            log_heavy_every_n_seconds=120,
+        ),
+    )
