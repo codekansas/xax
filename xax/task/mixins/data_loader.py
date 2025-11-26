@@ -3,11 +3,10 @@
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Generic, Iterator, TypeVar
+from typing import Generic, Iterator, TypeVar
 
 import jax
 from datasets import Dataset, DatasetDict, IterableDataset, IterableDatasetDict
-from dpshdl.collate import collate
 from jax.sharding import NamedSharding
 from omegaconf import II
 
@@ -84,7 +83,3 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
             return ds
 
         raise NotImplementedError(f"Unsupported dataset type: {type(ds)}")
-
-    @classmethod
-    def collate_fn(cls, items: list[Any], config: Config) -> Batch:
-        return collate(items)

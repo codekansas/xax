@@ -319,6 +319,7 @@ class SupervisedMixin(
                 sys.stdout.write(f"Caught exception during training loop:\n\n{exception_tb}\n")
                 sys.stdout.flush()
                 self.save_checkpoint(models=models, optimizers=optimizers, opt_states=opt_states, state=state)
+                raise
 
             finally:
                 self.on_training_end()

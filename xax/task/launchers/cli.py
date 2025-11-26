@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Literal, get_args
 
 from xax.task.base import RawConfigType
 from xax.task.launchers.base import BaseLauncher
+from xax.task.launchers.multi_cpu import MultiCpuLauncher
 from xax.task.launchers.multi_device import MultiDeviceLauncher
 from xax.task.launchers.single_device import SingleDeviceLauncher
 
@@ -13,7 +14,7 @@ if TYPE_CHECKING:
     from xax.task.mixins.runnable import Config, RunnableMixin
 
 
-LauncherChoice = Literal["single", "multi"]
+LauncherChoice = Literal["single", "multi", "multi_cpu"]
 
 
 class CliLauncher(BaseLauncher):
@@ -41,5 +42,7 @@ class CliLauncher(BaseLauncher):
                 SingleDeviceLauncher().launch(task, *cfgs, use_cli=use_cli_next)
             case "multi":
                 MultiDeviceLauncher().launch(task, *cfgs, use_cli=use_cli_next)
+            case "multi_cpu":
+                MultiCpuLauncher().launch(task, *cfgs, use_cli=use_cli_next)
             case _:
                 raise ValueError(f"Invalid launcher choice: {launcher_choice}")

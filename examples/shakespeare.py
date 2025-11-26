@@ -27,7 +27,9 @@ class Config(xax.SupervisedConfig):
     num_layers: int = xax.field(4)
     hidden_size: int = xax.field(256)
     batch_size: int = xax.field(8)
-    learning_rate: float = xax.field(1e-3)
+    learning_rate: float = xax.field(1e-4)
+    min_learning_rate: float = xax.field(1e-5, help="Minimum learning rate for cosine decay")
+    warmup_steps: int = xax.field(1000, help="Number of warmup steps")
     sequence_length: int = xax.field(1024)
     log_heavy_every_n_seconds: int = xax.field(120)
     model_type: str = xax.field("ssm", help="The model to use")
@@ -234,15 +236,40 @@ class ShakespearePrediction(xax.SupervisedTask[Config]):
                     output_size=self.vocab_size,
                     context_length=self.config.sequence_length,
                     causal=True,
-                    use_rotary_embeddings=True,
+                    # use_rotary_embeddings=True,
                     key=params.key,
                 )
             case _:
                 raise ValueError(f"Unknown model type: {self.config.model_type}")
 
     def get_optimizer(self) -> optax.GradientTransformation:
+        # Create learning rate schedule with warmup and cosine decay
+        if self.config.max_steps is not None:
+            # Warmup schedule
+            warmup_schedule = optax.linear_schedule(
+                init_value=0.0,
+                end_value=self.config.learning_rate,
+                transition_steps=self.config.warmup_steps,
+            )
+
+            # Cosine decay schedule
+            cosine_schedule = optax.cosine_decay_schedule(
+                init_value=self.config.learning_rate,
+                decay_steps=max(self.config.max_steps - self.config.warmup_steps, 1),
+                alpha=self.config.min_learning_rate / self.config.learning_rate,
+            )
+
+            # Combine warmup and decay
+            learning_rate_schedule = optax.join_schedules(
+                schedules=[warmup_schedule, cosine_schedule],
+                boundaries=[self.config.warmup_steps],
+            )
+        else:
+            # Fallback to constant learning rate if max_steps not specified
+            learning_rate_schedule = self.config.learning_rate
+
         opt = optax.adamw(
-            learning_rate=self.config.learning_rate,
+            learning_rate=learning_rate_schedule,
             weight_decay=0.01,
         )
 
@@ -264,8 +291,9 @@ class ShakespearePrediction(xax.SupervisedTask[Config]):
         metrics: xax.FrozenDict[str, Array],
         state: xax.State,
     ) -> None:
-        prompt = "To be or not to be, that is the"
-        prompt_seq = jnp.array(self.tokenizer.encode(prompt))
+        # prompt = "To be or not to be, that is the"
+        # prompt_seq = jnp.array(self.tokenizer.encode(prompt))
+        prompt_seq = batch["input_ids"][0, :16]
         generated_tokens = model.generate_sequence(prompt_seq, max_len=96)
         generated_words = self.tokenizer.decode(generated_tokens.tolist())
         self.logger.log_string("generated_output", generated_words)

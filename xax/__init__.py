@@ -69,6 +69,7 @@ __all__ = [
     "SSMBlock",
     "BaseLauncher",
     "CliLauncher",
+    "MultiCpuLauncher",
     "MultiDeviceLauncher",
     "SingleDeviceLauncher",
     "LogDistribution",
@@ -272,6 +273,7 @@ NAME_MAP: dict[str, str] = {
     "SSMBlock": "nn.ssm",
     "BaseLauncher": "task.launchers.base",
     "CliLauncher": "task.launchers.cli",
+    "MultiCpuLauncher": "task.launchers.multi_cpu",
     "MultiDeviceLauncher": "task.launchers.multi_device",
     "SingleDeviceLauncher": "task.launchers.single_device",
     "LogDistribution": "task.logger",
@@ -473,6 +475,7 @@ if IMPORT_ALL or TYPE_CHECKING:
     from xax.task.base import RawConfigType
     from xax.task.launchers.base import BaseLauncher
     from xax.task.launchers.cli import CliLauncher
+    from xax.task.launchers.multi_cpu import MultiCpuLauncher
     from xax.task.launchers.multi_device import MultiDeviceLauncher
     from xax.task.launchers.single_device import SingleDeviceLauncher
     from xax.task.logger import (

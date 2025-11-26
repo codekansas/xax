@@ -84,7 +84,7 @@ def gen_gpu_stats(loop_secs: int = 5) -> Iterable[GPUStats]:
     fields = ",".join(["index", "memory.total", "memory.used", "temperature.gpu", "utilization.gpu"])
     command = f"nvidia-smi --query-gpu={fields} --format=csv,noheader --loop={loop_secs}"
     visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    visible_device_ids = None if visible_devices is None else {int(i.strip()) for i in visible_devices.split(",")}
+    visible_device_ids = None if visible_devices is None else {int(i.strip()) for i in visible_devices.split(",") if i}
 
     try:
         with subprocess.Popen(command.split(), stdout=subprocess.PIPE, universal_newlines=True) as proc:
