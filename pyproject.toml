@@ -36,9 +36,13 @@ explicit_package_bases = true
 
 module = [
     "chex.*",
+    "datasets.*",
+    "etils.*",
     "optax.*",
+    "orbax.*",
     "setuptools.*",
     "tensorboard.*",
+    "tensorflow.*",
     "tensorflow_datasets.*",
     "transformers.*",
 ]

@@ -159,7 +159,7 @@ def abs_path(path: str) -> str:
     return str(Path(path).resolve())
 
 
-OmegaConf.register_new_resolver("ml.abs_path", abs_path, replace=True)
+OmegaConf.register_new_resolver("xax.abs_path", abs_path, replace=True)
 
 
 def cpu_count(default: int) -> int:
@@ -168,14 +168,14 @@ def cpu_count(default: int) -> int:
     return default
 
 
-OmegaConf.register_new_resolver("ml.cpu_count", cpu_count, replace=True)
+OmegaConf.register_new_resolver("xax.cpu_count", cpu_count, replace=True)
 
 
 def date_str(_: str) -> str:
     return time.strftime("%Y-%m-%d")
 
 
-OmegaConf.register_new_resolver("ml.date_str", date_str, replace=True)
+OmegaConf.register_new_resolver("xax.date_str", date_str, replace=True)
 
 
 def get_random_port(default: int = 1337) -> int:
@@ -850,4 +850,4 @@ def num_workers(default: int) -> int:
     return min(default, max_workers)
 
 
-OmegaConf.register_new_resolver("mlfab.num_workers", num_workers, replace=True)
+OmegaConf.register_new_resolver("xax.num_workers", num_workers, replace=True)

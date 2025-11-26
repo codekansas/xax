@@ -27,7 +27,6 @@ from typing import (
     Sequence,
     TypeVar,
     cast,
-    get_args,
 )
 
 import jax
@@ -38,7 +37,7 @@ from jaxtyping import Array
 from PIL import Image, ImageDraw, ImageFont
 from PIL.Image import Image as PILImage
 
-from xax.core.state import Phase, State
+from xax.core.state import State
 from xax.utils.experiments import ContextTimer, IntervalTicker
 from xax.utils.logging import LOG_ERROR_SUMMARY, LOG_PING, LOG_STATUS
 
@@ -289,6 +288,7 @@ class LogGraph:
 @dataclass(kw_only=True)
 class LogLine:
     state: State
+    heavy: bool
     scalars: dict[str, dict[str, LogScalar]]
     distributions: dict[str, dict[str, LogDistribution]]
     histograms: dict[str, dict[str, LogHistogram]]
@@ -460,7 +460,7 @@ class LoggerImpl(ABC):
         """
         super().__init__()
 
-        self.tickers = {phase: IntervalTicker(log_interval_seconds) for phase in get_args(Phase)}
+        self.ticker = {k: IntervalTicker(log_interval_seconds) for k in [True, False]}
 
     @abstractmethod
     def start(self) -> None: ...
@@ -517,17 +517,19 @@ class LoggerImpl(ABC):
             contents: The contents of the file.
         """
 
-    def should_log(self, state: State) -> bool:
+    def should_log(self, state: State, heavy: bool) -> bool:
         """Function that determines if the logger should log the current step.
 
         Args:
             state: The current step's state.
+            heavy: If the current step is heavy.
 
         Returns:
             If the logger should log the current step.
         """
         elapsed_time = state.elapsed_time_s.item()
-        return self.tickers[state.phase].tick(elapsed_time)
+        should_log = self.ticker[heavy].tick(elapsed_time)
+        return should_log
 
 
 class ToastHandler(logging.Handler):
@@ -593,9 +595,10 @@ class Logger:
         """
         self.loggers.extend(logger)
 
-    def pack(self, state: State) -> LogLine:
+    def pack(self, state: State, heavy: bool) -> LogLine:
         return LogLine(
             state=state,
+            heavy=heavy,
             scalars={k: {kk: v() for kk, v in v.items()} for k, v in self.scalars.items()},
             distributions={k: {kk: v() for kk, v in v.items()} for k, v in self.distributions.items()},
             histograms={k: {kk: v() for kk, v in v.items()} for k, v in self.histograms.items()},
@@ -614,17 +617,18 @@ class Logger:
         self.videos.clear()
         self.meshes.clear()
 
-    def write(self, state: State) -> None:
+    def write(self, state: State, heavy: bool) -> None:
         """Writes the current step's logging information.
 
         Args:
             state: The current step's state.
+            heavy: If the current step is heavy.
         """
-        should_log = [lg.should_log(state) for lg in self.loggers]
+        should_log = [lg.should_log(state, heavy) for lg in self.loggers]
         if not any(should_log):
             self.clear()
             return
-        line = self.pack(state)
+        line = self.pack(state, heavy)
         self.clear()
         for lg in (lg for lg, should_log in zip(self.loggers, should_log, strict=False) if should_log):
             lg.write(line)

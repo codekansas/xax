@@ -1,5 +1,6 @@
 """Defines a mixin for running the training loop."""
 
+import enum
 import functools
 import itertools
 import logging
@@ -12,21 +13,25 @@ from typing import (
     Generic,
     Literal,
     Mapping,
+    Protocol,
     Sequence,
     TypeVar,
     cast,
     get_args,
     overload,
+    runtime_checkable,
 )
 
 import equinox as eqx
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
+import orbax.checkpoint as ocp
 from jaxtyping import Array, PRNGKeyArray, PyTree
 
 from xax.core.conf import field
-from xax.core.state import Phase, State
+from xax.core.state import Batch, Output, State, StepKind
 from xax.nn.functions import set_random_seed
 from xax.task.mixins.artifacts import ArtifactsConfig, ArtifactsMixin
 from xax.task.mixins.checkpointing import (
@@ -37,6 +42,7 @@ from xax.task.mixins.checkpointing import (
 )
 from xax.task.mixins.data_loader import DataloadersConfig, DataloadersMixin
 from xax.task.mixins.logger import LoggerConfig, LoggerMixin
+from xax.task.mixins.parallel import ParallelConfig, ParallelMixin
 from xax.task.mixins.runnable import RunnableConfig, RunnableMixin
 from xax.task.mixins.step_wrapper import StepContextConfig, StepContextMixin
 from xax.utils.experiments import (
@@ -47,25 +53,41 @@ from xax.utils.experiments import (
     get_state_file_string,
     get_training_code,
 )
+from xax.utils.jax import jit as xax_jit
 from xax.utils.logging import LOG_PING, LOG_STATUS
 from xax.utils.types.frozen_dict import FrozenDict
 
 logger = logging.getLogger(__name__)
 
-# Batch = TypeVar("Batch")
-# Output = TypeVar("Output")
-
-Batch = Any
-Output = Any
-
-StepKind = Literal["step", "sample", "second"]
-
 PRINT_FINISH_TIME_EVERY_N_SECONDS = 60 * 2
+
+
+@runtime_checkable
+class Optimizer(Protocol):
+    def init(self, params: optax.Params) -> optax.OptState: ...
+
+    def update(
+        self,
+        updates: optax.Updates,
+        state: optax.OptState,
+        params: optax.Params | None = None,
+    ) -> tuple[optax.Updates, optax.OptState]: ...
 
 
 def cast_step_kind(s: str) -> StepKind:
     assert s in get_args(StepKind), f"`step_kind` must be one of {get_args(StepKind)}, not {s}"
     return cast(StepKind, s)
+
+
+class Precision(enum.Enum):
+    FLOAT32 = "float32"
+    BFLOAT16 = "bfloat16"
+
+
+def as_shape_dtype(x: Any) -> Any:  # noqa: ANN401
+    if isinstance(x, Array):
+        return ocp.utils.to_shape_dtype_struct(x)
+    return x
 
 
 @functools.lru_cache(maxsize=None)
@@ -84,63 +106,6 @@ def batches_per_step_schedule(schedule: list[int] | None) -> list[int] | None:
     if any(s < 1 for s in schedule):
         raise ValueError("Batch chunk schedule must be positive")
     return list(itertools.accumulate([0] + schedule))
-
-
-class ValidStepTimer:
-    def __init__(
-        self,
-        valid_every_n_steps: int | None = None,
-        valid_first_n_steps: int = 0,
-        valid_every_n_seconds: float | None = None,
-        valid_first_n_seconds: float | None = None,
-    ) -> None:
-        super().__init__()
-
-        self.valid_every_n_steps = valid_every_n_steps
-        self.valid_first_n_steps = valid_first_n_steps
-        self.valid_every_n_seconds = valid_every_n_seconds
-        self.valid_first_n_seconds = valid_first_n_seconds
-        self.first_valid_step_flag = True
-
-        self.last_valid_time: float | None = None
-        self.last_valid_step: int | None = None
-
-    def _reset(self, state: State) -> None:
-        self.last_valid_time = state.elapsed_time_s.item()
-        self.last_valid_step = state.num_steps.item()
-
-    def __call__(self, state: State) -> bool:
-        if state.num_steps < self.valid_first_n_steps:
-            return True
-
-        if self.last_valid_time is None or self.last_valid_step is None:
-            self._reset(state)
-            return False
-
-        # Step-based validation.
-        valid_every_n_steps = self.valid_every_n_steps
-        if valid_every_n_steps is not None and state.num_steps >= valid_every_n_steps + self.last_valid_step:
-            self._reset(state)
-            return True
-
-        # Time-based validation.
-        valid_every_n_seconds = self.valid_every_n_seconds
-        if (
-            valid_every_n_seconds is not None
-            and state.elapsed_time_s.item() - self.last_valid_time >= valid_every_n_seconds
-        ):
-            self._reset(state)
-            return True
-
-        # Time-based validation for first validation step.
-        if self.first_valid_step_flag:
-            valid_first_n_seconds = self.valid_first_n_seconds
-            if valid_first_n_seconds is not None and state.elapsed_time_s.item() >= valid_first_n_seconds:
-                self._reset(state)
-                self.first_valid_step_flag = False
-                return True
-
-        return False
 
 
 @jax.tree_util.register_dataclass
@@ -162,13 +127,13 @@ class TrainConfig(
     StepContextConfig,
     ArtifactsConfig,
     RunnableConfig,
+    ParallelConfig,
 ):
-    valid_every_n_steps: int | None = field(None, help="Number of training steps to run per validation step")
-    valid_first_n_steps: int = field(0, help="Treat the first N steps as validation steps")
-    valid_every_n_seconds: float | None = field(60.0 * 10.0, help="Run validation every N seconds")
-    valid_first_n_seconds: float | None = field(60.0, help="Run first validation after N seconds")
+    log_heavy_first_n_steps: int = field(1, help="Log heavy metrics for the first N steps")
+    log_heavy_every_n_seconds: int = field(60 * 5, help="Log heavy metrics every N seconds")
     max_steps: int | None = field(None, help="Maximum number of steps to run")
     step_kind: str = field("step", help=f"How to measure a step; one of [{', '.join(get_args(StepKind))}]")
+    precision: Precision = field(Precision.BFLOAT16, help="Precision to use for the task")
     random_seed: int = field(1337, help="Random seed for the task")
 
 
@@ -176,6 +141,7 @@ Config = TypeVar("Config", bound=TrainConfig)
 
 
 class TrainMixin(
+    ParallelMixin[Config],
     CheckpointingMixin[Config],
     DataloadersMixin[Config],
     LoggerMixin[Config],
@@ -185,8 +151,7 @@ class TrainMixin(
     Generic[Config, InitParamsT],
     ABC,
 ):
-    valid_step_timer: ValidStepTimer
-    state_timers: dict[Phase, StateTimer]
+    state_timer: StateTimer
 
     _training_over_flag: bool
     _last_printed_remaining_time: float
@@ -198,16 +163,8 @@ class TrainMixin(
         # Sets the random seed whenever we instantiate a new train mixin.
         set_random_seed(self.config.random_seed)
 
-        # Timer for validation steps.
-        self.valid_step_timer = ValidStepTimer(
-            valid_every_n_steps=config.valid_every_n_steps,
-            valid_first_n_steps=config.valid_first_n_steps,
-            valid_every_n_seconds=config.valid_every_n_seconds,
-            valid_first_n_seconds=config.valid_first_n_seconds,
-        )
-
         # Timers for iterations.
-        self.state_timers = {phase: StateTimer() for phase in get_args(Phase)}
+        self.state_timer = StateTimer()
 
         # This flag can be toggled to end training from anywhere in the task.
         self._training_over_flag = False
@@ -217,53 +174,49 @@ class TrainMixin(
         # The kind of step that was specified in the config.
         self._step_kind = cast_step_kind(self.config.step_kind)
 
+        # Update Jax configuration based on the precision.
+        match self.config.precision:
+            case Precision.FLOAT32:
+                jax.config.update("jax_default_matmul_precision", "float32")
+            case Precision.BFLOAT16:
+                jax.config.update("jax_default_matmul_precision", "bfloat16")
+            case _:
+                raise ValueError(f"Invalid precision: {self.config.precision}")
+
+    def cast_dtype(self, x: Any) -> Array:  # noqa: ANN401
+        if isinstance(x, Array) and jnp.issubdtype(x.dtype, jnp.floating):
+            match self.config.precision:
+                case Precision.FLOAT32:
+                    return x.astype(jnp.float32)
+                case Precision.BFLOAT16:
+                    return x.astype(jnp.bfloat16)
+                case _:
+                    raise ValueError(f"Invalid precision: {self.config.precision}")
+        return x
+
     def prng_key(self) -> PRNGKeyArray:
         return jax.random.PRNGKey(self.config.random_seed)
 
-    def log_train_step(
+    def log_light(
         self,
         model: PyTree,
         batch: Batch,
         output: Output,
         metrics: FrozenDict[str, Array],
         state: State,
-    ) -> None:
-        """Override this function to do logging during the training phase.
+    ) -> None: ...
 
-        This function is called after the model forward pass and before the
-        backward pass. It is called in the training phase.
-
-        Args:
-            model: The current model.
-            batch: The batch from the dataloader.
-            output: The model output.
-            metrics: The metrics for the current batch.
-            state: The current training state.
-        """
-
-    def log_valid_step(
+    def log_heavy(
         self,
         model: PyTree,
         batch: Batch,
         output: Output,
         metrics: FrozenDict[str, Array],
         state: State,
-    ) -> None:
-        """Override this function to do logging during the validation phase.
-
-        This function is called after the model forward pass. It is called in
-        the validation phase.
-
-        Args:
-            model: The current model.
-            batch: The batch from the dataloader.
-            output: The model output.
-            metrics: The metrics for the current batch.
-            state: The current training state.
-        """
+    ) -> None: ...
 
     def log_state_timers(self, state: State) -> None:
-        timer = self.state_timers[state.phase]
+        timer = self.state_timer
         timer.step(state)
         for k, v in timer.log_dict().items():
             if isinstance(v, tuple):
@@ -272,6 +225,16 @@ class TrainMixin(
                 secondary = False
             self.logger.log_scalar(k, v, namespace="🕒 timers", secondary=secondary)
 
+    @xax_jit(static_argnames=["self"], donate_argnames=["state"], jit_level=3)
+    def get_log_mode(self, state: State) -> tuple[State, Array]:
+        log_heavy = jnp.where(
+            state.num_steps <= self.config.log_heavy_first_n_steps,
+            True,
+            state.elapsed_time_s - state.last_log_time_s >= self.config.log_heavy_every_n_seconds,
+        )
+        last_log_time_s = jnp.where(log_heavy, state.elapsed_time_s, state.last_log_time_s)
+        return state.replace(last_log_time_s=last_log_time_s), log_heavy
+
     def log_step(
         self,
         model: PyTree,
@@ -279,8 +242,8 @@ class TrainMixin(
         output: Output,
         metrics: FrozenDict[str, Array],
         state: State,
-    ) -> None:
-        phase = state.phase
+    ) -> State:
+        state, log_heavy = self.get_log_mode(state)
 
         for k, v in metrics.items():
             if v.size == 1:
@@ -290,16 +253,15 @@ class TrainMixin(
 
         self.log_state_timers(state)
 
-        # Delegate to the appropriate logging function based on the phase.
-        match phase:
-            case "train":
-                self.log_train_step(model, batch, output, metrics, state)
-            case "valid":
-                self.log_valid_step(model, batch, output, metrics, state)
-            case _:
-                raise KeyError(f"Unknown phase: {phase}")
+        # Delegate to the appropriate logging function.
+        log_heavy_val = log_heavy.item()
+        if log_heavy_val:
+            self.log_heavy(model, batch, output, metrics, state)
+        else:
+            self.log_light(model, batch, output, metrics, state)
 
-        self.write_logs(state)
+        self.write_logs(state, log_heavy_val)
+        return state
 
     @abstractmethod
     def get_model(self, params: InitParamsT) -> PyTree | Sequence[PyTree]:
@@ -324,25 +286,28 @@ class TrainMixin(
         return models
 
     @abstractmethod
-    def get_optimizer(self) -> optax.GradientTransformation | Sequence[optax.GradientTransformation]:
+    def get_optimizer(self) -> Optimizer | Sequence[Optimizer]:
         """Gets the optimizer for the model.
 
         Returns:
             The optimizer to use to train the model.
         """
 
-    def _get_optimizers(self) -> list[optax.GradientTransformation]:
+    def _get_optimizers(self) -> list[Optimizer]:
         optimizers = self.get_optimizer()
-        if isinstance(optimizers, optax.GradientTransformation):
+        if isinstance(optimizers, Optimizer):
             optimizers = [optimizers]
         elif isinstance(optimizers, Sequence):
             optimizers = list(optimizers)
+        for opt in optimizers:
+            if not isinstance(opt, Optimizer):
+                raise ValueError(f"Optimizer {opt} is not a valid optimizer")
         return optimizers
 
     def get_initial_opt_state(
         self,
         models: list[PyTree],
-        optimizers: list[optax.GradientTransformation],
+        optimizers: list[Optimizer],
     ) -> list[optax.OptState]:
         return [opt.init(eqx.filter(model, eqx.is_array)) for model, opt in zip(models, optimizers, strict=True)]
 
@@ -351,6 +316,7 @@ class TrainMixin(
         self,
         params: InitParamsT,
         load_optimizer: Literal[False] = False,
+        model_sharding: jax.sharding.NamedSharding | None = None,
     ) -> tuple[PyTree, State]: ...
 
     @overload
@@ -358,35 +324,47 @@ class TrainMixin(
         self,
         params: InitParamsT,
         load_optimizer: Literal[True],
-    ) -> tuple[list[PyTree], list[optax.GradientTransformation], list[optax.OptState], State]: ...
+        model_sharding: jax.sharding.NamedSharding | None = None,
+    ) -> tuple[list[PyTree], list[Optimizer], list[optax.OptState], State]: ...
 
     def load_initial_state(
         self,
         params: InitParamsT,
         load_optimizer: bool = False,
-    ) -> (
-        tuple[list[PyTree], State]
-        | tuple[list[PyTree], list[optax.GradientTransformation], list[optax.OptState], State]
-    ):
+        model_sharding: jax.sharding.NamedSharding | None = None,
+    ) -> tuple[list[PyTree], State] | tuple[list[PyTree], list[Optimizer], list[optax.OptState], State]:
         init_ckpt_path = self.get_init_ckpt_path()
+
+        def _shard(x: Any) -> Any:  # noqa: ANN401
+            if isinstance(x, Array):
+                return jax.device_put(x, src=model_sharding)
+            return x
 
         if init_ckpt_path is not None:
             logger.info("Loading checkpoint from %s", init_ckpt_path)
-            model, state, config = self.load_ckpt(init_ckpt_path, params, part="model_state_config")
+            models, state, config = self.load_ckpt(init_ckpt_path, params, part="model_state_config")
+            if model_sharding is not None:
+                models = jax.tree.map(_shard, models)
             config_diff = get_diff_string(diff_configs(asdict(config), asdict(self.config)))
             if config_diff:
                 logger.warning("Loaded config differs from current config:\n%s", config_diff)
 
             if not load_optimizer:
-                return model, state
+                return models, state
 
-            optimizer = self.load_ckpt(init_ckpt_path, params, part="opt")
-            opt_state = self.load_ckpt(init_ckpt_path, params, part="opt_state", model=model, optimizer=optimizer)
-            return model, optimizer, opt_state, state
+            optimizers = self._get_optimizers()
+            opt_states = self.load_ckpt(init_ckpt_path, params, part="opt_state", models=models, optimizers=optimizers)
+            return models, optimizers, opt_states, state
 
         logger.info("Starting a new training run")
         models = self._get_models(params)
         state = State.init_state()
+
+        # Casts the model to the desired dtype.
+        models = jax.tree.map(self.cast_dtype, models)
+
+        if model_sharding is not None:
+            models = jax.tree.map(_shard, models)
 
         if not load_optimizer:
             return models, state
@@ -404,7 +382,7 @@ class TrainMixin(
         init_params: InitParamsT,
         *,
         part: Literal["all"],
-    ) -> tuple[list[PyTree], list[optax.GradientTransformation], list[optax.OptState], State, Config]: ...
+    ) -> tuple[list[PyTree], list[optax.OptState], State, Config]: ...
 
     @overload
     def load_ckpt(
@@ -430,18 +408,9 @@ class TrainMixin(
         path: Path,
         init_params: InitParamsT,
         *,
-        part: Literal["opt"],
-    ) -> list[optax.GradientTransformation]: ...
-
-    @overload
-    def load_ckpt(
-        self,
-        path: Path,
-        init_params: InitParamsT,
-        *,
         part: Literal["opt_state"],
-        model: PyTree | None = None,
-        optimizer: optax.GradientTransformation | None = None,
+        models: list[PyTree] | None = None,
+        optimizers: list[Optimizer] | None = None,
     ) -> list[optax.OptState]: ...
 
     @overload
@@ -468,13 +437,12 @@ class TrainMixin(
         init_params: InitParamsT,
         *,
         part: CheckpointPart = "all",
-        model: PyTree | None = None,
-        optimizer: optax.GradientTransformation | None = None,
+        models: list[PyTree] | None = None,
+        optimizers: list[Optimizer] | None = None,
     ) -> (
-        tuple[list[PyTree], list[optax.GradientTransformation], list[optax.OptState], State, Config]
+        tuple[list[PyTree], list[optax.OptState], State, Config]
         | tuple[list[PyTree], State, Config]
         | list[PyTree]
-        | list[optax.GradientTransformation]
         | list[optax.OptState]
         | State
         | Config
@@ -483,27 +451,28 @@ class TrainMixin(
 
         match part:
             case "model_state_config":
-                model_specs = eqx.filter_eval_shape(self._get_models, init_params)
-                model, state, config = load_ckpt(path, part="model_state_config", model_templates=model_specs)
+                if models is None:
+                    models_shape = eqx.filter_eval_shape(self._get_models, init_params)
+                    models_specs = jax.tree_util.tree_map(as_shape_dtype, models_shape)
+                else:
+                    models_specs = jax.tree_util.tree_map(as_shape_dtype, models)
+                models, state, config = load_ckpt(path, part="model_state_config", model_templates=models_specs)
                 config = self.get_config(config, use_cli=False)
-                return model, state, config
+                return models, state, config
 
             case "model":
-                model_specs = eqx.filter_eval_shape(self._get_models, init_params)
+                model_shape = eqx.filter_eval_shape(self._get_models, init_params)
+                model_specs = jax.tree_util.tree_map(as_shape_dtype, model_shape)
                 return load_ckpt(path, part="model", model_templates=model_specs)
 
-            case "opt":
-                optimizer_specs = eqx.filter_eval_shape(self._get_optimizers)
-                return load_ckpt(path, part="opt", optimizer_templates=optimizer_specs)
-
             case "opt_state":
-                if model is None:
-                    model_specs = eqx.filter_eval_shape(self._get_models, init_params)
-                    model = load_ckpt(path, part="model", model_templates=model_specs)
-                if optimizer is None:
-                    optimizer_specs = eqx.filter_eval_shape(self._get_optimizers)
-                    optimizer = load_ckpt(path, part="opt", optimizer_templates=optimizer_specs)
-                opt_state_specs = eqx.filter_eval_shape(self.get_initial_opt_state, model, optimizer)
+                if models is None:
+                    model_shape = eqx.filter_eval_shape(self._get_models, init_params)
+                    model_specs = jax.tree_util.tree_map(as_shape_dtype, model_shape)
+                    models = load_ckpt(path, part="model", model_templates=model_specs)
+                if optimizers is None:
+                    optimizers = self._get_optimizers()
+                opt_state_specs = eqx.filter_eval_shape(self.get_initial_opt_state, models, optimizers)
                 return load_ckpt(path, part="opt_state", opt_state_templates=opt_state_specs)
 
             case "state":
@@ -513,42 +482,45 @@ class TrainMixin(
                 return self.get_config(load_ckpt(path, part="config"), use_cli=False)
 
             case "all":
-                model_specs = eqx.filter_eval_shape(self._get_models, init_params)
-                model = load_ckpt(path, part="model", model_templates=model_specs)
-                optimizer_specs = eqx.filter_eval_shape(self._get_optimizers)
-                optimizer = load_ckpt(path, part="opt", optimizer_templates=optimizer_specs)
-                opt_state_specs = eqx.filter_eval_shape(self.get_initial_opt_state, model, optimizer)
-                opt_state = load_ckpt(path, part="opt_state", opt_state_templates=opt_state_specs)
+                if models is None:
+                    models_shape = eqx.filter_eval_shape(self._get_models, init_params)
+                    models_specs = jax.tree_util.tree_map(as_shape_dtype, models_shape)
+                    models = load_ckpt(path, part="model", model_templates=models_specs)
+                if optimizers is None:
+                    optimizers = self._get_optimizers()
+                opt_state_specs = eqx.filter_eval_shape(self.get_initial_opt_state, models, optimizers)
+                opt_states = load_ckpt(path, part="opt_state", opt_state_templates=opt_state_specs)
                 state = load_ckpt(path, part="state")
                 config = self.get_config(load_ckpt(path, part="config"), use_cli=False)
-                return model, optimizer, opt_state, state, config
+                return models, opt_states, state, config
 
             case _:
                 raise ValueError(f"Unknown checkpoint part: {part}")
 
-    def get_size_of_batch(self, batch: Batch) -> int | None:
+    def get_size_of_batch(self, batch: Batch, index: int = 0) -> int | None:
         """Gets the batch size for the current batch.
 
         Args:
             batch: The current minibatch of samples.
+            index: The index of the batch to get the size of.
 
         Returns:
             The parsed batch size, or None if the batch size could not be
             determined.
         """
-        if isinstance(batch, (np.ndarray, Array)):
-            return batch.shape[0]
+        if isinstance(batch, (np.ndarray, Array)) and len(batch.shape) > index:
+            return batch.shape[index]
         if is_dataclass(batch):
             for v in batch.__dict__.values():
-                if bsz := self.get_size_of_batch(v):
+                if bsz := self.get_size_of_batch(v, index):
                     return bsz
         if isinstance(batch, Mapping):
             for v in batch.values():
-                if bsz := self.get_size_of_batch(v):
+                if bsz := self.get_size_of_batch(v, index):
                     return bsz
         if isinstance(batch, Sequence):
             for i in batch:
-                if bsz := self.get_size_of_batch(i):
+                if bsz := self.get_size_of_batch(i, index):
                     return bsz
         return None
 

@@ -1,7 +1,6 @@
-"""Defines a mixin for running the training loop."""
+"""Defines a mixin for running the supervised training loop."""
 
 import bdb
-import contextlib
 import itertools
 import logging
 import signal
@@ -12,7 +11,6 @@ from abc import ABC
 from dataclasses import dataclass
 from threading import Thread
 from typing import (
-    Generator,
     Generic,
     Iterator,
     Sequence,
@@ -23,11 +21,13 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import optax
-from jaxtyping import Array, PRNGKeyArray, PyTree
+from jax.sharding import NamedSharding, PartitionSpec as P
+from jaxtyping import Array, PyTree
 
 from xax.core.conf import field
 from xax.core.state import State
 from xax.nn.parallel import is_master
+from xax.task.mixins.data_loader import iter_samples
 from xax.task.mixins.train import Batch, InitParams, Output, TrainConfig, TrainMixin
 from xax.utils.experiments import (
     ContextTimer,
@@ -128,7 +128,11 @@ class SupervisedMixin(
         metrics = self.compute_metrics(model, batch, output, loss, state)
         return loss, (output, metrics)
 
-    @xax_jit(static_argnames=["self", "model_static", "optimizer"], jit_level=3)
+    @xax_jit(
+        static_argnames=["self", "model_static", "optimizer"],
+        donate_argnames=["model_arr", "opt_state", "batch", "state"],
+        jit_level=3,
+    )
     def update(
         self,
         model_arr: PyTree,
@@ -145,21 +149,25 @@ class SupervisedMixin(
         model_arr = eqx.apply_updates(model_arr, updates)
         return model_arr, opt_state, output, metrics
 
-    @xax_jit(static_argnames=["self", "model_static", "optimizer"], jit_level=3)
+    @xax_jit(
+        static_argnames=["self", "model_static", "optimizer"],
+        donate_argnames=["model_arr", "opt_state", "state"],
+        jit_level=3,
+    )
     def train_step(
         self,
         model_arr: PyTree,
         model_static: PyTree,
         optimizer: optax.GradientTransformation,
         opt_state: optax.OptState,
-        batches: Batch,
+        batches: tuple[Batch, ...],
         state: State,
-    ) -> tuple[PyTree, optax.OptState, Output, FrozenDict[str, Array]]:
+    ) -> tuple[PyTree, optax.OptState, Output, FrozenDict[str, Array], State]:
         def update_fn(
-            carry: tuple[PyTree, optax.OptState],
+            carry: tuple[PyTree, optax.OptState, State],
             batch: Batch,
-        ) -> tuple[tuple[PyTree, optax.OptState], tuple[Output, FrozenDict[str, Array]]]:
-            model_arr, opt_state = carry
+        ) -> tuple[tuple[PyTree, optax.OptState, State], tuple[Output, FrozenDict[str, Array]]]:
+            model_arr, opt_state, state = carry
             model_arr, opt_state, output, metrics = self.update(
                 model_arr,
                 model_static,
@@ -168,12 +176,16 @@ class SupervisedMixin(
                 batch,
                 state,
             )
-            return (model_arr, opt_state), (output, FrozenDict(metrics))
+            state = state.replace(
+                num_steps=state.num_steps + 1,
+                num_samples=state.num_samples + (self.get_size_of_batch(batch) or 0),
+            )
+            return (model_arr, opt_state, state), (output, FrozenDict(metrics))
 
-        (model_arr, opt_state), (output, metrics) = xax_scan(
+        (model_arr, opt_state, state), (output, metrics) = xax_scan(
             update_fn,
-            (model_arr, opt_state),
-            batches,
+            (model_arr, opt_state, state),
+            jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *batches),
             jit_level=3,
         )
 
@@ -181,26 +193,14 @@ class SupervisedMixin(
         output = jax.tree.map(lambda x: x[-1], output)
         metrics = jax.tree.map(lambda x: x[-1], metrics)
 
-        return model_arr, opt_state, output, metrics
-
-    @xax_jit(static_argnames=["self", "model_static"], jit_level=3)
-    def val_step(
-        self,
-        model_arr: PyTree,
-        model_static: PyTree,
-        batch: Batch,
-        state: State,
-    ) -> tuple[Output, FrozenDict[str, Array]]:
-        _, (output, metrics) = self.get_output_and_loss(model_arr, model_static, batch, state)
-        return output, FrozenDict(metrics)
+        return model_arr, opt_state, output, metrics, state
 
     def train_loop(
         self,
         models: Sequence[PyTree],
         optimizers: Sequence[optax.GradientTransformation],
         opt_states: Sequence[optax.OptState],
-        train_pf: Iterator[Batch],
-        valid_pf: Iterator[Batch],
+        ds: Iterator[Batch],
         state: State,
     ) -> None:
         if len(models) != 1 or len(optimizers) != 1 or len(opt_states) != 1:
@@ -214,41 +214,21 @@ class SupervisedMixin(
         opt_state = opt_states[0]
 
         while not self.is_training_over(state):
-            valid_step = self.valid_step_timer(state)
-
-            if valid_step:
-                with ContextTimer() as timer:
-                    state = state.replace(phase="valid")
-                    valid_batch = next(valid_pf)
-                    output, metrics = self.val_step(model_arr, model_static, valid_batch, state)
-                    self.log_step(eqx.combine(model_arr, model_static), valid_batch, output, metrics, state)
-
-                state = state.replace(
-                    num_steps=state.num_steps + 1,
-                    num_samples=state.num_samples + (self.get_size_of_batch(valid_batch) or 0),
-                    elapsed_time_s=state.elapsed_time_s + timer.elapsed_time,
-                )
-
             with ContextTimer() as timer:
-                state = self.on_step_start(state)
-                state = state.replace(phase="train")
-                train_batches = list(itertools.islice(train_pf, self.config.updates_per_step))
-                model_arr, opt_state, output, metrics = self.train_step(
+                self.on_step_start()
+                batches = tuple(itertools.islice(ds, self.config.updates_per_step))
+                model_arr, opt_state, output, metrics, state = self.train_step(
                     model_arr=model_arr,
                     model_static=model_static,
                     optimizer=optimizer,
                     opt_state=opt_state,
-                    batches=jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *train_batches),
+                    batches=batches,
                     state=state,
                 )
-                self.log_step(eqx.combine(model_arr, model_static), train_batches[-1], output, metrics, state)
-                state = self.on_step_end(state)
+                state = self.log_step(eqx.combine(model_arr, model_static), batches[-1], output, metrics, state)
+                self.on_step_end()
 
-            state = state.replace(
-                num_steps=state.num_steps + 1,
-                num_samples=state.num_samples + (self.get_size_of_batch(train_batches[-1]) or 0),
-                elapsed_time_s=state.elapsed_time_s + timer.elapsed_time,
-            )
+            state = state.replace(elapsed_time_s=state.elapsed_time_s + timer.elapsed_time)
 
             if state.num_steps <= 3:
                 logger.log(LOG_PING, "Step %d took %.2f second", state.num_steps, timer.elapsed_time)
@@ -261,46 +241,13 @@ class SupervisedMixin(
         model = eqx.combine(model_arr, model_static)
         self.save_checkpoint(models=[model], optimizers=[optimizer], opt_states=[opt_state], state=state)
 
-    @contextlib.contextmanager
-    def get_train_iterator(self, key: PRNGKeyArray) -> Generator[Iterator[Batch], None, None]:
-        try:
-            train_iterator: Iterator[Batch] = self.get_data_iterator("train", key=key)
-            yield train_iterator
-            return
-        except NotImplementedError:
-            pass
-
-        train_ds = self.get_dataset("train")
-        train_dl = self.get_dataloader(train_ds, "train", prefetch_factor=self.config.updates_per_step + 1)
-        train_pf = self.get_prefetcher(train_dl)
-
-        try:
-            with train_pf as train_pf_ctx:
-                yield train_pf_ctx
-        finally:
-            logger.info("Closing train prefetcher")
-
-    @contextlib.contextmanager
-    def get_valid_iterator(self, key: PRNGKeyArray) -> Generator[Iterator[Batch], None, None]:
-        try:
-            valid_iterator: Iterator[Batch] = self.get_data_iterator("valid", key=key)
-            yield valid_iterator
-            return
-        except NotImplementedError:
-            pass
-
-        valid_ds = self.get_dataset("valid")
-        valid_dl = self.get_dataloader(valid_ds, "valid")
-        valid_pf = self.get_prefetcher(valid_dl)
-
-        try:
-            with valid_pf as valid_pf_ctx:
-                yield valid_pf_ctx
-        finally:
-            logger.info("Closing valid prefetcher")
-
     def run(self) -> None:
         self.run_training()
+
+    def get_sharding(self) -> NamedSharding:
+        ndevices = jax.local_device_count()
+        mesh = jax.make_mesh((ndevices,), axis_names=("batch",))
+        return jax.sharding.NamedSharding(mesh, P("batch"))
 
     def run_training(self) -> None:
         """Runs the training loop.
@@ -322,13 +269,22 @@ class SupervisedMixin(
             if is_master():
                 Thread(target=self.log_state, daemon=True).start()
 
+            # Gets the sharding strategy.
+            mesh = self.get_mesh()
+            data_sharding = self.get_data_sharding(mesh)
+            model_sharding = self.get_model_sharding(mesh)
+
             key, model_key = jax.random.split(key)
             init_params = InitParams(key=model_key)
-            models, optimizers, opt_states, state = self.load_initial_state(init_params, load_optimizer=True)
+            models, optimizers, opt_states, state = self.load_initial_state(
+                init_params,
+                load_optimizer=True,
+                model_sharding=model_sharding,
+            )
             logger.info("Model size: %s", f"{get_pytree_param_count(models):,}")
             logger.info("Optimizer size: %s", f"{get_pytree_param_count(opt_states):,}")
 
-            state = self.on_training_start(state)
+            self.on_training_start()
 
             def on_exit() -> None:
                 self.save_checkpoint(models=models, optimizers=optimizers, opt_states=opt_states, state=state)
@@ -336,33 +292,34 @@ class SupervisedMixin(
             # Handle user-defined interrupts during the training loop.
             self.add_signal_handler(on_exit, signal.SIGUSR1, signal.SIGTERM)
 
-            key, tkey, vkey = jax.random.split(key, 3)
-            with self.get_train_iterator(tkey) as train_pf, self.get_valid_iterator(vkey) as valid_pf:
-                try:
-                    self.train_loop(
-                        models=models,
-                        optimizers=optimizers,
-                        opt_states=opt_states,
-                        train_pf=train_pf,
-                        valid_pf=valid_pf,
-                        state=state,
-                    )
+            ds = self.get_data_iterator()
+            ds = iter_samples(ds, data_sharding)
 
-                except TrainingFinishedError:
-                    if is_master():
-                        num_steps, num_samples = int(state.num_steps), int(state.num_samples)
-                        show_info(f"Finished training after {num_steps} steps, {num_samples} samples", important=True)
-                    self.save_checkpoint(models=models, optimizers=optimizers, opt_states=opt_states, state=state)
+            try:
+                self.train_loop(
+                    models=models,
+                    optimizers=optimizers,
+                    opt_states=opt_states,
+                    ds=ds,
+                    state=state,
+                )
 
-                except (KeyboardInterrupt, bdb.BdbQuit):
-                    if is_master():
-                        show_info("Interrupted training", important=True)
+            except TrainingFinishedError:
+                if is_master():
+                    num_steps, num_samples = int(state.num_steps), int(state.num_samples)
+                    show_info(f"Finished training after {num_steps} steps, {num_samples} samples", important=True)
+                self.save_checkpoint(models=models, optimizers=optimizers, opt_states=opt_states, state=state)
 
-                except BaseException:
-                    exception_tb = textwrap.indent(highlight_exception_message(traceback.format_exc()), "  ")
-                    sys.stdout.write(f"Caught exception during training loop:\n\n{exception_tb}\n")
-                    sys.stdout.flush()
-                    self.save_checkpoint(models=models, optimizers=optimizers, opt_states=opt_states, state=state)
+            except (KeyboardInterrupt, bdb.BdbQuit):
+                if is_master():
+                    show_info("Interrupted training", important=True)
 
-                finally:
-                    state = self.on_training_end(state)
+            except BaseException:
+                exception_tb = textwrap.indent(highlight_exception_message(traceback.format_exc()), "  ")
+                sys.stdout.write(f"Caught exception during training loop:\n\n{exception_tb}\n")
+                sys.stdout.flush()
+                self.save_checkpoint(models=models, optimizers=optimizers, opt_states=opt_states, state=state)
+                raise
+
+            finally:
+                self.on_training_end()

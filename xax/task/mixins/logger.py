@@ -157,8 +157,8 @@ class LoggerMixin(BaseTask[Config], Generic[Config]):
                 # This shouldn't happen, as validation should take care of this
                 raise Exception(f"Invalid logger_backend '{self.config.logger_backend}'")
 
-    def write_logs(self, state: State) -> None:
-        self.logger.write(state)
+    def write_logs(self, state: State, heavy: bool) -> None:
+        self.logger.write(state, heavy)
 
     def __enter__(self) -> Self:
         self.logger.__enter__()

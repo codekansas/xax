@@ -67,17 +67,17 @@ class BaseTask(Generic[Config]):
 
         self.config = config
 
-    def on_step_start(self, state: State) -> State:
-        return state
+    def on_step_start(self) -> None:
+        pass
 
-    def on_step_end(self, state: State) -> State:
-        return state
+    def on_step_end(self) -> None:
+        pass
 
-    def on_training_start(self, state: State) -> State:
-        return state
+    def on_training_start(self) -> None:
+        pass
 
-    def on_training_end(self, state: State) -> State:
-        return state
+    def on_training_end(self) -> None:
+        pass
 
     def on_after_checkpoint_save(self, ckpt_path: Path, state: State | None) -> State | None:
         return state
@@ -163,7 +163,7 @@ class BaseTask(Generic[Config]):
         raise ValueError(
             "The config class could not be parsed from the generic type, which usually means that the task is not "
             "being instantiated correctly. Your class should be defined as follows:\n\n"
-            "  class ExampleTask(mlfab.Task[Config]):\n      ...\n\nThis lets the both the task and the type "
+            "  class ExampleTask(xax.SupervisedTask[Config]):\n      ...\n\nThis lets the both the task and the type "
             "checker know what config the task is using."
         )
 

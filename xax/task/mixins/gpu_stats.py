@@ -4,10 +4,8 @@ This logs GPU memory and utilization in a background process using
 ``nvidia-smi``, if a GPU is available in the system.
 """
 
-import functools
 import logging
 import os
-import re
 import shutil
 import subprocess
 from ctypes import Structure, c_double, c_uint32
@@ -15,14 +13,14 @@ from dataclasses import dataclass
 from multiprocessing.context import BaseContext, Process
 from multiprocessing.managers import SyncManager, ValueProxy
 from multiprocessing.synchronize import Event
-from typing import Generic, Iterable, Pattern, TypeVar
+from typing import Generic, Iterable, TypeVar
 
 import jax
 
 from xax.core.conf import field
-from xax.core.state import State
 from xax.task.mixins.logger import LoggerConfig, LoggerMixin
 from xax.task.mixins.process import ProcessConfig, ProcessMixin
+from xax.utils.devices import get_num_gpus, parse_number
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -41,8 +39,6 @@ class GPUStatsConfig(ProcessConfig, LoggerConfig):
 
 
 Config = TypeVar("Config", bound=GPUStatsConfig)
-
-NUMBER_REGEX: Pattern[str] = re.compile(r"[\d\.]+")
 
 
 class GPUStats(Structure):
@@ -71,29 +67,6 @@ class GPUStatsInfo:
         )
 
 
-@functools.lru_cache(maxsize=None)
-def get_num_gpus() -> int:
-    command = "nvidia-smi --query-gpu=index --format=csv --format=csv,noheader"
-
-    try:
-        with subprocess.Popen(command.split(), stdout=subprocess.PIPE, universal_newlines=True) as proc:
-            stdout = proc.stdout
-            assert stdout is not None
-            rows = iter(stdout.readline, "")
-            return len(list(rows))
-
-    except Exception:
-        logger.exception("Caught exception while trying to query `nvidia-smi`")
-        return 0
-
-
-def parse_number(s: str) -> float:
-    match = NUMBER_REGEX.search(s)
-    if match is None:
-        raise ValueError(s)
-    return float(match.group())
-
-
 def parse_gpu_stats(row: str) -> GPUStats:
     cols = row.split(",")
     index = int(cols[0].strip())
@@ -111,7 +84,7 @@ def gen_gpu_stats(loop_secs: int = 5) -> Iterable[GPUStats]:
     fields = ",".join(["index", "memory.total", "memory.used", "temperature.gpu", "utilization.gpu"])
     command = f"nvidia-smi --query-gpu={fields} --format=csv,noheader --loop={loop_secs}"
     visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    visible_device_ids = None if visible_devices is None else {int(i.strip()) for i in visible_devices.split(",")}
+    visible_device_ids = None if visible_devices is None else {int(i.strip()) for i in visible_devices.split(",") if i}
 
     try:
         with subprocess.Popen(command.split(), stdout=subprocess.PIPE, universal_newlines=True) as proc:
@@ -243,25 +216,23 @@ class GPUStatsMixin(ProcessMixin[Config], LoggerMixin[Config], Generic[Config]):
         else:
             self._gpu_stats_monitor = None
 
-    def on_training_start(self, state: State) -> State:
-        state = super().on_training_start(state)
+    def on_training_start(self) -> None:
+        super().on_training_start()
 
         if (monitor := self._gpu_stats_monitor) is not None:
             monitor.start()
-        return state
 
-    def on_training_end(self, state: State) -> State:
-        state = super().on_training_end(state)
+    def on_training_end(self) -> None:
+        super().on_training_end()
 
         if (monitor := self._gpu_stats_monitor) is not None:
             monitor.stop()
-        return state
 
-    def on_step_start(self, state: State) -> State:
-        state = super().on_step_start(state)
+    def on_step_start(self) -> None:
+        super().on_step_start()
 
         if (monitor := self._gpu_stats_monitor) is None:
-            return state
+            return
         stats = monitor.get_if_set() if self.config.gpu_stats.only_log_once else monitor.get()
 
         for gpu_stat in stats.values():
@@ -270,5 +241,3 @@ class GPUStatsMixin(ProcessMixin[Config], LoggerMixin[Config], Generic[Config]):
             self.logger.log_scalar(f"mem/{gpu_stat.index}", gpu_stat.memory_used, namespace="🔧 gpu", secondary=True)
             self.logger.log_scalar(f"temp/{gpu_stat.index}", gpu_stat.temperature, namespace="🔧 gpu", secondary=True)
             self.logger.log_scalar(f"util/{gpu_stat.index}", gpu_stat.utilization, namespace="🔧 gpu", secondary=True)
-
-        return state

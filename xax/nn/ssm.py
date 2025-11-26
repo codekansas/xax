@@ -224,7 +224,7 @@ class DiscreteDiagSSMBlock(DiagSSMBlock):
 class SSM(eqx.Module):
     vocab_embedding: eqx.nn.Embedding = eqx.field()
     output_layer: eqx.nn.Linear = eqx.field()
-    blocks: list[BaseSSMBlock] = eqx.field()
+    blocks: tuple[BaseSSMBlock, ...] = eqx.field()
     num_layers: int = eqx.field()
     hidden_size: int = eqx.field()
     skip_connections: bool = eqx.field()
@@ -262,7 +262,7 @@ class SSM(eqx.Module):
                 case _:
                     raise ValueError(f"Unknown block type: {block_type}")
 
-        self.blocks = [get_block(block_keys[i]) for i in range(num_layers)]
+        self.blocks = tuple(get_block(block_keys[i]) for i in range(num_layers))
         self.skip_connections = skip_connections
         self.num_layers = num_layers
         self.hidden_size = hidden_size

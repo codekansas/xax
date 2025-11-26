@@ -10,7 +10,6 @@ from typing import Generic, TypeVar
 import jax
 
 from xax.core.conf import field
-from xax.core.state import State
 from xax.task.base import BaseConfig, BaseTask
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -50,11 +49,9 @@ class ProcessMixin(BaseTask[Config], Generic[Config]):
     def multiprocessing_manager(self) -> SyncManager | None:
         return self._mp_manager
 
-    def on_training_end(self, state: State) -> State:
-        state = super().on_training_end(state)
+    def on_training_end(self) -> None:
+        super().on_training_end()
 
         if self._mp_manager is not None:
             self._mp_manager.shutdown()
             self._mp_manager.join()
-
-        return state

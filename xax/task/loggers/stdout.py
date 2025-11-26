@@ -97,9 +97,6 @@ class StdoutLogger(LoggerImpl):
             "Elapsed Time": format_timedelta(datetime.timedelta(seconds=line.state.elapsed_time_s.item()), short=True),
         }
 
-        colored_prefix = colored("Phase: ", "grey", bold=True)
-        colored_phase = colored(line.state.phase, "green" if line.state.phase == "train" else "yellow", bold=True)
-        self.write_fp.write(f"{colored_prefix}{colored_phase}\n")
         for k, v in state_info.items():
             self.write_fp.write(f" ↪ {k}: {colored(v, 'cyan')}\n")
 

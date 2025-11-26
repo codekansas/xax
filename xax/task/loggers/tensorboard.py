@@ -10,7 +10,6 @@ import time
 from pathlib import Path
 from typing import TypeVar
 
-from xax.core.state import Phase
 from xax.nn.parallel import is_master
 from xax.task.logger import LogError, LogErrorSummary, LoggerImpl, LogLine, LogPing, LogStatus
 from xax.utils.jax import as_float
@@ -144,9 +143,9 @@ class TensorboardLogger(LoggerImpl):
     def __del__(self) -> None:
         self.cleanup()
 
-    def get_writer(self, phase: Phase) -> TensorboardWriter:
+    def get_writer(self, heavy: bool) -> TensorboardWriter:
         self._start()
-        return self.writers.writer(phase)
+        return self.writers.writer(heavy)
 
     def log_file(self, name: str, contents: str) -> None:
         if not is_master():
@@ -157,7 +156,7 @@ class TensorboardLogger(LoggerImpl):
         if not is_master():
             return
 
-        writer = self.get_writer(line.state.phase)
+        writer = self.get_writer(line.heavy)
 
         global_step = line.state.num_steps.item()
         walltime = line.state.start_time_s.item() + line.state.elapsed_time_s.item()

@@ -19,7 +19,6 @@ import jax
 import psutil
 
 from xax.core.conf import field
-from xax.core.state import State
 from xax.task.base import BaseConfig
 from xax.task.mixins.logger import LoggerConfig, LoggerMixin
 from xax.task.mixins.process import ProcessConfig, ProcessMixin
@@ -228,25 +227,23 @@ class CPUStatsMixin(ProcessMixin[Config], LoggerMixin[Config], Generic[Config]):
         else:
             self._cpu_stats_monitor = None
 
-    def on_training_start(self, state: State) -> State:
-        state = super().on_training_start(state)
+    def on_training_start(self) -> None:
+        super().on_training_start()
 
         if (monitor := self._cpu_stats_monitor) is not None:
             monitor.start()
-        return state
 
-    def on_training_end(self, state: State) -> State:
-        state = super().on_training_end(state)
+    def on_training_end(self) -> None:
+        super().on_training_end()
 
         if (monitor := self._cpu_stats_monitor) is not None:
             monitor.stop()
-        return state
 
-    def on_step_start(self, state: State) -> State:
-        state = super().on_step_start(state)
+    def on_step_start(self) -> None:
+        super().on_step_start()
 
         if (monitor := self._cpu_stats_monitor) is None:
-            return state
+            return
 
         stats = monitor.get_if_set() if self.config.cpu_stats.only_log_once else monitor.get()
 
@@ -261,5 +258,3 @@ class CPUStatsMixin(ProcessMixin[Config], LoggerMixin[Config], Generic[Config]):
             self.logger.log_scalar("rss/total", stats.mem_rss_total, namespace="🔧 mem", secondary=True)
             self.logger.log_scalar("vms/cur", stats.mem_vms, namespace="🔧 mem", secondary=True)
             self.logger.log_scalar("vms/total", stats.mem_vms_total, namespace="🔧 mem", secondary=True)
-
-        return state
