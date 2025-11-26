@@ -84,8 +84,8 @@ class Precision(enum.Enum):
     BFLOAT16 = "bfloat16"
 
 
-def as_shape_dtype(x: Any) -> Any:
-    if eqx.is_inexact_array(x):
+def as_shape_dtype(x: Any) -> Any:  # noqa: ANN401
+    if isinstance(x, Array):
         return ocp.utils.to_shape_dtype_struct(x)
     return x
 
