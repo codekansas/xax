@@ -26,12 +26,10 @@ class Batch(TypedDict):
 class Config(xax.SupervisedConfig):
     num_layers: int = xax.field(4)
     hidden_size: int = xax.field(256)
-    batch_size: int = xax.field(8)
     learning_rate: float = xax.field(1e-4)
     min_learning_rate: float = xax.field(1e-5, help="Minimum learning rate for cosine decay")
     warmup_steps: int = xax.field(1000, help="Number of warmup steps")
     sequence_length: int = xax.field(1024)
-    log_heavy_every_n_seconds: int = xax.field(120)
     model_type: str = xax.field("ssm", help="The model to use")
 
 
@@ -102,7 +100,7 @@ class RNN(eqx.Module):
             return (hs, token, rng), token
 
         hs, _ = jax.lax.scan(encode_step, hs, prompt_seq_embedded)
-        _, sequence = jax.lax.scan(decode_step, (hs, prompt_seq[-1], jax.random.PRNGKey(0)), None, length=max_len)
+        _, sequence = jax.lax.scan(decode_step, (hs, prompt_seq[-1], jax.random.key(0)), None, length=max_len)
 
         return sequence
 
@@ -168,7 +166,7 @@ class LSTM(eqx.Module):
             return (hs, token, rng), token
 
         hs, _ = jax.lax.scan(encode_step, hs, prompt_seq_embedded)
-        _, sequence = jax.lax.scan(decode_step, (hs, prompt_seq[-1], jax.random.PRNGKey(0)), None, length=max_len)
+        _, sequence = jax.lax.scan(decode_step, (hs, prompt_seq[-1], jax.random.key(0)), None, length=max_len)
 
         return sequence
 
@@ -276,10 +274,17 @@ class ShakespearePrediction(xax.SupervisedTask[Config]):
         # Gradient accumulation.
         return optax.MultiSteps(opt, every_k_schedule=8)
 
-    def get_output(self, model: SequenceModel, batch: Batch, state: xax.State) -> Array:
+    def get_output(self, model: SequenceModel, batch: Batch, state: xax.State, key: PRNGKeyArray) -> Array:
         return jax.vmap(model.predict_sequence)(batch["input_ids"][:, :-1])
 
-    def compute_loss(self, model: SequenceModel, batch: Batch, output: Array, state: xax.State) -> Array:
+    def compute_loss(
+        self,
+        model: SequenceModel,
+        batch: Batch,
+        output: Array,
+        state: xax.State,
+        key: PRNGKeyArray,
+    ) -> Array:
         y, yhat, mask = batch["input_ids"][:, 1:], output, batch["attention_mask"][:, 1:] == 1
         return optax.softmax_cross_entropy_with_integer_labels(logits=yhat, labels=y, where=mask).mean()
 
@@ -290,6 +295,7 @@ class ShakespearePrediction(xax.SupervisedTask[Config]):
         output: Array,
         metrics: xax.FrozenDict[str, Array],
         state: xax.State,
+        key: PRNGKeyArray,
     ) -> None:
         # prompt = "To be or not to be, that is the"
         # prompt_seq = jnp.array(self.tokenizer.encode(prompt))
@@ -328,4 +334,9 @@ def _tokenize_with_tokenizer(examples: dict[str, str], tokenizer: Qwen2Tokenizer
 if __name__ == "__main__":
     # Launch the training task.
     #   python -m examples.shakespeare
-    ShakespearePrediction.launch()
+    ShakespearePrediction.launch(
+        Config(
+            batch_size=8,
+            log_heavy_every_n_seconds=120,
+        ),
+    )

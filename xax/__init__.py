@@ -23,6 +23,8 @@ __all__ = [
     "get_run_dir",
     "load_user_config",
     "State",
+    "cast_activation_type",
+    "get_activation",
     "AttentionCache",
     "AttentionCacheDict",
     "CrossAttentionBlock",
@@ -31,6 +33,18 @@ __all__ = [
     "TransformerBlock",
     "TransformerCache",
     "TransformerStack",
+    "BaseODESolver",
+    "ConsistencyModel",
+    "EulerODESolver",
+    "GaussianDiffusion",
+    "HeunODESolver",
+    "RK4ODESolver",
+    "cast_beta_schedule",
+    "cast_diffusion_loss_fn",
+    "cast_diffusion_pred_mode",
+    "cast_ode_solver_type",
+    "get_diffusion_beta_schedule",
+    "get_ode_solver",
     "Categorical",
     "Distribution",
     "MixtureOfGaussians",
@@ -59,14 +73,20 @@ __all__ = [
     "rotation_matrix_to_quat",
     "rotation_matrix_to_rotation6d",
     "cross_entropy",
-    "cast_norm_type",
+    "cast_euclidean_norm_type",
     "dynamic_time_warping",
-    "get_norm",
+    "get_euclidean_norm",
+    "cast_norm_type",
+    "get_norm_1d",
+    "get_norm_2d",
+    "get_norm_3d",
+    "get_norm_linear",
     "is_master",
     "BaseSSMBlock",
     "DiagSSMBlock",
     "SSM",
     "SSMBlock",
+    "UNet",
     "BaseLauncher",
     "CliLauncher",
     "MultiCpuLauncher",
@@ -100,6 +120,7 @@ __all__ = [
     "ParallelMixin",
     "StepContext",
     "InitParams",
+    "Optimizer",
     "Script",
     "ScriptConfig",
     "Config",
@@ -181,17 +202,22 @@ __all__ = [
 ]
 
 __all__ += [
+    "ActivationType",
     "Batch",
     "CollateMode",
-    "EmbeddingKind",
-    "ActivationFunction",
+    "DiffusionBetaSchedule",
+    "DiffusionLossFn",
+    "DiffusionPredMode",
     "DTYPE",
+    "EmbeddingKind",
     "LOG_ERROR_SUMMARY",
     "LOG_PING",
     "LOG_STATUS",
     "NormType",
+    "ODESolverType",
     "Output",
     "RawConfigType",
+    "SigmaType",
 ]
 
 import os
@@ -227,6 +253,8 @@ NAME_MAP: dict[str, str] = {
     "get_run_dir": "core.conf",
     "load_user_config": "core.conf",
     "State": "core.state",
+    "cast_activation_type": "nn.activation",
+    "get_activation": "nn.activation",
     "AttentionCache": "nn.attention",
     "AttentionCacheDict": "nn.attention",
     "CrossAttentionBlock": "nn.attention",
@@ -235,6 +263,18 @@ NAME_MAP: dict[str, str] = {
     "TransformerBlock": "nn.attention",
     "TransformerCache": "nn.attention",
     "TransformerStack": "nn.attention",
+    "BaseODESolver": "nn.diffusion",
+    "ConsistencyModel": "nn.diffusion",
+    "EulerODESolver": "nn.diffusion",
+    "GaussianDiffusion": "nn.diffusion",
+    "HeunODESolver": "nn.diffusion",
+    "RK4ODESolver": "nn.diffusion",
+    "cast_beta_schedule": "nn.diffusion",
+    "cast_diffusion_loss_fn": "nn.diffusion",
+    "cast_diffusion_pred_mode": "nn.diffusion",
+    "cast_ode_solver_type": "nn.diffusion",
+    "get_diffusion_beta_schedule": "nn.diffusion",
+    "get_ode_solver": "nn.diffusion",
     "Categorical": "nn.distributions",
     "Distribution": "nn.distributions",
     "MixtureOfGaussians": "nn.distributions",
@@ -263,14 +303,20 @@ NAME_MAP: dict[str, str] = {
     "rotation_matrix_to_quat": "nn.geom",
     "rotation_matrix_to_rotation6d": "nn.geom",
     "cross_entropy": "nn.losses",
-    "cast_norm_type": "nn.metrics",
+    "cast_euclidean_norm_type": "nn.metrics",
     "dynamic_time_warping": "nn.metrics",
-    "get_norm": "nn.metrics",
+    "get_euclidean_norm": "nn.metrics",
+    "cast_norm_type": "nn.norm",
+    "get_norm_1d": "nn.norm",
+    "get_norm_2d": "nn.norm",
+    "get_norm_3d": "nn.norm",
+    "get_norm_linear": "nn.norm",
     "is_master": "nn.parallel",
     "BaseSSMBlock": "nn.ssm",
     "DiagSSMBlock": "nn.ssm",
     "SSM": "nn.ssm",
     "SSMBlock": "nn.ssm",
+    "UNet": "nn.unet",
     "BaseLauncher": "task.launchers.base",
     "CliLauncher": "task.launchers.cli",
     "MultiCpuLauncher": "task.launchers.multi_cpu",
@@ -304,6 +350,7 @@ NAME_MAP: dict[str, str] = {
     "ParallelMixin": "task.mixins.parallel",
     "StepContext": "task.mixins.step_wrapper",
     "InitParams": "task.mixins.train",
+    "Optimizer": "task.mixins.train",
     "Script": "task.script",
     "ScriptConfig": "task.script",
     "Config": "task.task",
@@ -387,17 +434,22 @@ NAME_MAP: dict[str, str] = {
 # Need to manually set some values which can't be auto-generated.
 NAME_MAP.update(
     {
+        "ActivationType": "nn.activation",
         "Batch": "task.mixins.train",
         "CollateMode": "utils.data.collate",
+        "DiffusionBetaSchedule": "nn.diffusion",
+        "DiffusionLossFn": "nn.diffusion",
+        "DiffusionPredMode": "nn.diffusion",
+        "DTYPE": "nn.equinox",
         "EmbeddingKind": "nn.embeddings",
         "LOG_ERROR_SUMMARY": "utils.logging",
         "LOG_PING": "utils.logging",
         "LOG_STATUS": "utils.logging",
         "NormType": "nn.metrics",
+        "ODESolverType": "nn.diffusion",
         "Output": "task.mixins.output",
         "RawConfigType": "task.base",
-        "ActivationFunction": "nn.equinox",
-        "DTYPE": "nn.equinox",
+        "SigmaType": "nn.diffusion",
     },
 )
 
@@ -424,6 +476,7 @@ if IMPORT_ALL or TYPE_CHECKING:
         load_user_config,
     )
     from xax.core.state import State
+    from xax.nn.activation import ActivationType, cast_activation_type, get_activation
     from xax.nn.attention import (
         AttentionCache,
         AttentionCacheDict,
@@ -433,6 +486,23 @@ if IMPORT_ALL or TYPE_CHECKING:
         TransformerBlock,
         TransformerCache,
         TransformerStack,
+    )
+    from xax.nn.diffusion import (
+        BaseODESolver,
+        ConsistencyModel,
+        DiffusionBetaSchedule,
+        DiffusionLossFn,
+        DiffusionPredMode,
+        EulerODESolver,
+        GaussianDiffusion,
+        HeunODESolver,
+        RK4ODESolver,
+        cast_beta_schedule,
+        cast_diffusion_loss_fn,
+        cast_diffusion_pred_mode,
+        cast_ode_solver_type,
+        get_diffusion_beta_schedule,
+        get_ode_solver,
     )
     from xax.nn.distributions import (
         Categorical,
@@ -469,9 +539,11 @@ if IMPORT_ALL or TYPE_CHECKING:
         rotation_matrix_to_rotation6d,
     )
     from xax.nn.losses import cross_entropy
-    from xax.nn.metrics import NormType, cast_norm_type, dynamic_time_warping, get_norm
+    from xax.nn.metrics import NormType, cast_euclidean_norm_type, dynamic_time_warping, get_euclidean_norm
+    from xax.nn.norm import NormType, cast_norm_type, get_norm_1d, get_norm_2d, get_norm_3d, get_norm_linear
     from xax.nn.parallel import is_master
     from xax.nn.ssm import SSM, BaseSSMBlock, DiagSSMBlock, SSMBlock
+    from xax.nn.unet import UNet
     from xax.task.base import RawConfigType
     from xax.task.launchers.base import BaseLauncher
     from xax.task.launchers.cli import CliLauncher
@@ -505,7 +577,7 @@ if IMPORT_ALL or TYPE_CHECKING:
     from xax.task.mixins.gpu_stats import GPUStatsOptions
     from xax.task.mixins.parallel import ParallelConfig, ParallelMixin
     from xax.task.mixins.step_wrapper import StepContext
-    from xax.task.mixins.train import Batch, InitParams, Output
+    from xax.task.mixins.train import Batch, InitParams, Optimizer, Output
     from xax.task.script import Script, ScriptConfig
     from xax.task.task import Config, SupervisedConfig, SupervisedTask, Task
     from xax.utils.data.collate import CollateMode, collate, collate_non_null

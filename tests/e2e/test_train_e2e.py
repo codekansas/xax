@@ -64,16 +64,23 @@ class SimpleTask(xax.SupervisedTask[SimpleConfig]):
     def get_optimizer(self) -> optax.GradientTransformation:
         return optax.adam(self.config.learning_rate)
 
-    def get_output(self, model: SimpleModel, batch: Batch, state: xax.State) -> Array:
+    def get_output(self, model: SimpleModel, batch: Batch, state: xax.State, key: PRNGKeyArray) -> Array:
         return jax.vmap(model)(batch["x"])
 
-    def compute_loss(self, model: SimpleModel, batch: Batch, output: Array, state: xax.State) -> Array:
+    def compute_loss(
+        self,
+        model: SimpleModel,
+        batch: Batch,
+        output: Array,
+        state: xax.State,
+        key: PRNGKeyArray,
+    ) -> Array:
         y_one_hot = jax.nn.one_hot(batch["y"], 2)
         return -jnp.mean(jnp.sum(output * y_one_hot, axis=-1))
 
     def get_dataset(self) -> Dataset:
         """Create a dummy dataset for testing."""
-        key = jax.random.PRNGKey(42)
+        key = jax.random.key(42)
         num_samples = 1000
 
         # Generate dummy data
@@ -134,7 +141,7 @@ def test_save_load_model(tmpdir: Path) -> None:
 
     # Test loading checkpoint
     task = SimpleTask.get_task(SimpleConfig(exp_dir=str(tmpdir)), use_cli=False)
-    init_params = xax.InitParams(key=jax.random.PRNGKey(42))
+    init_params = xax.InitParams(key=jax.random.key(42))
 
     # Load checkpoint components
     models, opt_states, state, _ = task.load_ckpt(ckpt_path, init_params=init_params, part="all")

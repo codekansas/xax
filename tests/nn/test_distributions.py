@@ -37,7 +37,7 @@ class TestCategorical:
         logits = jnp.array([1.0, 2.0, 3.0])
         cat = xax.Categorical(logits)
 
-        key = jax.random.PRNGKey(0)
+        key = jax.random.key(0)
         samples = cat.sample(key)
 
         # Check shape
@@ -50,7 +50,7 @@ class TestCategorical:
         logits = jnp.array([[1.0, 2.0, 3.0], [0.0, 1.0, 2.0]])
         cat = xax.Categorical(logits)
 
-        key = jax.random.PRNGKey(0)
+        key = jax.random.key(0)
         samples = cat.sample(key)
 
         # Check shape
@@ -137,7 +137,7 @@ class TestNormal:
         std_n = jnp.array(1.0)
         normal = xax.Normal(mean_n, std_n)
 
-        key = jax.random.PRNGKey(0)
+        key = jax.random.key(0)
         samples = normal.sample(key)
 
         # Check shape
@@ -151,7 +151,7 @@ class TestNormal:
         std_n = jnp.array([1.0, 2.0])
         normal = xax.Normal(mean_n, std_n)
 
-        key = jax.random.PRNGKey(0)
+        key = jax.random.key(0)
         samples = normal.sample(key)
 
         # Check shape
@@ -254,7 +254,7 @@ class TestMixtureOfGaussians:
         logits = jnp.array([0.0, 0.0])
         mixture = xax.MixtureOfGaussians(means, stds, logits)
 
-        key = jax.random.PRNGKey(0)
+        key = jax.random.key(0)
         samples = mixture.sample(key)
 
         # Check shape - should be scalar since we have scalar inputs
@@ -270,7 +270,7 @@ class TestMixtureOfGaussians:
         logits = jnp.array([[0.0, 0.0], [1.0, 0.0]])
         mixture = xax.MixtureOfGaussians(means, stds, logits)
 
-        key = jax.random.PRNGKey(0)
+        key = jax.random.key(0)
         samples = mixture.sample(key)
 
         # Check shape - should match the batch dimensions
@@ -361,7 +361,7 @@ class TestDistributionProperties:
         logits = jnp.array([0.0, 5.0])
         mixture = xax.MixtureOfGaussians(means, stds, logits)
 
-        key = jax.random.PRNGKey(0)
+        key = jax.random.key(0)
         samples = [mixture.sample(jax.random.fold_in(key, i)) for i in range(50)]
         samples = jnp.array(samples)
 
@@ -380,7 +380,7 @@ class TestEdgeCases:
         cat = xax.Categorical(logits)
 
         # Test sampling
-        key = jax.random.PRNGKey(0)
+        key = jax.random.key(0)
         samples = cat.sample(key)
         assert samples == 0  # Only possible value
 
@@ -404,7 +404,7 @@ class TestEdgeCases:
         assert jnp.allclose(mixture_log_prob, normal_log_prob)
 
         # Test sampling - both should produce reasonable samples from the same distribution
-        key = jax.random.PRNGKey(0)
+        key = jax.random.key(0)
         mixture_sample = mixture.sample(key)
         normal_sample = normal.sample(key)
         # Both should be reasonable samples from N(0, 1)
@@ -424,7 +424,7 @@ class TestEdgeCases:
         assert jnp.allclose(mode, means[1])  # Should be second component
 
         # Test sampling
-        key = jax.random.PRNGKey(0)
+        key = jax.random.key(0)
         samples = [mixture.sample(jax.random.fold_in(key, i)) for i in range(50)]
         samples = jnp.array(samples)
 

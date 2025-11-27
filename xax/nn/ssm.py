@@ -311,6 +311,6 @@ class SSM(eqx.Module):
             return (hs, token, rng), token
 
         hs, _ = jax.lax.scan(encode_step, hs, prompt_seq_embedded)
-        _, sequence = jax.lax.scan(decode_step, (hs, prompt_seq[-1], jax.random.PRNGKey(0)), None, length=max_len)
+        _, sequence = jax.lax.scan(decode_step, (hs, prompt_seq[-1], jax.random.key(0)), None, length=max_len)
 
         return sequence

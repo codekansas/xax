@@ -897,7 +897,7 @@ class Transformer(eqx.Module):
             Generated sequence of shape (prompt_len + max_len,)
         """
         if key is None:
-            key = jax.random.PRNGKey(0)
+            key = jax.random.key(0)
 
         prompt_len = prompt_seq.shape[0]
 
