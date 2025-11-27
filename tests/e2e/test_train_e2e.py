@@ -64,10 +64,17 @@ class SimpleTask(xax.SupervisedTask[SimpleConfig]):
     def get_optimizer(self) -> optax.GradientTransformation:
         return optax.adam(self.config.learning_rate)
 
-    def get_output(self, model: SimpleModel, batch: Batch, state: xax.State) -> Array:
+    def get_output(self, model: SimpleModel, batch: Batch, state: xax.State, key: PRNGKeyArray) -> Array:
         return jax.vmap(model)(batch["x"])
 
-    def compute_loss(self, model: SimpleModel, batch: Batch, output: Array, state: xax.State) -> Array:
+    def compute_loss(
+        self,
+        model: SimpleModel,
+        batch: Batch,
+        output: Array,
+        state: xax.State,
+        key: PRNGKeyArray,
+    ) -> Array:
         y_one_hot = jax.nn.one_hot(batch["y"], 2)
         return -jnp.mean(jnp.sum(output * y_one_hot, axis=-1))
 

@@ -244,6 +244,6 @@ if __name__ == "__main__":
             max_grad_norm=1.0,
             # Perform a few updates per step, because otherwise we are sometimes
             # bottlenecked by the data loader.
-            updates_per_step=5,
+            updates_per_step=10,
         ),
     )
