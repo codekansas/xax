@@ -120,6 +120,7 @@ __all__ = [
     "ParallelMixin",
     "StepContext",
     "InitParams",
+    "Optimizer",
     "Script",
     "ScriptConfig",
     "Config",
@@ -349,6 +350,7 @@ NAME_MAP: dict[str, str] = {
     "ParallelMixin": "task.mixins.parallel",
     "StepContext": "task.mixins.step_wrapper",
     "InitParams": "task.mixins.train",
+    "Optimizer": "task.mixins.train",
     "Script": "task.script",
     "ScriptConfig": "task.script",
     "Config": "task.task",
@@ -575,7 +577,7 @@ if IMPORT_ALL or TYPE_CHECKING:
     from xax.task.mixins.gpu_stats import GPUStatsOptions
     from xax.task.mixins.parallel import ParallelConfig, ParallelMixin
     from xax.task.mixins.step_wrapper import StepContext
-    from xax.task.mixins.train import Batch, InitParams, Output
+    from xax.task.mixins.train import Batch, InitParams, Optimizer, Output
     from xax.task.script import Script, ScriptConfig
     from xax.task.task import Config, SupervisedConfig, SupervisedTask, Task
     from xax.utils.data.collate import CollateMode, collate, collate_non_null

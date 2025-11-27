@@ -113,7 +113,7 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
             key=params.key,
         )
 
-    def get_optimizer(self) -> optax.GradientTransformation:
+    def get_optimizer(self) -> xax.Optimizer:
         warmup_schedule = optax.linear_schedule(
             init_value=0.0,
             end_value=self.config.learning_rate,
