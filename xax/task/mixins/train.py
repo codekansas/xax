@@ -195,7 +195,7 @@ class TrainMixin(
         return x
 
     def prng_key(self) -> PRNGKeyArray:
-        return jax.random.PRNGKey(self.config.random_seed)
+        return jax.random.key(self.config.random_seed)
 
     def log_light(
         self,
@@ -204,6 +204,7 @@ class TrainMixin(
         output: Output,
         metrics: FrozenDict[str, Array],
         state: State,
+        key: PRNGKeyArray,
     ) -> None: ...
 
     def log_heavy(
@@ -213,6 +214,7 @@ class TrainMixin(
         output: Output,
         metrics: FrozenDict[str, Array],
         state: State,
+        key: PRNGKeyArray,
     ) -> None: ...
 
     def log_state_timers(self, state: State) -> None:
@@ -242,6 +244,7 @@ class TrainMixin(
         output: Output,
         metrics: FrozenDict[str, Array],
         state: State,
+        key: PRNGKeyArray,
     ) -> State:
         state, log_heavy = self.get_log_mode(state)
 
@@ -256,9 +259,9 @@ class TrainMixin(
         # Delegate to the appropriate logging function.
         log_heavy_val = log_heavy.item()
         if log_heavy_val:
-            self.log_heavy(model, batch, output, metrics, state)
+            self.log_heavy(model, batch, output, metrics, state, key)
         else:
-            self.log_light(model, batch, output, metrics, state)
+            self.log_light(model, batch, output, metrics, state, key)
 
         self.write_logs(state, log_heavy_val)
         return state

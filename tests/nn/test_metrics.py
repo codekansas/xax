@@ -22,7 +22,7 @@ def test_dtw_cost_matches() -> None:
         _assert_correct((series_2[:, None] - series_1[None, :]) ** 2)
 
     # Random matrix.
-    key = jax.random.PRNGKey(0)
+    key = jax.random.key(0)
     n, m = 5, 10
     distances = jax.random.uniform(key, (n, m))
     _assert_correct(distances)

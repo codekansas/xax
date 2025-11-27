@@ -22,7 +22,7 @@ import jax
 import jax.numpy as jnp
 import optax
 from jax.sharding import NamedSharding, PartitionSpec as P
-from jaxtyping import Array, PyTree
+from jaxtyping import Array, PRNGKeyArray, PyTree
 
 from xax.core.conf import field
 from xax.core.state import State
@@ -57,7 +57,7 @@ class SupervisedMixin(
     Generic[Config],
     ABC,
 ):
-    def get_output(self, model: PyTree, batch: Batch, state: State) -> Output:
+    def get_output(self, model: PyTree, batch: Batch, state: State, key: PRNGKeyArray) -> Output:
         """Gets the output from the model.
 
         By default, we assume the model is a function that takes the batch as
@@ -68,10 +68,14 @@ class SupervisedMixin(
             model: The current model.
             batch: The current minibatch of samples.
             state: The current training state.
+            key: The current PRNG key.
+
+        Returns:
+            The output from the model.
         """
         raise NotImplementedError("`get_output` must be implemented by the subclass")
 
-    def compute_loss(self, model: PyTree, batch: Batch, output: Output, state: State) -> Array:
+    def compute_loss(self, model: PyTree, batch: Batch, output: Output, state: State, key: PRNGKeyArray) -> Array:
         """Gets the loss for the current batch.
 
         By default, we assume the model is a function that takes the batch as
@@ -83,6 +87,7 @@ class SupervisedMixin(
             batch: The current minibatch of samples.
             output: The output from the model.
             state: The current training state.
+            key: The current PRNG key.
 
         Returns:
             The computed loss, as a tensor.
@@ -122,16 +127,18 @@ class SupervisedMixin(
         model_static: PyTree,
         batch: Batch,
         state: State,
+        key: PRNGKeyArray,
     ) -> tuple[Array, tuple[Output, dict[str, Array]]]:
+        output_key, loss_key = jax.random.split(key)
         model = eqx.combine(model_arr, model_static)
-        output = self.get_output(model, batch, state)
-        loss = self.compute_loss(model, batch, output, state)
+        output = self.get_output(model, batch, state, output_key)
+        loss = self.compute_loss(model, batch, output, state, loss_key)
         metrics = self.compute_metrics(model, batch, output, loss, state)
         return loss, (output, metrics)
 
     @xax_jit(
         static_argnames=["self", "model_static", "optimizer"],
-        donate_argnames=["model_arr", "opt_state", "batch", "state"],
+        donate_argnames=["model_arr", "opt_state", "batch", "state", "key"],
         jit_level=3,
     )
     def update(
@@ -142,10 +149,11 @@ class SupervisedMixin(
         opt_state: optax.OptState,
         batch: Batch,
         state: State,
+        key: PRNGKeyArray,
     ) -> tuple[PyTree, optax.OptState, Output, dict[str, Array]]:
         grad_fn = jax.grad(self.get_output_and_loss, argnums=0, has_aux=True)
         grad_fn = xax_jit(static_argnums=[1], jit_level=3)(grad_fn)
-        grads, (output, metrics) = grad_fn(model_arr, model_static, batch, state)
+        grads, (output, metrics) = grad_fn(model_arr, model_static, batch, state, key)
         grad_norm = optax.global_norm(grads)
         if self.config.max_grad_norm is not None:
             clip_fn = optax.clip_by_global_norm(self.config.max_grad_norm)
@@ -162,7 +170,7 @@ class SupervisedMixin(
 
     @xax_jit(
         static_argnames=["self", "model_static", "optimizer"],
-        donate_argnames=["model_arr", "opt_state", "state"],
+        donate_argnames=["model_arr", "opt_state", "state", "key"],
         jit_level=3,
     )
     def train_step(
@@ -173,6 +181,7 @@ class SupervisedMixin(
         opt_state: optax.OptState,
         batches: tuple[Batch, ...],
         state: State,
+        key: PRNGKeyArray,
     ) -> tuple[PyTree, optax.OptState, Output, FrozenDict[str, Array], State]:
         def update_fn(
             carry: tuple[PyTree, optax.OptState, State],
@@ -186,6 +195,7 @@ class SupervisedMixin(
                 opt_state,
                 batch,
                 state,
+                key,
             )
             state = state.replace(
                 num_steps=state.num_steps + 1,
@@ -213,6 +223,7 @@ class SupervisedMixin(
         opt_states: Sequence[optax.OptState],
         ds: Iterator[Batch],
         state: State,
+        key: PRNGKeyArray,
     ) -> None:
         if len(models) != 1 or len(optimizers) != 1 or len(opt_states) != 1:
             raise ValueError(
@@ -228,6 +239,7 @@ class SupervisedMixin(
             with ContextTimer() as timer:
                 self.on_step_start()
                 batches = tuple(itertools.islice(ds, self.config.updates_per_step))
+                step_key, log_key, key = jax.random.split(key, 3)
                 model_arr, opt_state, output, metrics, state = self.train_step(
                     model_arr=model_arr,
                     model_static=model_static,
@@ -235,8 +247,16 @@ class SupervisedMixin(
                     opt_state=opt_state,
                     batches=batches,
                     state=state,
+                    key=step_key,
                 )
-                state = self.log_step(eqx.combine(model_arr, model_static), batches[-1], output, metrics, state)
+                state = self.log_step(
+                    eqx.combine(model_arr, model_static),
+                    batches[-1],
+                    output,
+                    metrics,
+                    state,
+                    log_key,
+                )
                 self.on_step_end()
 
             state = state.replace(elapsed_time_s=state.elapsed_time_s + timer.elapsed_time)
@@ -285,7 +305,7 @@ class SupervisedMixin(
             data_sharding = self.get_data_sharding(mesh)
             model_sharding = self.get_model_sharding(mesh)
 
-            key, model_key = jax.random.split(key)
+            model_key, key = jax.random.split(key)
             init_params = InitParams(key=model_key)
             models, optimizers, opt_states, state = self.load_initial_state(
                 init_params,
@@ -313,6 +333,7 @@ class SupervisedMixin(
                     opt_states=opt_states,
                     ds=ds,
                     state=state,
+                    key=key,
                 )
 
             except TrainingFinishedError:

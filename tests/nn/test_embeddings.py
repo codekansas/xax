@@ -11,7 +11,7 @@ import xax
 
 @pytest.mark.parametrize("kind", get_args(xax.EmbeddingKind))
 def test_embeddings_api(kind: xax.EmbeddingKind) -> None:
-    key = jrandom.PRNGKey(0)
+    key = jrandom.key(0)
     xkey, pkey = jrandom.split(key)
     x_tc = jrandom.normal(xkey, (5, 8), dtype=jnp.float32)
     times_t = jnp.arange(1, 6)
@@ -25,7 +25,7 @@ def test_embeddings_api(kind: xax.EmbeddingKind) -> None:
 
 @pytest.mark.parametrize("offset", [0, 12])
 def test_rotary_embeddings_inference(offset: int) -> None:
-    key = jrandom.PRNGKey(0)
+    key = jrandom.key(0)
     x_tc = jrandom.normal(key, (5, 8), dtype=jnp.float32)
     emb = xax.get_positional_embeddings("rotary", max_tsz=8 + offset, embed_dim=8, learnable=False)
     y1_tc = emb(x_tc, offset=offset)

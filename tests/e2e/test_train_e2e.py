@@ -73,7 +73,7 @@ class SimpleTask(xax.SupervisedTask[SimpleConfig]):
 
     def get_dataset(self) -> Dataset:
         """Create a dummy dataset for testing."""
-        key = jax.random.PRNGKey(42)
+        key = jax.random.key(42)
         num_samples = 1000
 
         # Generate dummy data
@@ -134,7 +134,7 @@ def test_save_load_model(tmpdir: Path) -> None:
 
     # Test loading checkpoint
     task = SimpleTask.get_task(SimpleConfig(exp_dir=str(tmpdir)), use_cli=False)
-    init_params = xax.InitParams(key=jax.random.PRNGKey(42))
+    init_params = xax.InitParams(key=jax.random.key(42))
 
     # Load checkpoint components
     models, opt_states, state, _ = task.load_ckpt(ckpt_path, init_params=init_params, part="all")

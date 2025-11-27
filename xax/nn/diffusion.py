@@ -15,13 +15,15 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, PRNGKeyArray
 
+from xax.utils.jax import jit as xax_jit
+
 ODESolverType = Literal["euler", "heun", "rk4"]
 DiffusionLossFn = Literal["mse", "l1", "pseudo-huber"]
 DiffusionPredMode = Literal["pred_x_0", "pred_eps", "pred_v"]
-SigmaType = Literal["upper_bound", "lower_bound"]
 DiffusionBetaSchedule = Literal["linear", "quad", "warmup", "const", "cosine", "jsd"]
 
 EPS = 1e-5
+
 
 def cast_ode_solver_type(s: str) -> ODESolverType:
     assert s in get_args(ODESolverType), f"Unknown solver {s}"
@@ -36,11 +38,6 @@ def cast_diffusion_loss_fn(loss: str) -> DiffusionLossFn:
 def cast_diffusion_pred_mode(pred_mode: str) -> DiffusionPredMode:
     assert pred_mode in get_args(DiffusionPredMode), f"Unknown prediction mode: {pred_mode}"
     return cast(DiffusionPredMode, pred_mode)
-
-
-def cast_sigma_type(sigma_type: str) -> SigmaType:
-    assert sigma_type in get_args(SigmaType), f"Unknown sigma type: {sigma_type}"
-    return cast(SigmaType, sigma_type)
 
 
 def cast_beta_schedule(schedule: str) -> DiffusionBetaSchedule:
@@ -289,25 +286,23 @@ class GaussianDiffusion(eqx.Module):
         cosine_offset: The cosine offset, for cosine schedules.
     """
 
-    bar_alpha: Array = eqx.field()
-    beta_schedule: DiffusionBetaSchedule = eqx.field(static=True)
-    num_beta_steps: int = eqx.field(static=True)
-    pred_mode: DiffusionPredMode = eqx.field(static=True)
-    loss_fn: DiffusionLossFn = eqx.field(static=True)
-    sigma_type: SigmaType = eqx.field(static=True)
-    beta_start: float = eqx.field(static=True)
-    beta_end: float = eqx.field(static=True)
-    warmup: float = eqx.field(static=True)
-    cosine_offset: float = eqx.field(static=True)
-    num_timesteps: int = eqx.field(static=True)
+    bar_alpha: tuple[float, ...] = eqx.field()
+    beta_schedule: DiffusionBetaSchedule = eqx.field()
+    num_beta_steps: int = eqx.field()
+    pred_mode: DiffusionPredMode = eqx.field()
+    loss_fn: DiffusionLossFn = eqx.field()
+    beta_start: float = eqx.field()
+    beta_end: float = eqx.field()
+    warmup: float = eqx.field()
+    cosine_offset: float = eqx.field()
+    num_timesteps: int = eqx.field()
 
     def __init__(
         self,
         beta_schedule: DiffusionBetaSchedule = "linear",
         num_beta_steps: int = 1000,
-        pred_mode: DiffusionPredMode = "pred_x_0",
+        pred_mode: DiffusionPredMode = "pred_v",
         loss: DiffusionLossFn = "mse",
-        sigma_type: SigmaType = "upper_bound",
         *,
         beta_start: float = 0.0001,
         beta_end: float = 0.02,
@@ -318,20 +313,12 @@ class GaussianDiffusion(eqx.Module):
         self.num_beta_steps = num_beta_steps
         self.pred_mode = pred_mode
         self.loss_fn = loss
-        self.sigma_type = sigma_type
         self.beta_start = beta_start
         self.beta_end = beta_end
         self.warmup = warmup
         self.cosine_offset = cosine_offset
         self.num_timesteps = num_beta_steps - 1
 
-        # Initialize bar_alpha with placeholder, will be set in reset_parameters
-        # bar_alpha has shape (num_beta_steps + 1,) because we prepend 1.0 for t=0
-        self.bar_alpha = jnp.empty(self.num_beta_steps + 1)
-
-    def reset_parameters(self) -> "GaussianDiffusion":
-        """Resets the parameters of the diffusion model."""
-        # Gets the beta schedule from the given parameters.
         betas = get_diffusion_beta_schedule(
             schedule=self.beta_schedule,
             num_timesteps=self.num_beta_steps,
@@ -340,19 +327,9 @@ class GaussianDiffusion(eqx.Module):
             warmup=self.warmup,
             cosine_offset=self.cosine_offset,
         )
-
-        assert betas.ndim == 1
-
-        assert not (betas < 0).any(), "Betas must be non-negative."
-        assert not (betas > 1).any(), "Betas must be less than or equal to 1."
-
-        # bar_alpha_t = prod_{i=1}^t (1 - beta_i)
-        # bar_alpha_0 = 1.0 (no noise at t=0)
         bar_alpha = jnp.cumprod(1.0 - betas, axis=0)
-        # Prepend 1.0 so bar_alpha[0] = 1.0 (no noise)
         bar_alpha = jnp.concatenate([jnp.array([1.0]), bar_alpha])
-
-        return eqx.tree_at(lambda x: x.bar_alpha, self, bar_alpha)
+        self.bar_alpha = tuple(bar_alpha.tolist())
 
     def get_noise(self, key: PRNGKeyArray, x: Array) -> Array:
         return jax.random.normal(key, x.shape, dtype=x.dtype)
@@ -378,7 +355,7 @@ class GaussianDiffusion(eqx.Module):
         # We sample from [0, num_timesteps] to include all valid timesteps
         t_sample = jax.random.randint(t_key, (bsz,), 0, self.num_timesteps + 1)
         eps = self.get_noise(eps_key, x)
-        bar_alpha = self.bar_alpha[t_sample].reshape(-1, *[1] * (x.ndim - 1))
+        bar_alpha = self._get_bar_alpha(t_sample, x)
         x_t = jnp.sqrt(bar_alpha) * x + jnp.sqrt(1 - bar_alpha) * eps
         pred_target = model(x_t, t_sample)
         match self.pred_mode:
@@ -392,6 +369,7 @@ class GaussianDiffusion(eqx.Module):
                 raise NotImplementedError(f"Unknown pred_mode: {self.pred_mode}")
         return pred_target, gt_target
 
+    @xax_jit(static_argnames=["self", "model", "loss", "loss_dim", "loss_factor"])
     def loss(
         self,
         key: PRNGKeyArray,
@@ -414,6 +392,7 @@ class GaussianDiffusion(eqx.Module):
             case _:
                 raise NotImplementedError(f"Unknown loss: {loss}")
 
+    @xax_jit(static_argnames=["self", "model", "start_percent", "sampling_timesteps"])
     def partial_sample(
         self,
         key: PRNGKeyArray,
@@ -447,17 +426,19 @@ class GaussianDiffusion(eqx.Module):
         assert 0.0 <= start_percent <= 1.0
         num_timesteps = round(self.num_timesteps * start_percent)
         scalar_t_start = num_timesteps
-        noise = self.get_noise(key, reference_sample)
-        bar_alpha = self.bar_alpha[scalar_t_start].reshape(-1, *[1] * (noise.ndim - 1))
+        noise_key, sample_key = jax.random.split(key)
+        noise = self.get_noise(noise_key, reference_sample)
+        bar_alpha = self._get_bar_alpha(scalar_t_start, noise)
         x = jnp.sqrt(bar_alpha) * reference_sample + jnp.sqrt(1 - bar_alpha) * noise
         return self._sample_common(
-            key=key,
+            key=sample_key,
             model=model,
             x=x,
             sampling_timesteps=sampling_timesteps,
             start_percent=start_percent,
         )
 
+    @xax_jit(static_argnames=["self", "model", "shape", "sampling_timesteps"])
     def sample(
         self,
         key: PRNGKeyArray,
@@ -479,10 +460,10 @@ class GaussianDiffusion(eqx.Module):
         Returns:
             The samples, with shape ``(sampling_timesteps + 1, *)``.
         """
-        init_key, sample_key = jax.random.split(key)
+        init_key, key = jax.random.split(key)
         x = jax.random.normal(init_key, shape)
         return self._sample_common(
-            key=sample_key,
+            key=key,
             model=model,
             x=x,
             sampling_timesteps=sampling_timesteps,
@@ -492,22 +473,25 @@ class GaussianDiffusion(eqx.Module):
     def _get_t_tensor(self, t: Array, x: Array) -> Array:
         return jnp.full((x.shape[0],), t, dtype=jnp.int32)
 
-    def _get_bar_alpha(self, t: Array, x: Array) -> Array:
+    def _get_bar_alpha(self, t: float | int | Array, x: Array) -> Array:
         # When using non-integer timesteps, like when using the RK4 ODE solver,
         # we interpolate the `bar_alpha` values. Since `bar_alpha` is a
         # cumulative product we need to do a weighted geometric mean rather than
         # a linear mean. Side note: This code works for both the case where
         # `t_max - t_min` is 1 and where it is 0.
+        bar_alpha = jnp.array(self.bar_alpha)
+        if isinstance(t, (float, int)):
+            t = jnp.array(t)
         if t.dtype in (jnp.float32, jnp.float64):
             t_min = jnp.floor(t).astype(jnp.int32)
             t_max = jnp.ceil(t).astype(jnp.int32)
-            bar_alpha_min = self.bar_alpha[t_min]
-            bar_alpha_max = self.bar_alpha[t_max]
+            bar_alpha_min = bar_alpha[t_min]
+            bar_alpha_max = bar_alpha[t_max]
             w_min = t - t_min.astype(t.dtype)
             factor = bar_alpha_max / bar_alpha_min
             bar_alpha = jnp.power(factor, w_min) * bar_alpha_min
         else:
-            bar_alpha = self.bar_alpha[t]
+            bar_alpha = bar_alpha[t]
         return append_dims(bar_alpha, x.ndim - bar_alpha.ndim)
 
     def _run_model(self, model: Callable[[Array, Array], Array], x: Array, t: Array, bar_alpha: Array) -> Array:
@@ -548,23 +532,6 @@ class GaussianDiffusion(eqx.Module):
         noisy_part = sqrt_one_minus_bar_alpha_next * predicted_eps
         return deterministic_part + noisy_part
 
-    def _add_noise(self, key: PRNGKeyArray, x: Array, scalar_t_start: Array, scalar_t_end: Array) -> Array:
-        t_start, t_end = self._get_t_tensor(scalar_t_start, x), self._get_t_tensor(scalar_t_end, x)
-        bar_alpha_start, bar_alpha_end = self._get_bar_alpha(t_start, x), self._get_bar_alpha(t_end, x)
-
-        # Forward model posterior noise
-        match self.sigma_type:
-            case "upper_bound":
-                std = jnp.sqrt(1 - bar_alpha_start / bar_alpha_end)
-                noise = std * self.get_noise(key, x)
-            case "lower_bound":
-                std = jnp.sqrt((1 - bar_alpha_start / bar_alpha_end) * (1 - bar_alpha_end) / (1 - bar_alpha_start))
-                noise = std * self.get_noise(key, x)
-            case _:
-                raise AssertionError(f"Invalid {self.sigma_type=}.")
-
-        return x + noise
-
     def _sample_common(
         self,
         key: PRNGKeyArray,
@@ -586,18 +553,23 @@ class GaussianDiffusion(eqx.Module):
         samples = jnp.zeros((sampling_timesteps + 1, *x.shape), dtype=x.dtype)
         samples = samples.at[-1].set(x)
 
-        key, init_key = jax.random.split(key)
-        current_x = x
-        current_key = init_key
+        # Prepare timestep pairs for scanning
+        t_starts = subseq[:-1]
+        t_ends = subseq[1:]
 
-        for idx in range(sampling_timesteps):
-            t_start = subseq[idx]
-            t_end = subseq[idx + 1]
-            current_x = self._sample_step(model, current_x, t_start, t_end)
-            if t_end != 0:
-                current_key, noise_key = jax.random.split(current_key)
-                current_x = self._add_noise(noise_key, current_x, t_start, t_end)
-            samples = samples.at[sampling_timesteps - 1 - idx].set(current_x)
+        def scan_fn(
+            x: Array,
+            timesteps: tuple[Array, Array],
+        ) -> tuple[Array, Array]:
+            t_start, t_end = timesteps
+            x = self._sample_step(model, x, t_start, t_end)
+            return x, x
+
+        # Scan over timestep pairs
+        _, sample_history = jax.lax.scan(scan_fn, x, (t_starts, t_ends))
+
+        # Store samples in reverse order
+        samples = samples.at[:sampling_timesteps].set(sample_history[::-1])
 
         return samples
 
@@ -631,15 +603,15 @@ class ConsistencyModel(eqx.Module):
             end of training.
     """
 
-    total_steps: int | None = eqx.field(static=True)
-    sigma_data: float = eqx.field(static=True)
-    sigma_max: float = eqx.field(static=True)
-    sigma_min: float = eqx.field(static=True)
-    rho: float = eqx.field(static=True)
-    p_mean: float = eqx.field(static=True)
-    p_std: float = eqx.field(static=True)
-    start_scales: int = eqx.field(static=True)
-    end_scales: int = eqx.field(static=True)
+    total_steps: int | None = eqx.field()
+    sigma_data: float = eqx.field()
+    sigma_max: float = eqx.field()
+    sigma_min: float = eqx.field()
+    rho: float = eqx.field()
+    p_mean: float = eqx.field()
+    p_std: float = eqx.field()
+    start_scales: int = eqx.field()
+    end_scales: int = eqx.field()
 
     def __init__(
         self,
@@ -696,15 +668,15 @@ class ConsistencyModel(eqx.Module):
         # samples to be closer to the less noisy end, which improves training
         # stability. This distribution is defined as a function of the standard
         # deviations.
-        timesteps = self._sample_timesteps(key, x, num_scales)
+        ts_key, key = jax.random.split(key)
+        timesteps = self._sample_timesteps(ts_key, x, num_scales)
         t_current, t_next = timesteps / (num_scales - 1), (timesteps + 1) / (num_scales - 1)
 
         # Converts timesteps to sigmas.
         sigmas = self._get_sigmas(jnp.stack((t_next, t_current)))
         sigma_next, sigma_current = sigmas[0], sigmas[1]
 
-        noise_key, dropout_key = jax.random.split(key)
-        noise = self.get_noise(noise_key, x)
+        noise = self.get_noise(key, x)
         x_current = x + noise * append_dims(sigma_current, dims - sigma_current.ndim)
         y_current = self._call_model(model, x_current, sigma_current)
 
@@ -785,20 +757,38 @@ class ConsistencyModel(eqx.Module):
         timesteps = jnp.linspace(start_percent, 1, num_steps + 1)
         sigmas = self._get_sigmas(timesteps)
         x = reference_sample
-        init_key, sample_key = jax.random.split(key)
+        init_key, key = jax.random.split(key)
         x = x + jax.random.normal(init_key, x.shape, dtype=x.dtype) * sigmas[0]
         samples = jnp.zeros((num_steps + 1, *x.shape), dtype=x.dtype)
         samples = samples.at[num_steps].set(x)
 
-        current_x = x
-        current_key = sample_key
+        # Prepare indices and sigma slices for scanning
+        indices = jnp.arange(num_steps)
+        is_last_mask = indices == (num_steps - 1)
 
-        for i in range(num_steps):
-            current_x = self._call_model(model, current_x, sigmas[i : i + 1])
-            samples = samples.at[num_steps - 1 - i].set(current_x)
-            if i < num_steps - 1:
-                current_key, noise_key = jax.random.split(current_key)
-                current_x = current_x + self.get_noise(noise_key, current_x) * sigmas[i + 1 : i + 2]
+        def scan_fn(
+            carry: tuple[Array, PRNGKeyArray],
+            idx_and_mask: tuple[Array, Array],
+        ) -> tuple[tuple[Array, PRNGKeyArray], Array]:
+            current_x, key = carry
+            idx, is_last = idx_and_mask
+            idx_int = idx.astype(jnp.int32)
+
+            # Call model with current sigma
+            sigma_curr = sigmas[idx_int : idx_int + 1]
+            current_x = self._call_model(model, current_x, sigma_curr)
+
+            noise_key, key = jax.random.split(key)
+            sigma_next = sigmas[idx_int + 1 : idx_int + 2]
+            current_x = jnp.where(~is_last, current_x + self.get_noise(noise_key, current_x) * sigma_next, current_x)
+
+            return (current_x, key), current_x
+
+        # Scan over indices
+        _, sample_history = jax.lax.scan(scan_fn, (x, key), (indices, is_last_mask))
+
+        # Store samples in reverse order to match original behavior
+        samples = samples.at[:num_steps].set(sample_history[::-1])
 
         return samples
 
@@ -824,22 +814,19 @@ class ConsistencyModel(eqx.Module):
             sample (i.e., ``samples[0]``) as the denoised output and the last
             sample (i.e., ``samples[-1]``) as the random noise.
         """
-        init_key, sample_key = jax.random.split(key)
+        init_key, key = jax.random.split(key)
         timesteps = jnp.linspace(0, 1, num_steps + 1)
         sigmas = self._get_sigmas(timesteps)
         x = jax.random.normal(init_key, shape) * sigmas[0]
         samples = jnp.zeros((num_steps + 1, *x.shape), dtype=x.dtype)
         samples = samples.at[num_steps].set(x)
 
-        current_x = x
-        current_key = sample_key
-
         for i in range(num_steps):
-            current_x = self._call_model(model, current_x, sigmas[i : i + 1])
-            samples = samples.at[num_steps - 1 - i].set(current_x)
+            x = self._call_model(model, x, sigmas[i : i + 1])
+            samples = samples.at[num_steps - 1 - i].set(x)
             if i < num_steps - 1:
-                current_key, noise_key = jax.random.split(current_key)
-                current_x = current_x + self.get_noise(noise_key, current_x) * sigmas[i + 1 : i + 2]
+                noise_key, key = jax.random.split(key)
+                x = x + self.get_noise(noise_key, x) * sigmas[i + 1 : i + 2]
 
         return samples
 

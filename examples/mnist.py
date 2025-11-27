@@ -86,10 +86,10 @@ class MnistClassification(xax.SupervisedTask[Config]):
     def get_optimizer(self) -> optax.GradientTransformation:
         return optax.adam(self.config.learning_rate)
 
-    def get_output(self, model: Model, batch: Batch, state: xax.State) -> Array:
+    def get_output(self, model: Model, batch: Batch, state: xax.State, key: PRNGKeyArray) -> Array:
         return jax.vmap(model)(batch["image"])
 
-    def compute_loss(self, model: Model, batch: Batch, output: Array, state: xax.State) -> Array:
+    def compute_loss(self, model: Model, batch: Batch, output: Array, state: xax.State, key: PRNGKeyArray) -> Array:
         y, yhat = batch["label"], output
         return xax.cross_entropy(y, yhat, axis=1)
 
@@ -114,6 +114,7 @@ class MnistClassification(xax.SupervisedTask[Config]):
         output: Array,
         metrics: xax.FrozenDict[str, Array],
         state: xax.State,
+        key: PRNGKeyArray,
     ) -> None:
         max_images = 16
         batch = jax.tree.map(lambda x: jax.device_get(x[:max_images]), batch)

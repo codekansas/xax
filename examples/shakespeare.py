@@ -100,7 +100,7 @@ class RNN(eqx.Module):
             return (hs, token, rng), token
 
         hs, _ = jax.lax.scan(encode_step, hs, prompt_seq_embedded)
-        _, sequence = jax.lax.scan(decode_step, (hs, prompt_seq[-1], jax.random.PRNGKey(0)), None, length=max_len)
+        _, sequence = jax.lax.scan(decode_step, (hs, prompt_seq[-1], jax.random.key(0)), None, length=max_len)
 
         return sequence
 
@@ -166,7 +166,7 @@ class LSTM(eqx.Module):
             return (hs, token, rng), token
 
         hs, _ = jax.lax.scan(encode_step, hs, prompt_seq_embedded)
-        _, sequence = jax.lax.scan(decode_step, (hs, prompt_seq[-1], jax.random.PRNGKey(0)), None, length=max_len)
+        _, sequence = jax.lax.scan(decode_step, (hs, prompt_seq[-1], jax.random.key(0)), None, length=max_len)
 
         return sequence
 
@@ -274,10 +274,17 @@ class ShakespearePrediction(xax.SupervisedTask[Config]):
         # Gradient accumulation.
         return optax.MultiSteps(opt, every_k_schedule=8)
 
-    def get_output(self, model: SequenceModel, batch: Batch, state: xax.State) -> Array:
+    def get_output(self, model: SequenceModel, batch: Batch, state: xax.State, key: PRNGKeyArray) -> Array:
         return jax.vmap(model.predict_sequence)(batch["input_ids"][:, :-1])
 
-    def compute_loss(self, model: SequenceModel, batch: Batch, output: Array, state: xax.State) -> Array:
+    def compute_loss(
+        self,
+        model: SequenceModel,
+        batch: Batch,
+        output: Array,
+        state: xax.State,
+        key: PRNGKeyArray,
+    ) -> Array:
         y, yhat, mask = batch["input_ids"][:, 1:], output, batch["attention_mask"][:, 1:] == 1
         return optax.softmax_cross_entropy_with_integer_labels(logits=yhat, labels=y, where=mask).mean()
 
@@ -288,6 +295,7 @@ class ShakespearePrediction(xax.SupervisedTask[Config]):
         output: Array,
         metrics: xax.FrozenDict[str, Array],
         state: xax.State,
+        key: PRNGKeyArray,
     ) -> None:
         # prompt = "To be or not to be, that is the"
         # prompt_seq = jnp.array(self.tokenizer.encode(prompt))

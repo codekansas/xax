@@ -10,13 +10,13 @@ from jaxtyping import Array
 NormType = Literal["l1", "l2"]
 
 
-def cast_norm_type(norm: str) -> NormType:
+def cast_euclidean_norm_type(norm: str) -> NormType:
     if norm not in get_args(NormType):
         raise ValueError(f"Invalid norm: {norm}")
     return cast(NormType, norm)
 
 
-def get_norm(x: Array, norm: NormType) -> Array:
+def get_euclidean_norm(x: Array, norm: NormType) -> Array:
     match norm:
         case "l1":
             return jnp.abs(x)

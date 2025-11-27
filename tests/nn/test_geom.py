@@ -21,7 +21,7 @@ def test_euler_to_quat() -> None:
 
 def test_rotation_equivalence() -> None:
     """Test that Euler angles and quaternions represent the same rotation."""
-    rng = jax.random.PRNGKey(0)
+    rng = jax.random.key(0)
     euler = jax.random.uniform(rng, (10, 3), minval=-jnp.pi, maxval=jnp.pi)
     quat = xax.euler_to_quat(euler)
     euler_again = xax.quat_to_euler(quat)
@@ -207,7 +207,7 @@ def test_rotation_matrix_to_quat() -> None:
 
 
 def test_rotation_matrix_to_quat_bijection() -> None:
-    rng = jax.random.PRNGKey(0)
+    rng = jax.random.key(0)
     batch_size = 10
     quat = jax.random.normal(rng, (batch_size, 4))
     rotmat = xax.quat_to_rotmat(quat)
@@ -302,7 +302,7 @@ def test_rotation_matrix_to_rotation6d() -> None:
 def test_rotation_conversion_roundtrip() -> None:
     """Test roundtrip conversion between rotation representations."""
     # Generate random rotation matrices
-    rng = jax.random.PRNGKey(0)
+    rng = jax.random.key(0)
     batch_size = 10
 
     # Generate random 6D rotations

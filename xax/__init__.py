@@ -74,8 +74,9 @@ __all__ = [
     "rotation_matrix_to_quat",
     "rotation_matrix_to_rotation6d",
     "cross_entropy",
+    "cast_euclidean_norm_type",
     "dynamic_time_warping",
-    "get_norm",
+    "get_euclidean_norm",
     "cast_norm_type",
     "get_norm_1d",
     "get_norm_2d",
@@ -303,8 +304,9 @@ NAME_MAP: dict[str, str] = {
     "rotation_matrix_to_quat": "nn.geom",
     "rotation_matrix_to_rotation6d": "nn.geom",
     "cross_entropy": "nn.losses",
+    "cast_euclidean_norm_type": "nn.metrics",
     "dynamic_time_warping": "nn.metrics",
-    "get_norm": "nn.metrics",
+    "get_euclidean_norm": "nn.metrics",
     "cast_norm_type": "nn.norm",
     "get_norm_1d": "nn.norm",
     "get_norm_2d": "nn.norm",
@@ -539,7 +541,7 @@ if IMPORT_ALL or TYPE_CHECKING:
         rotation_matrix_to_rotation6d,
     )
     from xax.nn.losses import cross_entropy
-    from xax.nn.metrics import NormType, cast_norm_type, dynamic_time_warping, get_norm
+    from xax.nn.metrics import NormType, cast_euclidean_norm_type, dynamic_time_warping, get_euclidean_norm
     from xax.nn.norm import NormType, cast_norm_type, get_norm_1d, get_norm_2d, get_norm_3d, get_norm_linear
     from xax.nn.parallel import is_master
     from xax.nn.ssm import SSM, BaseSSMBlock, DiagSSMBlock, SSMBlock

@@ -8,6 +8,7 @@ from typing import TypedDict
 
 import equinox as eqx
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 from datasets import Dataset, load_dataset
@@ -24,12 +25,11 @@ class Batch(TypedDict):
 
 @dataclass
 class Config(xax.SupervisedConfig):
-    batch_size: int = xax.field(256, help="The size of a minibatch")
     learning_rate: float = xax.field(1e-3, help="The learning rate")
     hidden_dim: int = xax.field(128, help="Hidden layer dimension")
     dim_scales: list[int] = xax.field([1, 2, 4, 8], help="List of dimension scales for UNet")
     num_timesteps: int = xax.field(500, help="Number of diffusion timesteps")
-    pred_mode: str = xax.field("pred_x_0", help="Prediction mode: pred_x_0, pred_eps, or pred_v")
+    pred_mode: str = xax.field("pred_v", help="Prediction mode: pred_x_0, pred_eps, or pred_v")
     beta_schedule: str = xax.field("linear", help="Beta schedule type")
     warmup_steps: int = xax.field(100, help="Number of warmup steps")
     sampling_timesteps: int | None = xax.field(50, help="Number of timesteps for sampling")
@@ -94,6 +94,8 @@ class UNet(eqx.Module):
 
 
 class MnistDiffusion(xax.SupervisedTask[Config]):
+    diffusion: xax.GaussianDiffusion
+
     def __init__(self, config: Config) -> None:
         super().__init__(config)
 
@@ -102,7 +104,6 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
             num_beta_steps=config.num_timesteps,
             pred_mode=xax.cast_diffusion_pred_mode(config.pred_mode),
         )
-        self.diffusion = self.diffusion.reset_parameters()
 
     def get_model(self, params: xax.InitParams) -> UNet:
         return UNet(
@@ -141,7 +142,7 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
             b2=0.999,
         )
 
-    def get_output(self, model: UNet, batch: Batch, state: xax.State) -> Array:
+    def get_output(self, model: UNet, batch: Batch, state: xax.State, key: PRNGKeyArray) -> Array:
         """Computes the diffusion loss.
 
         The model is called with (x_t, t, class_label) internally, but we need
@@ -150,14 +151,13 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
         images_bhw = batch["image"]
         labels_b = batch["label"]
 
-        def model_fn(x_bt: Array, t_b: Array) -> Array:
-            return xax.vmap(model)(x_bt, t_b, labels_b)
+        def model_fn(x_bhw: Array, t_b: Array) -> Array:
+            return xax.vmap(model)(x_bhw, t_b, labels_b)
 
-        key = jax.random.PRNGKey(state.num_steps)
         loss = self.diffusion.loss(key, model_fn, images_bhw)
         return loss.mean()
 
-    def compute_loss(self, model: UNet, batch: Batch, output: Array, state: xax.State) -> Array:
+    def compute_loss(self, model: UNet, batch: Batch, output: Array, state: xax.State, key: PRNGKeyArray) -> Array:
         """The output is already the loss."""
         return output
 
@@ -180,6 +180,7 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
         output: Array,
         metrics: xax.FrozenDict[str, Array],
         state: xax.State,
+        key: PRNGKeyArray,
     ) -> None:
         """Generate and log sample images."""
         max_images = 9
@@ -190,13 +191,17 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
         class_id = class_id[:max_images]
 
         # Log real images
-        self.logger.log_labeled_images("real", (images, [f"class: {int(c)}" for c in class_id]), max_images=max_images)
+        self.logger.log_labeled_images(
+            "real",
+            (images, [f"class: {int(c)}" for c in class_id]),
+            max_images=max_images,
+            target_resolution=(64, 64),
+        )
 
         def vanilla_func(x_bt: Array, t_b: Array) -> Array:
             return jax.vmap(model)(x_bt, t_b, class_id)
 
         # Generate samples
-        key = jax.random.PRNGKey(state.num_steps)
         gen = self.diffusion.sample(
             key,
             vanilla_func,
@@ -210,14 +215,17 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
             "generated",
             (generated_images, [f"class: {int(c)}" for c in class_id]),
             max_images=max_images,
+            target_resolution=(64, 64),
         )
 
         # Log single image sequence
-        one_gen = gen[:, 0]  # First image across all timesteps
+        indices = jnp.linspace(0, gen.shape[1] - 1, max_images).astype(jnp.int32).clip(0, gen.shape[1] - 1)
+        one_gen = gen[indices, 0]
         self.logger.log_labeled_images(
             "generated_single",
-            (one_gen, [f"step {i}" for i in range(len(one_gen))]),
-            max_images=len(one_gen),
+            (one_gen, [f"step {i}" for i in indices.tolist()]),
+            max_images=max_images,
+            target_resolution=(64, 64),
         )
 
     def get_dataset(self) -> Dataset:
@@ -241,10 +249,7 @@ if __name__ == "__main__":
     MnistDiffusion.launch(
         Config(
             batch_size=256,
-            log_heavy_every_n_seconds=60,
-            num_timesteps=500,
-            pred_mode="pred_v",
-            beta_schedule="linear",
-            sampling_timesteps=50,
+            log_heavy_every_n_seconds=60 * 5,
+            max_grad_norm=1.0,
         ),
     )
