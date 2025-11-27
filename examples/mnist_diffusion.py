@@ -220,7 +220,7 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
         )
 
         # Log single image sequence
-        indices = jnp.linspace(0, gen.shape[1] - 1, max_images).astype(jnp.int32).clip(0, gen.shape[1] - 1)
+        indices = jnp.linspace(0, gen.shape[0] - 1, max_images).astype(jnp.int32).clip(0, gen.shape[0] - 1)
         one_gen = gen[indices, 0]
         self.logger.log_labeled_images(
             "generated_single",
@@ -242,5 +242,8 @@ if __name__ == "__main__":
             batch_size=256,
             log_heavy_every_n_seconds=60 * 5,
             max_grad_norm=1.0,
+            # Perform a few updates per step, because otherwise we are sometimes
+            # bottlenecked by the data loader.
+            updates_per_step=5,
         ),
     )
