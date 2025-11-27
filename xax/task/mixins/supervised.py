@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 @jax.tree_util.register_dataclass
 @dataclass
 class SupervisedConfig(TrainConfig):
+    batches_per_step: int = field(1, help="Number of batches to process per step")
     updates_per_step: int = field(1, help="Number of updates to perform per step")
     max_grad_norm: float | None = field(None, help="Clip gradient norm to this value.")
 
@@ -184,10 +185,10 @@ class SupervisedMixin(
         key: PRNGKeyArray,
     ) -> tuple[PyTree, optax.OptState, Output, FrozenDict[str, Array], State]:
         def update_fn(
-            carry: tuple[PyTree, optax.OptState, State],
+            carry: tuple[PyTree, optax.OptState, State, PRNGKeyArray],
             batch: Batch,
-        ) -> tuple[tuple[PyTree, optax.OptState, State], tuple[Output, FrozenDict[str, Array]]]:
-            model_arr, opt_state, state = carry
+        ) -> tuple[tuple[PyTree, optax.OptState, State, PRNGKeyArray], tuple[Output, FrozenDict[str, Array]]]:
+            model_arr, opt_state, state, key = carry
             model_arr, opt_state, output, metrics = self.update(
                 model_arr,
                 model_static,
@@ -201,12 +202,29 @@ class SupervisedMixin(
                 num_steps=state.num_steps + 1,
                 num_samples=state.num_samples + (self.get_size_of_batch(batch) or 0),
             )
-            return (model_arr, opt_state, state), (output, FrozenDict(metrics))
+            return (model_arr, opt_state, state, key), (output, FrozenDict(metrics))
 
-        (model_arr, opt_state, state), (output, metrics) = xax_scan(
-            update_fn,
-            (model_arr, opt_state, state),
-            jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *batches),
+        batches_stacked = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *batches)
+
+        def update_batch_fn(
+            carry: tuple[PyTree, optax.OptState, State, PRNGKeyArray],
+            _: None,
+        ) -> tuple[tuple[PyTree, optax.OptState, State, PRNGKeyArray], tuple[Output, FrozenDict[str, Array]]]:
+            model_arr, opt_state, state, key = carry
+
+            (model_arr, opt_state, state, key), (output, metrics) = xax_scan(
+                update_fn,
+                (model_arr, opt_state, state, key),
+                batches_stacked,
+                jit_level=3,
+            )
+
+            return (model_arr, opt_state, state, key), (output, metrics)
+
+        (model_arr, opt_state, state, _), (output, metrics) = xax_scan(
+            update_batch_fn,
+            (model_arr, opt_state, state, key),
+            length=self.config.updates_per_step,
             jit_level=3,
         )
 
@@ -238,7 +256,7 @@ class SupervisedMixin(
         while not self.is_training_over(state):
             with ContextTimer() as timer:
                 self.on_step_start()
-                batches = tuple(itertools.islice(ds, self.config.updates_per_step))
+                batches = tuple(itertools.islice(ds, self.config.batches_per_step))
                 step_key, log_key, key = jax.random.split(key, 3)
                 model_arr, opt_state, output, metrics, state = self.train_step(
                     model_arr=model_arr,

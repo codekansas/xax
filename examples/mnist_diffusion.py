@@ -251,5 +251,6 @@ if __name__ == "__main__":
             batch_size=256,
             log_heavy_every_n_seconds=60 * 5,
             max_grad_norm=1.0,
+            updates_per_step=10,
         ),
     )
