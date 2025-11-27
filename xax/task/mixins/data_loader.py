@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Generic, Iterator, TypeVar
 
 import jax
+import tensorflow as tf
 from datasets import Dataset, DatasetDict, IterableDataset, IterableDatasetDict
 from jax.sharding import NamedSharding
 from omegaconf import II
@@ -35,15 +36,16 @@ class DataloadersConfig(ProcessConfig, BaseConfig):
 Config = TypeVar("Config", bound=DataloadersConfig)
 
 
-def iter_samples(ds: IterableDataset, sharding: NamedSharding) -> Iterator[Batch]:
-    sample: Batch | None = None
-    for next_sample in ds:
-        if sample is None:
-            sample = jax.device_put(next_sample, sharding)
+def iter_samples(ds: tf.data.Dataset, sharding: NamedSharding) -> Iterator[Batch]:
+    next_sample = None
+    for sample in ds:
+        sample = jax.tree.map(lambda x: x.numpy() if isinstance(x, tf.Tensor) else x, sample)
+        if next_sample is None:
+            next_sample = jax.device_put(sample, sharding)
             continue
-        next_sample = jax.device_put(next_sample, sharding)
-        yield sample
-        sample = next_sample
+        sample = jax.device_put(sample, sharding)
+        yield next_sample
+        next_sample = sample
 
 
 class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], ABC):
@@ -63,23 +65,33 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
         return self.get_batch_size()
 
     @abstractmethod
-    def get_dataset(self) -> DatasetDict | Dataset | IterableDatasetDict | IterableDataset:
+    def get_dataset(self) -> DatasetDict | Dataset | IterableDatasetDict | IterableDataset | tf.data.Dataset:
         """Returns the dataset.
 
         Returns:
             The dataset to train on.
         """
 
-    def get_data_iterator(self) -> IterableDataset:
+    def get_tf_dataset(self) -> tf.data.Dataset:
         ds = self.get_dataset()
 
+        if isinstance(ds, tf.data.Dataset):
+            ds = ds.batch(self.batch_size, drop_remainder=True)
+            ds = ds.repeat(None)
+            ds = ds.prefetch(buffer_size=tf.data.AUTOTUNE)
+            return ds
+
         if isinstance(ds, Dataset):
-            ds = ds.to_iterable_dataset(num_shards=self.config.dataset_workers)
+            tfds = ds.to_tf_dataset(
+                batch_size=self.batch_size,
+                shuffle=True,
+                drop_remainder=True,
+                prefetch=True,
+            )
+            tfds = tfds.repeat(None)
+            return tfds
 
         if isinstance(ds, IterableDataset):
-            ds = ds.batch(self.batch_size, drop_last_batch=True)
-            ds = ds.repeat(None)
-            ds = ds.shuffle(seed=self.config.shuffle_seed, buffer_size=self.config.shuffle_buffer_size)
-            return ds
+            raise NotImplementedError("IterableDataset is not implemented yet")
 
         raise NotImplementedError(f"Unsupported dataset type: {type(ds)}")

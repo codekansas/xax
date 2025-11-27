@@ -13,7 +13,6 @@ import numpy as np
 import optax
 from datasets import Dataset, load_dataset
 from jaxtyping import Array, PRNGKeyArray, PyTree
-from PIL.Image import Image as PILImage
 
 import xax
 
@@ -148,7 +147,7 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
         The model is called with (x_t, t, class_label) internally, but we need
         to wrap it to match the diffusion API which expects (x_t, t) -> output.
         """
-        images_bhw = batch["image"]
+        images_bhw = (batch["image"].astype(np.float32) / 255.0) - 0.5
         labels_b = batch["label"]
 
         def model_fn(x_bhw: Array, t_b: Array) -> Array:
@@ -186,7 +185,9 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
         max_images = 9
         num_sample = self.config.sampling_timesteps or 50
 
-        images, class_id = batch["image"], batch["label"]
+        images = (batch["image"].astype(np.float32) / 255.0) - 0.5
+        class_id = batch["label"]
+
         images = images[:max_images]
         class_id = class_id[:max_images]
 
@@ -230,16 +231,6 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
 
     def get_dataset(self) -> Dataset:
         ds = load_dataset("ylecun/mnist", split="train")
-
-        def process_fn(example: dict) -> dict:
-            image: PILImage = example["image"]
-            label: int = example["label"]
-            image_array = np.array(image).astype(np.float32) / 255.0
-            image_array = np.pad(image_array, ((2, 2), (2, 2)), mode="constant", constant_values=0)
-            image_array = image_array - 0.5
-            return {"image": image_array, "label": label}
-
-        ds = ds.map(process_fn)
         ds.set_format(type="numpy", columns=["image", "label"])
         return ds
 
@@ -251,6 +242,5 @@ if __name__ == "__main__":
             batch_size=256,
             log_heavy_every_n_seconds=60 * 5,
             max_grad_norm=1.0,
-            updates_per_step=10,
         ),
     )

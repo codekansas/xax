@@ -341,7 +341,7 @@ class SupervisedMixin(
             # Handle user-defined interrupts during the training loop.
             self.add_signal_handler(on_exit, signal.SIGUSR1, signal.SIGTERM)
 
-            ds = self.get_data_iterator()
+            ds = self.get_tf_dataset()
             ds = iter_samples(ds, data_sharding)
 
             try:

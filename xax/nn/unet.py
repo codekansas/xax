@@ -330,13 +330,14 @@ class UNet(eqx.Module):
         for up_block in self.up_blocks:
             if isinstance(up_block, BasicBlock):
                 skip = skip_conns.pop()
+                x = jax.image.resize(x, (x.shape[0], skip.shape[1], skip.shape[2]), method="linear")
                 x = jnp.concatenate([x, skip], axis=0)  # Concatenate along channel dimension
                 x = up_block(x, embedding)
             else:
                 x = up_block(x)
 
         # Residual connection
-        x = x + residual
+        x = jax.image.resize(x, residual.shape, method="linear") + residual
 
         # Output blocks
         for out_block in self.out_blocks:
