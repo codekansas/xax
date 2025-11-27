@@ -315,7 +315,7 @@ def get_positional_embeddings(
 
 
 def fourier_embeddings(t: Array, dim: int, max_period: int = 10000) -> Array:
-    if (squeeze := t.ndim == 0):
+    if squeeze := t.ndim == 0:
         t = t[None]
     half = dim // 2
     idxs = jnp.arange(start=0, stop=half, dtype=jnp.float32)
