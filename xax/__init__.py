@@ -23,6 +23,8 @@ __all__ = [
     "get_run_dir",
     "load_user_config",
     "State",
+    "cast_activation_type",
+    "get_activation",
     "AttentionCache",
     "AttentionCacheDict",
     "CrossAttentionBlock",
@@ -40,8 +42,8 @@ __all__ = [
     "cast_beta_schedule",
     "cast_diffusion_loss_fn",
     "cast_diffusion_pred_mode",
+    "cast_ode_solver_type",
     "cast_sigma_type",
-    "cast_solver_type",
     "get_diffusion_beta_schedule",
     "get_ode_solver",
     "Categorical",
@@ -72,14 +74,19 @@ __all__ = [
     "rotation_matrix_to_quat",
     "rotation_matrix_to_rotation6d",
     "cross_entropy",
-    "cast_norm_type",
     "dynamic_time_warping",
     "get_norm",
+    "cast_norm_type",
+    "get_norm_1d",
+    "get_norm_2d",
+    "get_norm_3d",
+    "get_norm_linear",
     "is_master",
     "BaseSSMBlock",
     "DiagSSMBlock",
     "SSM",
     "SSMBlock",
+    "UNet",
     "BaseLauncher",
     "CliLauncher",
     "MultiCpuLauncher",
@@ -194,7 +201,7 @@ __all__ = [
 ]
 
 __all__ += [
-    "ActivationFunction",
+    "ActivationType",
     "Batch",
     "CollateMode",
     "DiffusionBetaSchedule",
@@ -245,6 +252,8 @@ NAME_MAP: dict[str, str] = {
     "get_run_dir": "core.conf",
     "load_user_config": "core.conf",
     "State": "core.state",
+    "cast_activation_type": "nn.activation",
+    "get_activation": "nn.activation",
     "AttentionCache": "nn.attention",
     "AttentionCacheDict": "nn.attention",
     "CrossAttentionBlock": "nn.attention",
@@ -262,8 +271,8 @@ NAME_MAP: dict[str, str] = {
     "cast_beta_schedule": "nn.diffusion",
     "cast_diffusion_loss_fn": "nn.diffusion",
     "cast_diffusion_pred_mode": "nn.diffusion",
+    "cast_ode_solver_type": "nn.diffusion",
     "cast_sigma_type": "nn.diffusion",
-    "cast_solver_type": "nn.diffusion",
     "get_diffusion_beta_schedule": "nn.diffusion",
     "get_ode_solver": "nn.diffusion",
     "Categorical": "nn.distributions",
@@ -294,14 +303,19 @@ NAME_MAP: dict[str, str] = {
     "rotation_matrix_to_quat": "nn.geom",
     "rotation_matrix_to_rotation6d": "nn.geom",
     "cross_entropy": "nn.losses",
-    "cast_norm_type": "nn.metrics",
     "dynamic_time_warping": "nn.metrics",
     "get_norm": "nn.metrics",
+    "cast_norm_type": "nn.norm",
+    "get_norm_1d": "nn.norm",
+    "get_norm_2d": "nn.norm",
+    "get_norm_3d": "nn.norm",
+    "get_norm_linear": "nn.norm",
     "is_master": "nn.parallel",
     "BaseSSMBlock": "nn.ssm",
     "DiagSSMBlock": "nn.ssm",
     "SSM": "nn.ssm",
     "SSMBlock": "nn.ssm",
+    "UNet": "nn.unet",
     "BaseLauncher": "task.launchers.base",
     "CliLauncher": "task.launchers.cli",
     "MultiCpuLauncher": "task.launchers.multi_cpu",
@@ -418,7 +432,7 @@ NAME_MAP: dict[str, str] = {
 # Need to manually set some values which can't be auto-generated.
 NAME_MAP.update(
     {
-        "ActivationFunction": "nn.equinox",
+        "ActivationType": "nn.activation",
         "Batch": "task.mixins.train",
         "CollateMode": "utils.data.collate",
         "DiffusionBetaSchedule": "nn.diffusion",
@@ -460,6 +474,7 @@ if IMPORT_ALL or TYPE_CHECKING:
         load_user_config,
     )
     from xax.core.state import State
+    from xax.nn.activation import ActivationType, cast_activation_type, get_activation
     from xax.nn.attention import (
         AttentionCache,
         AttentionCacheDict,
@@ -484,8 +499,8 @@ if IMPORT_ALL or TYPE_CHECKING:
         cast_beta_schedule,
         cast_diffusion_loss_fn,
         cast_diffusion_pred_mode,
+        cast_ode_solver_type,
         cast_sigma_type,
-        cast_solver_type,
         get_diffusion_beta_schedule,
         get_ode_solver,
     )
@@ -525,8 +540,10 @@ if IMPORT_ALL or TYPE_CHECKING:
     )
     from xax.nn.losses import cross_entropy
     from xax.nn.metrics import NormType, cast_norm_type, dynamic_time_warping, get_norm
+    from xax.nn.norm import NormType, cast_norm_type, get_norm_1d, get_norm_2d, get_norm_3d, get_norm_linear
     from xax.nn.parallel import is_master
     from xax.nn.ssm import SSM, BaseSSMBlock, DiagSSMBlock, SSMBlock
+    from xax.nn.unet import UNet
     from xax.task.base import RawConfigType
     from xax.task.launchers.base import BaseLauncher
     from xax.task.launchers.cli import CliLauncher

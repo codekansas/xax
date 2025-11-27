@@ -21,8 +21,9 @@ DiffusionPredMode = Literal["pred_x_0", "pred_eps", "pred_v"]
 SigmaType = Literal["upper_bound", "lower_bound"]
 DiffusionBetaSchedule = Literal["linear", "quad", "warmup", "const", "cosine", "jsd"]
 
+EPS = 1e-5
 
-def cast_solver_type(s: str) -> ODESolverType:
+def cast_ode_solver_type(s: str) -> ODESolverType:
     assert s in get_args(ODESolverType), f"Unknown solver {s}"
     return cast(ODESolverType, s)
 
@@ -31,13 +32,16 @@ def cast_diffusion_loss_fn(loss: str) -> DiffusionLossFn:
     assert loss in get_args(DiffusionLossFn), f"Unknown loss function: {loss}"
     return cast(DiffusionLossFn, loss)
 
+
 def cast_diffusion_pred_mode(pred_mode: str) -> DiffusionPredMode:
     assert pred_mode in get_args(DiffusionPredMode), f"Unknown prediction mode: {pred_mode}"
     return cast(DiffusionPredMode, pred_mode)
 
+
 def cast_sigma_type(sigma_type: str) -> SigmaType:
     assert sigma_type in get_args(SigmaType), f"Unknown sigma type: {sigma_type}"
     return cast(SigmaType, sigma_type)
+
 
 def cast_beta_schedule(schedule: str) -> DiffusionBetaSchedule:
     assert schedule in get_args(DiffusionBetaSchedule), f"Unknown schedule type: {schedule}"
@@ -160,7 +164,7 @@ class RK4ODESolver(BaseODESolver):
         dt = next_t - t
         half_t = t + dt / 2
         k1 = func(samples, t)
-        k2 = func(add_fn(samples, k1 / 2, t, half_t), half_t)
+        k2 = func(add_fn(samples, k1, t, half_t), half_t)
         k3 = func(add_fn(samples, k2, t, half_t), half_t)
         k4 = func(add_fn(samples, k3, t, next_t), next_t)
         x = (k1 + 2 * k2 + 2 * k3 + k4) / 6
@@ -276,8 +280,6 @@ class GaussianDiffusion(eqx.Module):
                 - ``"upper_bound"``: The upper bound of the posterior noise.
                 - ``"lower_bound"``: The lower bound of the posterior noise.
 
-        solver: The ODE solver to use for running incremental model steps.
-            If not set, will default to using the built-in ODE solver.
         beta_start: The initial beta value, for linear, quad, and warmup
             schedules.
         beta_end: The final beta value, for linear, quad, warmup and const
@@ -298,7 +300,6 @@ class GaussianDiffusion(eqx.Module):
     warmup: float = eqx.field(static=True)
     cosine_offset: float = eqx.field(static=True)
     num_timesteps: int = eqx.field(static=True)
-    solver: BaseODESolver = eqx.field()
 
     def __init__(
         self,
@@ -307,7 +308,6 @@ class GaussianDiffusion(eqx.Module):
         pred_mode: DiffusionPredMode = "pred_x_0",
         loss: DiffusionLossFn = "mse",
         sigma_type: SigmaType = "upper_bound",
-        solver: ODESolverType = "euler",
         *,
         beta_start: float = 0.0001,
         beta_end: float = 0.02,
@@ -326,10 +326,8 @@ class GaussianDiffusion(eqx.Module):
         self.num_timesteps = num_beta_steps - 1
 
         # Initialize bar_alpha with placeholder, will be set in reset_parameters
-        self.bar_alpha = jnp.empty(self.num_beta_steps)
-
-        # The ODE solver to use.
-        self.solver = get_ode_solver(solver)
+        # bar_alpha has shape (num_beta_steps + 1,) because we prepend 1.0 for t=0
+        self.bar_alpha = jnp.empty(self.num_beta_steps + 1)
 
     def reset_parameters(self) -> "GaussianDiffusion":
         """Resets the parameters of the diffusion model."""
@@ -348,7 +346,11 @@ class GaussianDiffusion(eqx.Module):
         assert not (betas < 0).any(), "Betas must be non-negative."
         assert not (betas > 1).any(), "Betas must be less than or equal to 1."
 
+        # bar_alpha_t = prod_{i=1}^t (1 - beta_i)
+        # bar_alpha_0 = 1.0 (no noise at t=0)
         bar_alpha = jnp.cumprod(1.0 - betas, axis=0)
+        # Prepend 1.0 so bar_alpha[0] = 1.0 (no noise)
+        bar_alpha = jnp.concatenate([jnp.array([1.0]), bar_alpha])
 
         return eqx.tree_at(lambda x: x.bar_alpha, self, bar_alpha)
 
@@ -370,7 +372,11 @@ class GaussianDiffusion(eqx.Module):
         """
         bsz = x.shape[0]
         t_key, eps_key = jax.random.split(key)
-        t_sample = jax.random.randint(t_key, (bsz,), 1, self.num_timesteps + 1)
+        # Sample timesteps from [0, num_timesteps]
+        # Note: bar_alpha has shape (num_beta_steps,) = (num_timesteps + 1,)
+        # So we can index with [0, num_timesteps], but t=0 means no noise
+        # We sample from [0, num_timesteps] to include all valid timesteps
+        t_sample = jax.random.randint(t_key, (bsz,), 0, self.num_timesteps + 1)
         eps = self.get_noise(eps_key, x)
         bar_alpha = self.bar_alpha[t_sample].reshape(-1, *[1] * (x.ndim - 1))
         x_t = jnp.sqrt(bar_alpha) * x + jnp.sqrt(1 - bar_alpha) * eps
@@ -415,7 +421,6 @@ class GaussianDiffusion(eqx.Module):
         reference_sample: Array,
         start_percent: float,
         sampling_timesteps: int | None = None,
-        solver: BaseODESolver | None = None,
     ) -> Array:
         """Samples from the model, starting from a given reference sample.
 
@@ -435,8 +440,6 @@ class GaussianDiffusion(eqx.Module):
                 means that none of the diffusion steps will be used.
             sampling_timesteps: The number of timesteps to sample for. If
                 ``None``, then the full number of timesteps will be used.
-            solver: The ODE solver to use for running incremental model steps.
-                If not set, will default to using the built-in ODE solver.
 
         Returns:
             The samples, with shape ``(sampling_timesteps + 1, *)``.
@@ -451,7 +454,6 @@ class GaussianDiffusion(eqx.Module):
             key=key,
             model=model,
             x=x,
-            solver=solver,
             sampling_timesteps=sampling_timesteps,
             start_percent=start_percent,
         )
@@ -462,7 +464,6 @@ class GaussianDiffusion(eqx.Module):
         model: Callable[[Array, Array], Array],
         shape: tuple[int, ...],
         sampling_timesteps: int | None = None,
-        solver: BaseODESolver | None = None,
     ) -> Array:
         """Samples from the model.
 
@@ -474,8 +475,6 @@ class GaussianDiffusion(eqx.Module):
             shape: The shape of the samples.
             sampling_timesteps: The number of timesteps to sample for. If
                 ``None``, then the full number of timesteps will be used.
-            solver: The ODE solver to use for running incremental model steps.
-                If not set, will default to using the built-in ODE solver.
 
         Returns:
             The samples, with shape ``(sampling_timesteps + 1, *)``.
@@ -486,12 +485,11 @@ class GaussianDiffusion(eqx.Module):
             key=sample_key,
             model=model,
             x=x,
-            solver=solver,
             sampling_timesteps=sampling_timesteps,
             start_percent=0.0,
         )
 
-    def _get_t_tensor(self, t: int, x: Array) -> Array:
+    def _get_t_tensor(self, t: Array, x: Array) -> Array:
         return jnp.full((x.shape[0],), t, dtype=jnp.int32)
 
     def _get_bar_alpha(self, t: Array, x: Array) -> Array:
@@ -519,7 +517,10 @@ class GaussianDiffusion(eqx.Module):
                 return model(x, t)
             case "pred_eps":
                 pred_eps = model(x, t)
-                return (x - jnp.sqrt(1 - bar_alpha) * pred_eps) / jnp.sqrt(bar_alpha)
+                bar_alpha_clipped = jnp.clip(bar_alpha, EPS, 1.0 - EPS)
+                sqrt_bar_alpha = jnp.sqrt(bar_alpha_clipped)
+                sqrt_one_minus_bar_alpha = jnp.sqrt(1.0 - bar_alpha_clipped)
+                return (x - sqrt_one_minus_bar_alpha * pred_eps) / sqrt_bar_alpha
             case "pred_v":
                 pred_v = model(x, t)
                 return jnp.sqrt(bar_alpha) * x - jnp.sqrt(1 - bar_alpha) * pred_v
@@ -530,26 +531,24 @@ class GaussianDiffusion(eqx.Module):
         self,
         model: Callable[[Array, Array], Array],
         x: Array,
-        solver: BaseODESolver,
-        scalar_t_start: int,
-        scalar_t_end: int,
+        scalar_t_start: Array,
+        scalar_t_end: Array,
     ) -> Array:
-        def func(x: Array, t: Array) -> Array:
-            return self._run_model(model, x, t, self._get_bar_alpha(t, x))
+        t = self._get_t_tensor(scalar_t_start, x)
+        bar_alpha = self._get_bar_alpha(t, x)
+        pred_x_0 = self._run_model(model, x, t, bar_alpha)
+        next_t = self._get_t_tensor(scalar_t_end, x)
+        bar_alpha_next = self._get_bar_alpha(next_t, x)
+        sqrt_bar_alpha = jnp.sqrt(jnp.clip(bar_alpha, EPS, 1.0 - EPS))
+        sqrt_one_minus_bar_alpha = jnp.sqrt(jnp.clip(1.0 - bar_alpha, EPS, 1.0))
+        predicted_eps = (x - sqrt_bar_alpha * pred_x_0) / sqrt_one_minus_bar_alpha
+        sqrt_bar_alpha_next = jnp.sqrt(jnp.clip(bar_alpha_next, EPS, 1.0 - EPS))
+        deterministic_part = sqrt_bar_alpha_next * pred_x_0
+        sqrt_one_minus_bar_alpha_next = jnp.sqrt(jnp.clip(1.0 - bar_alpha_next, EPS, 1.0))
+        noisy_part = sqrt_one_minus_bar_alpha_next * predicted_eps
+        return deterministic_part + noisy_part
 
-        def add_fn(x: Array, pred_x: Array, t: Array, next_t: Array) -> Array:
-            bar_alpha, bar_alpha_next = self._get_bar_alpha(t, x), self._get_bar_alpha(next_t, x)
-            lhs_factor = jnp.sqrt(bar_alpha / bar_alpha_next) * (1 - bar_alpha_next)
-            rhs_factor = jnp.sqrt(bar_alpha_next) * (1 - bar_alpha / bar_alpha_next)
-            lhs = lhs_factor * x
-            rhs = rhs_factor * pred_x
-            return (lhs + rhs) / (1 - bar_alpha)
-
-        t_start, t_end = self._get_t_tensor(scalar_t_start, x), self._get_t_tensor(scalar_t_end, x)
-
-        return solver.step(x, t_start, t_end, func, add_fn)
-
-    def _add_noise(self, key: PRNGKeyArray, x: Array, scalar_t_start: int, scalar_t_end: int) -> Array:
+    def _add_noise(self, key: PRNGKeyArray, x: Array, scalar_t_start: Array, scalar_t_end: Array) -> Array:
         t_start, t_end = self._get_t_tensor(scalar_t_start, x), self._get_t_tensor(scalar_t_end, x)
         bar_alpha_start, bar_alpha_end = self._get_bar_alpha(t_start, x), self._get_bar_alpha(t_end, x)
 
@@ -571,13 +570,10 @@ class GaussianDiffusion(eqx.Module):
         key: PRNGKeyArray,
         model: Callable[[Array, Array], Array],
         x: Array,
-        solver: BaseODESolver | None = None,
         sampling_timesteps: int | None = None,
         start_percent: float = 0.0,
     ) -> Array:
         assert 0.0 <= start_percent <= 1.0
-        if solver is None:
-            solver = self.solver
 
         sampling_timesteps = self.num_timesteps if sampling_timesteps is None else sampling_timesteps
         assert 1 <= sampling_timesteps <= self.num_timesteps
@@ -595,9 +591,9 @@ class GaussianDiffusion(eqx.Module):
         current_key = init_key
 
         for idx in range(sampling_timesteps):
-            t_start = int(subseq[idx])
-            t_end = int(subseq[idx + 1])
-            current_x = self._sample_step(model, current_x, solver, t_start, t_end)
+            t_start = subseq[idx]
+            t_end = subseq[idx + 1]
+            current_x = self._sample_step(model, current_x, t_start, t_end)
             if t_end != 0:
                 current_key, noise_key = jax.random.split(current_key)
                 current_x = self._add_noise(noise_key, current_x, t_start, t_end)

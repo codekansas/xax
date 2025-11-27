@@ -8,7 +8,6 @@ from typing import TypedDict
 
 import equinox as eqx
 import jax
-import jax.numpy as jnp
 import numpy as np
 import optax
 from datasets import Dataset, load_dataset
@@ -25,236 +24,73 @@ class Batch(TypedDict):
 
 @dataclass
 class Config(xax.SupervisedConfig):
-    batch_size: int = xax.field(128, help="The size of a minibatch")
-    learning_rate: float = xax.field(1e-4, help="The learning rate")
-    hidden_dim: int = xax.field(256, help="Hidden layer dimension")
-    num_timesteps: int = xax.field(1000, help="Number of diffusion timesteps")
+    batch_size: int = xax.field(256, help="The size of a minibatch")
+    learning_rate: float = xax.field(1e-3, help="The learning rate")
+    hidden_dim: int = xax.field(128, help="Hidden layer dimension")
+    dim_scales: list[int] = xax.field([1, 2, 4, 8], help="List of dimension scales for UNet")
+    num_timesteps: int = xax.field(500, help="Number of diffusion timesteps")
     pred_mode: str = xax.field("pred_x_0", help="Prediction mode: pred_x_0, pred_eps, or pred_v")
-    beta_schedule: str = xax.field("jsd", help="Beta schedule type")
-    warmup_steps: int = xax.field(250, help="Number of warmup steps")
-    sampling_timesteps: int = xax.field(100, help="Number of timesteps for sampling")
+    beta_schedule: str = xax.field("linear", help="Beta schedule type")
+    warmup_steps: int = xax.field(100, help="Number of warmup steps")
+    sampling_timesteps: int | None = xax.field(50, help="Number of timesteps for sampling")
 
 
-class ResBlock(eqx.Module):
-    """Residual block with time and class conditioning."""
-
-    conv1: eqx.nn.Conv2d
-    conv2: eqx.nn.Conv2d
-    time_proj: eqx.nn.Linear
-    class_proj: eqx.nn.Linear | None
-    norm1: eqx.nn.GroupNorm
-    norm2: eqx.nn.GroupNorm
+class UNet(eqx.Module):
+    class_embs: eqx.nn.Embedding
+    fourier_emb: xax.FourierEmbeddings
+    time_proj_1: eqx.nn.Linear
+    time_proj_2: eqx.nn.Linear
+    unet: xax.UNet
 
     def __init__(
         self,
-        channels: int,
-        time_dim: int,
-        class_dim: int | None = None,
-        *,
-        key: PRNGKeyArray,
-    ) -> None:
-        key1, key2, key_time, key_class = jax.random.split(key, 4)
-        self.conv1 = eqx.nn.Conv2d(channels, channels, kernel_size=3, padding=1, key=key1)
-        self.conv2 = eqx.nn.Conv2d(channels, channels, kernel_size=3, padding=1, key=key2)
-        self.time_proj = eqx.nn.Linear(time_dim, channels, key=key_time)
-        self.class_proj = eqx.nn.Linear(class_dim, channels, key=key_class) if class_dim is not None else None
-        self.norm1 = eqx.nn.GroupNorm(min(8, channels), channels)
-        self.norm2 = eqx.nn.GroupNorm(min(8, channels), channels)
-
-    def __call__(self, x: Array, t_emb: Array, class_emb: Array | None = None) -> Array:
-        """Forward pass of residual block.
-
-        Args:
-            x: Input features, shape (C, H, W)
-            t_emb: Time embedding, shape (time_dim,)
-            class_emb: Class embedding, shape (class_dim,) or None
-
-        Returns:
-            Output features, shape (out_channels, H, W)
-        """
-        h = self.norm1(x)
-        h = jax.nn.swish(h)
-        h = self.conv1(h)
-
-        # Add time conditioning
-        t_proj = self.time_proj(t_emb)  # (out_channels,)
-        h = h + t_proj[:, None, None]  # Broadcast to spatial dimensions
-
-        # Add class conditioning if provided
-        if class_emb is not None and self.class_proj is not None:
-            c_proj = self.class_proj(class_emb)  # (out_channels,)
-            h = h + c_proj[:, None, None]  # Broadcast to spatial dimensions
-
-        h = self.norm2(h)
-        h = jax.nn.swish(h)
-        h = self.conv2(h)
-
-        return h + x
-
-
-class DiffusionModel(eqx.Module):
-    """A UNet-style diffusion model with class conditioning."""
-
-    time_embed: xax.FourierEmbeddings
-    class_embed: eqx.nn.Embedding
-    input_conv: eqx.nn.Conv2d
-    down_blocks: tuple[tuple[ResBlock, ...], ...]
-    down_samples: tuple[eqx.nn.Conv2d, ...]
-    bottleneck: ResBlock
-    up_samples: tuple[eqx.nn.ConvTranspose2d, ...]
-    up_blocks: tuple[tuple[ResBlock, ...], ...]
-    output_norm: eqx.nn.GroupNorm
-    output_conv: eqx.nn.Conv2d
-    hidden_dim: int
-    num_classes: int
-
-    def __init__(
-        self,
-        hidden_dim: int,
+        in_dim: int,
+        embed_dim: int,
+        dim_scales: list[int],
         num_classes: int,
-        num_timesteps: int,
         *,
         key: PRNGKeyArray,
     ) -> None:
-        super().__init__()
+        # Class embeddings.
+        emb_key, key = jax.random.split(key)
+        self.class_embs = eqx.nn.Embedding(
+            num_embeddings=num_classes,
+            embedding_size=embed_dim,
+            key=emb_key,
+        )
 
-        self.hidden_dim = hidden_dim
-        self.num_classes = num_classes
+        # Time embeddings.
+        key1, key2, key = jax.random.split(key, 3)
+        self.fourier_emb = xax.FourierEmbeddings(embed_dim)
+        self.time_proj_1 = eqx.nn.Linear(embed_dim, embed_dim, key=key1)
+        self.time_proj_2 = eqx.nn.Linear(embed_dim, embed_dim, key=key2)
 
-        # Time embedding using Fourier features
-        time_dim = hidden_dim
-        self.time_embed = xax.FourierEmbeddings(dim=time_dim, max_period=num_timesteps)
+        self.unet = xax.UNet(
+            in_dim=in_dim,
+            embed_dim=embed_dim,
+            dim_scales=dim_scales,
+            input_embedding_dim=embed_dim,
+            key=key,
+        )
 
-        # Class embedding
-        class_dim = hidden_dim
-        embed_key, input_key = jax.random.split(key)
-        self.class_embed = eqx.nn.Embedding(num_classes, class_dim, key=embed_key)
+    def __call__(self, x_hw: Array, t: Array, c: Array) -> Array:
+        dtype = self.class_embs.weight.dtype
 
-        # Input convolution: 1 channel (grayscale) -> hidden_dim
-        self.input_conv = eqx.nn.Conv2d(1, hidden_dim, kernel_size=3, padding=1, key=input_key)
+        # Embed class.
+        c_n = self.class_embs(c)
 
-        # UNet architecture: 3 down/up levels for 28x28 images
-        # Level 0: 28x28, Level 1: 14x14, Level 2: 7x7
-        channels = [hidden_dim, hidden_dim * 2, hidden_dim * 4]
-        num_levels = len(channels)
+        # Embed time.
+        t_n = self.fourier_emb(t).astype(dtype)
+        t_n = self.time_proj_1(t_n)
+        t_n = xax.get_activation("silu")(t_n)
+        t_n = self.time_proj_2(t_n)
 
-        # Downsampling path
-        down_blocks_list: list[tuple[ResBlock, ...]] = []
-        down_samples_list: list[eqx.nn.Conv2d] = []
+        # Combine embeddings.
+        e_n = c_n + t_n
 
-        for i in range(num_levels):
-            level_blocks: list[ResBlock] = []
-            num_blocks = 2 if i == 0 else 1  # More blocks at first level
-            for _ in range(num_blocks):
-                block_key, key = jax.random.split(key)
-                level_blocks.append(ResBlock(channels[i], time_dim, class_dim, key=block_key))
-            down_blocks_list.append(tuple(level_blocks))
+        o_hw = self.unet(x_hw[None].astype(dtype), e_n)[0]
 
-            # Downsample (except for last level)
-            if i < num_levels - 1:
-                downsample_key, key = jax.random.split(key)
-                downsample = eqx.nn.Conv2d(
-                    channels[i],
-                    channels[i + 1],
-                    kernel_size=3,
-                    stride=2,
-                    padding=1,
-                    key=downsample_key,
-                )
-                down_samples_list.append(downsample)
-
-        self.down_blocks = tuple(down_blocks_list)
-        self.down_samples = tuple(down_samples_list)
-
-        # Bottleneck
-        bottleneck_key, key = jax.random.split(key)
-        self.bottleneck = ResBlock(channels[-1], time_dim, class_dim, key=bottleneck_key)
-
-        # Upsampling path
-        up_blocks_list: list[tuple[ResBlock, ...]] = []
-        up_samples_list: list[eqx.nn.ConvTranspose2d] = []
-
-        for i in range(num_levels - 1, -1, -1):
-            # Upsample (except for first level)
-            if i < num_levels - 1:
-                upsample_key, key = jax.random.split(key)
-                upsample = eqx.nn.ConvTranspose2d(
-                    channels[i + 1],
-                    channels[i],
-                    kernel_size=4,
-                    stride=2,
-                    padding=1,
-                    key=upsample_key,
-                )
-                up_samples_list.append(upsample)
-
-            up_level_blocks: list[ResBlock] = []
-            num_blocks = 2 if i == 0 else 1
-            for _ in range(num_blocks):
-                block_key, key = jax.random.split(key)
-                up_level_blocks.append(ResBlock(channels[i], time_dim, class_dim, key=block_key))
-            up_blocks_list.append(tuple(up_level_blocks))
-
-        self.up_blocks = tuple(up_blocks_list)
-        self.up_samples = tuple(up_samples_list)
-
-        # Output layers
-        self.output_norm = eqx.nn.GroupNorm(min(8, hidden_dim), hidden_dim)
-        self.output_conv = eqx.nn.Conv2d(hidden_dim, 1, kernel_size=3, padding=1, key=key)
-
-    def __call__(self, x_hw: Array, t: Array, class_label: Array | None = None) -> Array:
-        """Forward pass of the diffusion model.
-
-        Args:
-            x_hw: Noisy image at timestep t, shape (H, W) for MNIST (28, 28)
-            t: Timestep, shape ()
-            class_label: Class label for conditioning, shape (). If None, uses zeros.
-
-        Returns:
-            Predicted target, shape (H, W) same as input
-        """
-        dtype = self.input_conv.weight.dtype
-        x_1hw = x_hw[None].astype(dtype)
-
-        # Time embedding
-        t_emb = self.time_embed(t[None])[0].astype(dtype)
-
-        # Class embedding
-        if class_label is None:
-            class_label = jnp.zeros((), dtype=jnp.int32)
-        class_emb = self.class_embed(class_label)  # Shape: (class_dim,)
-
-        # Input projection
-        x = self.input_conv(x_1hw)  # (H, W, hidden_dim)
-
-        # Downsampling path with skip connections
-        skip_connections: list[Array] = []
-        for i, blocks in enumerate(self.down_blocks):
-            for block in blocks:
-                x = block(x, t_emb, class_emb)
-            skip_connections.append(x)
-            if i < len(self.down_samples):
-                x = self.down_samples[i](x)
-
-        # Bottleneck
-        x = self.bottleneck(x, t_emb, class_emb)
-
-        # Upsampling path with skip connections
-        for i, blocks in enumerate(self.up_blocks):
-            if i > 0:
-                x = self.up_samples[i - 1](x)
-                skip = skip_connections[-(i + 1)]
-                x = x + skip
-            for block in blocks:
-                x = block(x, t_emb, class_emb)
-
-        # Output projection
-        x = self.output_norm(x)
-        x = jax.nn.swish(x)
-        x = self.output_conv(x)  # (1, H, W)
-
-        # Remove channel dimension: (1, H, W) -> (H, W)
-        return x[0].astype(x_hw.dtype)
+        return o_hw
 
 
 class MnistDiffusion(xax.SupervisedTask[Config]):
@@ -268,11 +104,12 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
         )
         self.diffusion = self.diffusion.reset_parameters()
 
-    def get_model(self, params: xax.InitParams) -> DiffusionModel:
-        return DiffusionModel(
-            hidden_dim=self.config.hidden_dim,
+    def get_model(self, params: xax.InitParams) -> UNet:
+        return UNet(
+            in_dim=1,
+            embed_dim=self.config.hidden_dim,
+            dim_scales=self.config.dim_scales,
             num_classes=10,
-            num_timesteps=self.config.num_timesteps,
             key=params.key,
         )
 
@@ -290,26 +127,21 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
                 alpha=0.1,  # Decay to 10% of initial learning rate
             )
 
-            opt = optax.adamw(
-                learning_rate=optax.join_schedules(
-                    schedules=[warmup_schedule, cosine_schedule],
-                    boundaries=[self.config.warmup_steps],
-                ),
-                weight_decay=0.01,
+            learning_rate_schedule = optax.join_schedules(
+                schedules=[warmup_schedule, cosine_schedule],
+                boundaries=[self.config.warmup_steps],
             )
-
         else:
-            opt = optax.adamw(
-                learning_rate=warmup_schedule,
-                weight_decay=0.01,
-            )
+            learning_rate_schedule = warmup_schedule
 
-        # Gradient accumulation.
-        # return optax.MultiSteps(opt, every_k_schedule=8)
+        return optax.adamw(
+            learning_rate=learning_rate_schedule,
+            weight_decay=1e-4,
+            b1=0.9,
+            b2=0.999,
+        )
 
-        return opt
-
-    def get_output(self, model: DiffusionModel, batch: Batch, state: xax.State) -> Array:
+    def get_output(self, model: UNet, batch: Batch, state: xax.State) -> Array:
         """Computes the diffusion loss.
 
         The model is called with (x_t, t, class_label) internally, but we need
@@ -325,7 +157,7 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
         loss = self.diffusion.loss(key, model_fn, images_bhw)
         return loss.mean()
 
-    def compute_loss(self, model: DiffusionModel, batch: Batch, output: Array, state: xax.State) -> Array:
+    def compute_loss(self, model: UNet, batch: Batch, output: Array, state: xax.State) -> Array:
         """The output is already the loss."""
         return output
 
@@ -343,47 +175,50 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
 
     def log_heavy(
         self,
-        model: DiffusionModel,
+        model: UNet,
         batch: Batch,
         output: Array,
         metrics: xax.FrozenDict[str, Array],
         state: xax.State,
     ) -> None:
         """Generate and log sample images."""
-        max_images = 16
+        max_images = 9
+        num_sample = self.config.sampling_timesteps or 50
 
-        # Generate samples for each class.
-        num_classes = 10
-        samples_per_class = 2
-        total_samples = num_classes * samples_per_class
+        images, class_id = batch["image"], batch["label"]
+        images = images[:max_images]
+        class_id = class_id[:max_images]
 
-        # Create class labels for generation.
-        class_labels = jnp.repeat(jnp.arange(num_classes), samples_per_class)
+        # Log real images
+        self.logger.log_labeled_images("real", (images, [f"class: {int(c)}" for c in class_id]), max_images=max_images)
 
-        def model_fn(x_bt: Array, t_b: Array) -> Array:
-            return jax.vmap(model)(x_bt, t_b, class_labels)
+        def vanilla_func(x_bt: Array, t_b: Array) -> Array:
+            return jax.vmap(model)(x_bt, t_b, class_id)
 
+        # Generate samples
         key = jax.random.PRNGKey(state.num_steps)
-        samples = self.diffusion.sample(
+        gen = self.diffusion.sample(
             key,
-            model_fn,
-            shape=(total_samples, 28, 28),
-            sampling_timesteps=self.config.sampling_timesteps,
+            vanilla_func,
+            shape=(max_images, 32, 32),
+            sampling_timesteps=num_sample,
         )
 
-        # Get the final denoised samples (first element is the final sample).
-        generated_images = samples[0]
+        # Get the final denoised samples (first element is the final sample)
+        generated_images = gen[0]
+        self.logger.log_labeled_images(
+            "generated",
+            (generated_images, [f"class: {int(c)}" for c in class_id]),
+            max_images=max_images,
+        )
 
-        # Create labels for the generated images.
-        labels = [f"class: {c}" for c in class_labels]
-
-        # Log the generated images.
-        self.logger.log_labeled_images("generated_samples", (generated_images, labels), max_images=total_samples)
-
-        # Also log some real images from the batch for comparison.
-        real_images = batch["image"][:max_images]
-        real_labels = [f"class: {int(label)}" for label in batch["label"][:max_images]]
-        self.logger.log_labeled_images("real_samples", (real_images, real_labels), max_images=max_images)
+        # Log single image sequence
+        one_gen = gen[:, 0]  # First image across all timesteps
+        self.logger.log_labeled_images(
+            "generated_single",
+            (one_gen, [f"step {i}" for i in range(len(one_gen))]),
+            max_images=len(one_gen),
+        )
 
     def get_dataset(self) -> Dataset:
         ds = load_dataset("ylecun/mnist", split="train")
@@ -391,10 +226,10 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
         def process_fn(example: dict) -> dict:
             image: PILImage = example["image"]
             label: int = example["label"]
-            return {
-                "image": (np.array(image).astype(np.float32) / 255.0) * 2.0 - 1.0,
-                "label": label,
-            }
+            image_array = np.array(image).astype(np.float32) / 255.0
+            image_array = np.pad(image_array, ((2, 2), (2, 2)), mode="constant", constant_values=0)
+            image_array = image_array - 0.5
+            return {"image": image_array, "label": label}
 
         ds = ds.map(process_fn)
         ds.set_format(type="numpy", columns=["image", "label"])
@@ -405,10 +240,11 @@ if __name__ == "__main__":
     # python -m examples.mnist_diffusion
     MnistDiffusion.launch(
         Config(
+            batch_size=256,
             log_heavy_every_n_seconds=60,
-            num_timesteps=1000,
-            pred_mode="pred_eps",
-            beta_schedule="cosine",
+            num_timesteps=500,
+            pred_mode="pred_v",
+            beta_schedule="linear",
             sampling_timesteps=50,
         ),
     )

@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SupervisedConfig(TrainConfig):
     updates_per_step: int = field(1, help="Number of updates to perform per step")
+    max_grad_norm: float | None = field(None, help="Clip gradient norm to this value.")
 
 
 Config = TypeVar("Config", bound=SupervisedConfig)
@@ -145,8 +146,18 @@ class SupervisedMixin(
         grad_fn = jax.grad(self.get_output_and_loss, argnums=0, has_aux=True)
         grad_fn = xax_jit(static_argnums=[1], jit_level=3)(grad_fn)
         grads, (output, metrics) = grad_fn(model_arr, model_static, batch, state)
+        grad_norm = optax.global_norm(grads)
+        if self.config.max_grad_norm is not None:
+            clip_fn = optax.clip_by_global_norm(self.config.max_grad_norm)
+            grads, _ = clip_fn.update(grads, None)
+
         updates, opt_state = optimizer.update(grads, opt_state, model_arr)
         model_arr = eqx.apply_updates(model_arr, updates)
+
+        # Add gradient norm to metrics
+        metrics = dict(metrics)
+        metrics["grad_norm"] = grad_norm
+
         return model_arr, opt_state, output, metrics
 
     @xax_jit(
