@@ -234,11 +234,11 @@ class SupervisedMixin(
             jit_level=3,
         )
 
-        # Only get the final output and metrics.
+        # Compute metrics for the final batch and output.
+        batch = batches[-1]
         output = jax.tree.map(lambda x: x[-1, -1], output)
 
         model = eqx.combine(model_arr, model_static)
-        batch = batches[-1]
         metrics = self.compute_metrics(model, batch, output, state, heavy, key)
 
         # Adds loss and gradient norm to metrics.
