@@ -48,12 +48,13 @@ __all__ = [
     "get_run_dir",
     "load_user_config",
     "State",
+    "cast_step_kind",
     "cast_activation_type",
     "get_activation",
     "Categorical",
-    "Distribution",
     "MixtureOfGaussians",
     "Normal",
+    "ProbabilityDistribution",
     "FourierEmbeddings",
     "IdentityPositionalEmbeddings",
     "LearnedPositionalEmbeddings",
@@ -92,6 +93,11 @@ __all__ = [
     "MultiCpuLauncher",
     "MultiDeviceLauncher",
     "SingleDeviceLauncher",
+    "Distribution",
+    "Histogram",
+    "Image",
+    "Images",
+    "LabeledImages",
     "LogDistribution",
     "LogError",
     "LogErrorSummary",
@@ -106,6 +112,10 @@ __all__ = [
     "LogVideo",
     "Logger",
     "LoggerImpl",
+    "Mesh",
+    "Scalar",
+    "String",
+    "Video",
     "CallbackLogger",
     "JsonLogger",
     "StateLogger",
@@ -213,11 +223,13 @@ __all__ += [
     "LOG_ERROR_SUMMARY",
     "LOG_PING",
     "LOG_STATUS",
+    "Metric",
     "NormType",
     "ODESolverType",
     "Output",
     "RawConfigType",
     "SigmaType",
+    "StepKind",
 ]
 
 import os
@@ -278,12 +290,13 @@ NAME_MAP: dict[str, str] = {
     "get_run_dir": "core.conf",
     "load_user_config": "core.conf",
     "State": "core.state",
+    "cast_step_kind": "core.state",
     "cast_activation_type": "nn.activation",
     "get_activation": "nn.activation",
     "Categorical": "nn.distributions",
-    "Distribution": "nn.distributions",
     "MixtureOfGaussians": "nn.distributions",
     "Normal": "nn.distributions",
+    "ProbabilityDistribution": "nn.distributions",
     "FourierEmbeddings": "nn.embeddings",
     "IdentityPositionalEmbeddings": "nn.embeddings",
     "LearnedPositionalEmbeddings": "nn.embeddings",
@@ -322,6 +335,11 @@ NAME_MAP: dict[str, str] = {
     "MultiCpuLauncher": "task.launchers.multi_cpu",
     "MultiDeviceLauncher": "task.launchers.multi_device",
     "SingleDeviceLauncher": "task.launchers.single_device",
+    "Distribution": "task.logger",
+    "Histogram": "task.logger",
+    "Image": "task.logger",
+    "Images": "task.logger",
+    "LabeledImages": "task.logger",
     "LogDistribution": "task.logger",
     "LogError": "task.logger",
     "LogErrorSummary": "task.logger",
@@ -336,6 +354,10 @@ NAME_MAP: dict[str, str] = {
     "LogVideo": "task.logger",
     "Logger": "task.logger",
     "LoggerImpl": "task.logger",
+    "Mesh": "task.logger",
+    "Scalar": "task.logger",
+    "String": "task.logger",
+    "Video": "task.logger",
     "CallbackLogger": "task.loggers.callback",
     "JsonLogger": "task.loggers.json",
     "StateLogger": "task.loggers.state",
@@ -445,11 +467,13 @@ NAME_MAP.update(
         "LOG_ERROR_SUMMARY": "utils.logging",
         "LOG_PING": "utils.logging",
         "LOG_STATUS": "utils.logging",
+        "Metric": "task.logger",
         "NormType": "nn.metrics",
         "ODESolverType": "arch.diffusion",
         "Output": "task.mixins.output",
         "RawConfigType": "task.base",
         "SigmaType": "arch.diffusion",
+        "StepKind": "core.state",
         "TransformerStack": "arch.attention",
     },
 )
@@ -502,13 +526,13 @@ if IMPORT_ALL or TYPE_CHECKING:
         get_run_dir,
         load_user_config,
     )
-    from xax.core.state import State
+    from xax.core.state import Batch, Output, State, StepKind, cast_step_kind
     from xax.nn.activation import ActivationType, cast_activation_type, get_activation
     from xax.nn.distributions import (
         Categorical,
-        Distribution,
         MixtureOfGaussians,
         Normal,
+        ProbabilityDistribution,
     )
     from xax.nn.embeddings import (
         EmbeddingKind,
@@ -549,6 +573,11 @@ if IMPORT_ALL or TYPE_CHECKING:
     from xax.task.launchers.multi_device import MultiDeviceLauncher
     from xax.task.launchers.single_device import SingleDeviceLauncher
     from xax.task.logger import (
+        Distribution,
+        Histogram,
+        Image,
+        Images,
+        LabeledImages,
         LogDistribution,
         LogError,
         LogErrorSummary,
@@ -563,6 +592,11 @@ if IMPORT_ALL or TYPE_CHECKING:
         LogScalar,
         LogStatus,
         LogVideo,
+        Mesh,
+        Metric,
+        Scalar,
+        String,
+        Video,
     )
     from xax.task.loggers.callback import CallbackLogger
     from xax.task.loggers.json import JsonLogger
@@ -575,7 +609,7 @@ if IMPORT_ALL or TYPE_CHECKING:
     from xax.task.mixins.gpu_stats import GPUStatsOptions
     from xax.task.mixins.parallel import ParallelConfig, ParallelMixin
     from xax.task.mixins.step_wrapper import StepContext
-    from xax.task.mixins.train import Batch, InitParams, Optimizer, Output
+    from xax.task.mixins.train import InitParams, Optimizer
     from xax.task.script import Script, ScriptConfig
     from xax.task.task import Config, SupervisedConfig, SupervisedTask, Task
     from xax.utils.data.collate import CollateMode, collate, collate_non_null

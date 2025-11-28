@@ -29,6 +29,7 @@ from typing import (
     cast,
 )
 
+import chex
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -39,7 +40,7 @@ from PIL.Image import Image as PILImageType
 
 from xax.core.state import State
 from xax.utils.experiments import ContextTimer, IntervalTicker
-from xax.utils.logging import LOG_ERROR_SUMMARY, LOG_PING, LOG_STATUS
+from xax.utils.logging import LOG_ERROR_SUMMARY, LOG_PING, LOG_STATUS, format_number
 
 logger = logging.getLogger(__name__)
 
@@ -229,47 +230,42 @@ def as_numpy_opt(array: Array | np.ndarray | None) -> np.ndarray | None:
     return as_numpy(array)
 
 
+@jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class Scalar:
     value: Array
     secondary: bool = field(default=False)
 
 
+@jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class Distribution:
     mean: Array
     std: Array
 
 
+@jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class Histogram:
     value: Array
     bins: int = field(default=DEFAULT_HISTOGRAM_BINS)
 
 
+@jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class String:
     value: str
     secondary: bool = field(default=False)
 
 
+@jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class Image:
     image: Array
     target_resolution: tuple[int, int] = field(default=DEFAULT_IMAGE_RESOLUTION)
 
 
-@dataclass(frozen=True)
-class LabeledImage:
-    image: Array
-    label: str
-    max_line_length: int | None = field(default=None)
-    max_num_lines: int | None = field(default=None)
-    target_resolution: tuple[int, int] = field(default=DEFAULT_IMAGE_RESOLUTION)
-    line_spacing: int = field(default=2)
-    centered: bool = field(default=True)
-
-
+@jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class Images:
     images: Array
@@ -278,10 +274,11 @@ class Images:
     sep: int = field(default=0)
 
 
+@jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class LabeledImages:
     images: Array
-    labels: Sequence[str]
+    labels: Array
     max_images: int | None = field(default=None)
     max_line_length: int | None = field(default=None)
     max_num_lines: int | None = field(default=None)
@@ -290,13 +287,18 @@ class LabeledImages:
     centered: bool = field(default=True)
     sep: int = field(default=0)
 
+    def __post_init__(self) -> None:
+        chex.assert_shape(self.labels, (self.images.shape[0],))
 
+
+@jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class Video:
     video: Array
     fps: int = field(default=DEFAULT_VIDEO_FPS)
 
 
+@jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class Mesh:
     vertices: Array
@@ -305,7 +307,7 @@ class Mesh:
     config_dict: dict[str, Any] | None = field(default=None)
 
 
-Metric = Scalar | Distribution | Histogram | String | Image | LabeledImage | Images | LabeledImages | Video | Mesh
+Metric = Scalar | Distribution | Histogram | String | Image | Images | LabeledImages | Video | Mesh
 
 
 @dataclass(kw_only=True)
@@ -780,17 +782,6 @@ class Logger:
             self.log_string(key, value.value, namespace=namespace, secondary=value.secondary)
         elif isinstance(value, Image):
             self.log_image(key, value.image, namespace=namespace, target_resolution=value.target_resolution)
-        elif isinstance(value, LabeledImage):
-            self.log_labeled_image(
-                key,
-                (value.image, value.label),
-                namespace=namespace,
-                max_line_length=value.max_line_length,
-                max_num_lines=value.max_num_lines,
-                target_resolution=value.target_resolution,
-                line_spacing=value.line_spacing,
-                centered=value.centered,
-            )
         elif isinstance(value, Images):
             self.log_images(
                 key,
@@ -802,7 +793,7 @@ class Logger:
         elif isinstance(value, LabeledImages):
             self.log_labeled_images(
                 key,
-                (value.images, value.labels),
+                (value.images, [format_number(label) for label in value.labels.tolist()]),
                 namespace=namespace,
                 max_images=value.max_images,
                 max_line_length=value.max_line_length,

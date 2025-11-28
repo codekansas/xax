@@ -6,7 +6,7 @@ versions (since Distrax is tied pretty closely to Tensorflow).
 """
 
 __all__ = [
-    "Distribution",
+    "ProbabilityDistribution",
     "Categorical",
     "Normal",
     "MixtureOfGaussians",
@@ -22,7 +22,7 @@ STD_CLIP = 1e-6
 LOGIT_CLIP = 6.0
 
 
-class Distribution(ABC):
+class ProbabilityDistribution(ABC):
     @abstractmethod
     def log_prob(self, x: Array) -> Array: ...
 
@@ -36,7 +36,7 @@ class Distribution(ABC):
     def entropy(self) -> Array: ...
 
 
-class Categorical(Distribution):
+class Categorical(ProbabilityDistribution):
     def __init__(self, logits_nc: Array, logit_clip: float = LOGIT_CLIP) -> None:
         """Initialize a categorical distribution.
 
@@ -66,7 +66,7 @@ class Categorical(Distribution):
         return -jnp.sum(probs * log_probs, axis=-1)
 
 
-class Normal(Distribution):
+class Normal(ProbabilityDistribution):
     def __init__(self, loc_n: Array, scale_n: Array, std_clip: float = STD_CLIP) -> None:
         """Initialize a normal distribution.
 
@@ -91,7 +91,7 @@ class Normal(Distribution):
         return jnp.log(2 * jnp.pi * jnp.e) + jnp.log(self.scale_n)
 
 
-class MixtureOfGaussians(Distribution):
+class MixtureOfGaussians(ProbabilityDistribution):
     def __init__(
         self,
         means_nm: Array,

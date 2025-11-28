@@ -16,7 +16,6 @@ from typing import (
     Protocol,
     Sequence,
     TypeVar,
-    cast,
     get_args,
     overload,
     runtime_checkable,
@@ -31,7 +30,7 @@ import orbax.checkpoint as ocp
 from jaxtyping import Array, PRNGKeyArray, PyTree
 
 from xax.core.conf import field
-from xax.core.state import Batch, Output, State, StepKind
+from xax.core.state import Batch, State, StepKind, cast_step_kind
 from xax.nn.functions import set_random_seed
 from xax.task.mixins.artifacts import ArtifactsConfig, ArtifactsMixin
 from xax.task.mixins.checkpointing import (
@@ -55,7 +54,6 @@ from xax.utils.experiments import (
 )
 from xax.utils.jax import jit as xax_jit
 from xax.utils.logging import LOG_PING, LOG_STATUS
-from xax.utils.types.frozen_dict import FrozenDict
 
 logger = logging.getLogger(__name__)
 
@@ -72,11 +70,6 @@ class Optimizer(Protocol):
         state: optax.OptState,
         params: optax.Params | None = None,
     ) -> tuple[optax.Updates, optax.OptState]: ...
-
-
-def cast_step_kind(s: str) -> StepKind:
-    assert s in get_args(StepKind), f"`step_kind` must be one of {get_args(StepKind)}, not {s}"
-    return cast(StepKind, s)
 
 
 class Precision(enum.Enum):
@@ -197,26 +190,6 @@ class TrainMixin(
     def prng_key(self) -> PRNGKeyArray:
         return jax.random.key(self.config.random_seed)
 
-    def log_light(
-        self,
-        model: PyTree,
-        batch: Batch,
-        output: Output,
-        metrics: FrozenDict[str, Array],
-        state: State,
-        key: PRNGKeyArray,
-    ) -> dict[str, Metric]: ...
-
-    def log_heavy(
-        self,
-        model: PyTree,
-        batch: Batch,
-        output: Output,
-        metrics: FrozenDict[str, Array],
-        state: State,
-        key: PRNGKeyArray,
-    ) -> dict[str, Metric]: ...
-
     def log_state_timers(self, state: State) -> None:
         timer = self.state_timer
         timer.step(state)
@@ -236,35 +209,6 @@ class TrainMixin(
         )
         last_log_time_s = jnp.where(log_heavy, state.elapsed_time_s, state.last_log_time_s)
         return state.replace(last_log_time_s=last_log_time_s), log_heavy
-
-    def log_step(
-        self,
-        model: PyTree,
-        batch: Batch,
-        output: Output,
-        metrics: FrozenDict[str, Array],
-        state: State,
-        key: PRNGKeyArray,
-    ) -> State:
-        state, log_heavy = self.get_log_mode(state)
-
-        for k, v in metrics.items():
-            if v.size == 1:
-                self.logger.log_scalar(k, v.item())
-            else:
-                self.logger.log_histogram(k, v)
-
-        self.log_state_timers(state)
-
-        # Delegate to the appropriate logging function.
-        log_heavy_val = log_heavy.item()
-        if log_heavy_val:
-            self.log_heavy(model, batch, output, metrics, state, key)
-        else:
-            self.log_light(model, batch, output, metrics, state, key)
-
-        self.write_logs(state, log_heavy_val)
-        return state
 
     @abstractmethod
     def get_model(self, params: InitParamsT) -> PyTree | Sequence[PyTree]:

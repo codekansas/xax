@@ -25,11 +25,11 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from jaxtyping import Array, PRNGKeyArray, PyTree
 
 from xax.core.conf import field
-from xax.core.state import State
+from xax.core.state import Batch, Output, State
 from xax.nn.parallel import is_master
 from xax.task.logger import Metric, Scalar
 from xax.task.mixins.data_loader import iter_samples
-from xax.task.mixins.train import Batch, InitParams, Output, TrainConfig, TrainMixin
+from xax.task.mixins.train import InitParams, TrainConfig, TrainMixin
 from xax.utils.experiments import (
     ContextTimer,
     TrainingFinishedError,
@@ -103,8 +103,9 @@ class SupervisedMixin(
         model: PyTree,
         batch: Batch,
         output: Output,
-        loss: Array,
         state: State,
+        heavy: bool,
+        key: PRNGKeyArray,
     ) -> dict[str, Metric]:
         """Computes the metrics for the current batch.
 
@@ -112,15 +113,14 @@ class SupervisedMixin(
             model: The current model.
             batch: The current minibatch of samples.
             output: The output from the model.
-            loss: The loss for the current batch.
             state: The current training state.
+            heavy: If we should be logging heavy metrics.
+            key: The current PRNG key.
 
         Returns:
             A dictionary of metrics.
         """
-        return {
-            "loss": Scalar(loss),
-        }
+        return {}
 
     @xax_jit(static_argnames=["self", "model_static"], jit_level=3)
     def get_output_and_loss(
@@ -130,13 +130,12 @@ class SupervisedMixin(
         batch: Batch,
         state: State,
         key: PRNGKeyArray,
-    ) -> tuple[Array, tuple[Output, dict[str, Metric]]]:
+    ) -> tuple[Array, Output]:
         output_key, loss_key = jax.random.split(key)
         model = eqx.combine(model_arr, model_static)
         output = self.get_output(model, batch, state, output_key)
         loss = self.compute_loss(model, batch, output, state, loss_key)
-        metrics = self.compute_metrics(model, batch, output, loss, state)
-        return loss, (output, metrics)
+        return loss, (loss, output)
 
     @xax_jit(
         static_argnames=["self", "model_static", "optimizer"],
@@ -152,10 +151,10 @@ class SupervisedMixin(
         batch: Batch,
         state: State,
         key: PRNGKeyArray,
-    ) -> tuple[PyTree, optax.OptState, Output, dict[str, Metric]]:
+    ) -> tuple[PyTree, optax.OptState, Output, Array, Array]:
         grad_fn = jax.grad(self.get_output_and_loss, argnums=0, has_aux=True)
         grad_fn = xax_jit(static_argnums=[1], jit_level=3)(grad_fn)
-        grads, (output, metrics) = grad_fn(model_arr, model_static, batch, state, key)
+        grads, (loss, output) = grad_fn(model_arr, model_static, batch, state, key)
         grad_norm = optax.global_norm(grads)
         if self.config.max_grad_norm is not None:
             clip_fn = optax.clip_by_global_norm(self.config.max_grad_norm)
@@ -164,13 +163,16 @@ class SupervisedMixin(
         updates, opt_state = optimizer.update(grads, opt_state, model_arr)
         model_arr = eqx.apply_updates(model_arr, updates)
 
-        # Add gradient norm to metrics
-        metrics["grad_norm"] = Scalar(grad_norm)
+        return model_arr, opt_state, output, loss, grad_norm
 
-        return model_arr, opt_state, output, metrics
+    def log_step(self, metrics: FrozenDict[str, Metric], state: State, heavy: bool) -> None:
+        for k, v in metrics.items():
+            self.logger.log_metric(k, v)
+        self.log_state_timers(state)
+        self.write_logs(state, heavy)
 
     @xax_jit(
-        static_argnames=["self", "model_static", "optimizer"],
+        static_argnames=["self", "model_static", "optimizer", "heavy"],
         donate_argnames=["model_arr", "opt_state", "state", "key"],
         jit_level=3,
     )
@@ -182,14 +184,16 @@ class SupervisedMixin(
         opt_state: optax.OptState,
         batches: tuple[Batch, ...],
         state: State,
+        heavy: bool,
         key: PRNGKeyArray,
-    ) -> tuple[PyTree, optax.OptState, Output, FrozenDict[str, Array], State]:
+    ) -> tuple[PyTree, optax.OptState, FrozenDict[str, Metric], State]:
+        @xax_jit(donate_argnames=["carry"])
         def update_fn(
             carry: tuple[PyTree, optax.OptState, State, PRNGKeyArray],
             batch: Batch,
-        ) -> tuple[tuple[PyTree, optax.OptState, State, PRNGKeyArray], tuple[Output, FrozenDict[str, Array]]]:
+        ) -> tuple[tuple[PyTree, optax.OptState, State, PRNGKeyArray], tuple[Output, Array, Array]]:
             model_arr, opt_state, state, key = carry
-            model_arr, opt_state, output, metrics = self.update(
+            model_arr, opt_state, output, loss, grad_norm = self.update(
                 model_arr,
                 model_static,
                 optimizer,
@@ -202,37 +206,46 @@ class SupervisedMixin(
                 num_steps=state.num_steps + 1,
                 num_samples=state.num_samples + (self.get_size_of_batch(batch) or 0),
             )
-            return (model_arr, opt_state, state, key), (output, FrozenDict(metrics))
+            return (model_arr, opt_state, state, key), (output, loss, grad_norm)
 
         batches_stacked = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *batches)
 
+        @xax_jit(donate_argnames=["carry"])
         def update_batch_fn(
             carry: tuple[PyTree, optax.OptState, State, PRNGKeyArray],
             _: None,
-        ) -> tuple[tuple[PyTree, optax.OptState, State, PRNGKeyArray], tuple[Output, FrozenDict[str, Array]]]:
+        ) -> tuple[tuple[PyTree, optax.OptState, State, PRNGKeyArray], tuple[Output, Array, Array]]:
             model_arr, opt_state, state, key = carry
 
-            (model_arr, opt_state, state, key), (output, metrics) = xax_scan(
+            (model_arr, opt_state, state, key), (output, loss, grad_norm) = xax_scan(
                 update_fn,
                 (model_arr, opt_state, state, key),
                 batches_stacked,
                 jit_level=3,
             )
 
-            return (model_arr, opt_state, state, key), (output, metrics)
+            return (model_arr, opt_state, state, key), (output, loss, grad_norm)
 
-        (model_arr, opt_state, state, _), (output, metrics) = xax_scan(
+        update_key, key = jax.random.split(key)
+        (model_arr, opt_state, state, _), (output, loss, grad_norm) = xax_scan(
             update_batch_fn,
-            (model_arr, opt_state, state, key),
+            (model_arr, opt_state, state, update_key),
             length=self.config.updates_per_step,
             jit_level=3,
         )
 
         # Only get the final output and metrics.
-        output = jax.tree.map(lambda x: x[-1], output)
-        metrics = jax.tree.map(lambda x: x[-1], metrics)
+        output = jax.tree.map(lambda x: x[-1, -1], output)
 
-        return model_arr, opt_state, output, metrics, state
+        model = eqx.combine(model_arr, model_static)
+        batch = batches[-1]
+        metrics = self.compute_metrics(model, batch, output, state, heavy, key)
+
+        # Adds loss and gradient norm to metrics.
+        metrics["loss"] = Scalar(loss.mean())
+        metrics["grad_norm"] = Scalar(grad_norm.mean())
+
+        return model_arr, opt_state, FrozenDict(metrics), state
 
     def train_loop(
         self,
@@ -257,24 +270,20 @@ class SupervisedMixin(
             with ContextTimer() as timer:
                 self.on_step_start()
                 batches = tuple(itertools.islice(ds, self.config.batches_per_step))
-                step_key, log_key, key = jax.random.split(key, 3)
-                model_arr, opt_state, output, metrics, state = self.train_step(
+                state, heavy_arr = self.get_log_mode(state)
+                heavy = heavy_arr.item()
+                step_key, key = jax.random.split(key)
+                model_arr, opt_state, metrics, state = self.train_step(
                     model_arr=model_arr,
                     model_static=model_static,
                     optimizer=optimizer,
                     opt_state=opt_state,
                     batches=batches,
                     state=state,
+                    heavy=heavy,
                     key=step_key,
                 )
-                state = self.log_step(
-                    eqx.combine(model_arr, model_static),
-                    batches[-1],
-                    output,
-                    metrics,
-                    state,
-                    log_key,
-                )
+                self.log_step(metrics, state, heavy)
                 self.on_step_end()
 
             state = state.replace(elapsed_time_s=state.elapsed_time_s + timer.elapsed_time)

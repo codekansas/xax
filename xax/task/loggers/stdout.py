@@ -4,9 +4,7 @@ import datetime
 import logging
 import sys
 from collections import deque
-from typing import Any, Deque, Mapping, TextIO
-
-from jaxtyping import Array
+from typing import Deque, Mapping, TextIO
 
 from xax.task.logger import (
     LogError,
@@ -18,23 +16,8 @@ from xax.task.logger import (
     LogStatus,
     LogString,
 )
+from xax.utils.logging import as_str, format_number
 from xax.utils.text import Color, colored, format_timedelta
-
-
-def format_number(value: int | float, precision: int) -> str:
-    if isinstance(value, int):
-        return f"{value:,}"  # Add commas to the number
-    return f"{value:.{precision}g}"
-
-
-def as_str(value: Any, precision: int) -> str:  # noqa: ANN401
-    if isinstance(value, str):
-        return f'"{value}"'
-    if isinstance(value, Array):
-        value = value.item()
-    if isinstance(value, (int, float)):
-        return format_number(value, precision)
-    raise TypeError(f"Unexpected log type: {type(value)}")
 
 
 class StdoutLogger(LoggerImpl):
@@ -97,6 +80,7 @@ class StdoutLogger(LoggerImpl):
             "Elapsed Time": format_timedelta(datetime.timedelta(seconds=line.state.elapsed_time_s.item()), short=True),
         }
 
+        self.write_fp.write(f"{colored('State', 'grey', bold=True)}\n")
         for k, v in state_info.items():
             self.write_fp.write(f" ↪ {k}: {colored(v, 'cyan')}\n")
 
