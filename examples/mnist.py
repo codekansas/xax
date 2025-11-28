@@ -110,7 +110,11 @@ class MnistClassification(xax.SupervisedTask[Config]):
         max_images = 16
         batch = jax.tree.map(lambda x: jax.device_get(x[:max_images]), batch)
         x, y, yhat = batch["image"][:max_images], y[:max_images], yhat[:max_images]
-        metrics["predictions"] = xax.LabeledImages(x, {"pred": yhat, "true": y})
+        metrics["predictions"] = xax.LabeledImages(
+            x,
+            {"pred": yhat, "true": y},
+            target_resolution=(64, 64),
+        )
 
         return metrics
 
