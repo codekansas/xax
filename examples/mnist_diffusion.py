@@ -167,36 +167,23 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
         model: PyTree,
         batch: Batch,
         output: Array,
-        loss: Array,
         state: xax.State,
-    ) -> dict[str, Array]:
-        return {
-            "loss": loss,
-        }
-
-    def log_heavy(
-        self,
-        model: UNet,
-        batch: Batch,
-        output: Array,
-        metrics: xax.FrozenDict[str, Array],
-        state: xax.State,
+        heavy: bool,
         key: PRNGKeyArray,
-    ) -> None:
+    ) -> dict[str, xax.Metric]:
         """Generate and log sample images."""
+        metrics: dict[str, xax.Metric] = {}
+        if not heavy:
+            return metrics
+
         max_images = 9
         num_sample = self.config.sampling_timesteps or 50
 
         images = (batch["image"].astype(np.float32) / 255.0) - 0.5
         class_id = batch["label"]
-
-        images = images[:max_images]
-        class_id = class_id[:max_images]
-
-        # Log real images
-        self.logger.log_labeled_images(
-            "real",
-            (images, [f"class: {int(c)}" for c in class_id]),
+        metrics["real"] = xax.LabeledImages(
+            images,
+            class_id,
             max_images=max_images,
             target_resolution=(64, 64),
         )
@@ -204,32 +191,34 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
         def vanilla_func(x_bt: Array, t_b: Array) -> Array:
             return jax.vmap(model)(x_bt, t_b, class_id)
 
-        # Generate samples
+        # Generate samples.
         gen = self.diffusion.sample(
             key,
             vanilla_func,
-            shape=(max_images, 32, 32),
+            shape=(len(class_id), 32, 32),
             sampling_timesteps=num_sample,
         )
 
-        # Get the final denoised samples (first element is the final sample)
+        # Get the final denoised samples (first element is the final sample).
         generated_images = gen[0]
-        self.logger.log_labeled_images(
-            "generated",
-            (generated_images, [f"class: {int(c)}" for c in class_id]),
+        metrics["generated"] = xax.LabeledImages(
+            generated_images,
+            class_id,
             max_images=max_images,
             target_resolution=(64, 64),
         )
 
-        # Log single image sequence
+        # Log single image sequence.
         indices = jnp.linspace(0, gen.shape[0] - 1, max_images).astype(jnp.int32).clip(0, gen.shape[0] - 1)
         one_gen = gen[indices, 0]
-        self.logger.log_labeled_images(
-            "generated_single",
-            (one_gen, [f"step {i}" for i in indices.tolist()]),
+        metrics["generated_single"] = xax.LabeledImages(
+            one_gen,
+            indices,
             max_images=max_images,
             target_resolution=(64, 64),
         )
+
+        return metrics
 
     def get_dataset(self) -> Dataset:
         ds = load_dataset("ylecun/mnist", split="train")

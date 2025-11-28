@@ -4,7 +4,9 @@ import logging
 import math
 import socket
 import sys
+from typing import Any
 
+from jaxtyping import Array
 from omegaconf import OmegaConf
 
 from xax.core.conf import load_user_config
@@ -22,6 +24,22 @@ LOG_STATUS: int = logging.INFO + 3
 
 # Reserved for error summary.
 LOG_ERROR_SUMMARY: int = logging.INFO + 4
+
+
+def format_number(value: int | float, precision: int = 4) -> str:
+    if isinstance(value, int):
+        return f"{value:,}"  # Add commas to the number
+    return f"{value:.{precision}g}"
+
+
+def as_str(value: Any, precision: int = 4) -> str:  # noqa: ANN401
+    if isinstance(value, str):
+        return f'"{value}"'
+    if isinstance(value, Array):
+        value = value.item()
+    if isinstance(value, (int, float)):
+        return format_number(value, precision)
+    raise TypeError(f"Unexpected log type: {type(value)}")
 
 
 class RankFilter(logging.Filter):

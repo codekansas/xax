@@ -24,7 +24,6 @@ class Batch(TypedDict):
 
 @dataclass
 class Config(xax.SupervisedConfig):
-    batch_size: int = xax.field(128, help="The size of a minibatch")
     learning_rate: float = xax.field(1e-3, help="The learning rate")
     hidden_dim: int = xax.field(512, help="Hidden layer dimension")
     num_hidden_layers: int = xax.field(2, help="Number of hidden layers")
@@ -98,14 +97,27 @@ class MnistClassification(xax.SupervisedTask[Config]):
         model: PyTree,
         batch: Batch,
         output: Array,
-        loss: Array,
         state: xax.State,
-    ) -> dict[str, Array]:
+        heavy: bool,
+        key: PRNGKeyArray,
+    ) -> dict[str, xax.Metric]:
         y, yhat = batch["label"], output.argmax(axis=1)
-        return {
-            "loss": loss,
-            "acc": (yhat == y).astype(float).mean(),
-        }
+        metrics: dict[str, xax.Metric] = {}
+        metrics["acc"] = xax.Scalar((yhat == y).astype(float).mean())
+        if not heavy:
+            return metrics
+
+        max_images = 16
+        batch = jax.tree.map(lambda x: jax.device_get(x[:max_images]), batch)
+        x = batch["image"]
+        metrics["predictions"] = xax.LabeledImages(
+            x,
+            {"pred": yhat, "true": y},
+            max_images=max_images,
+            target_resolution=(64, 64),
+        )
+
+        return metrics
 
     def log_heavy(
         self,
@@ -142,6 +154,10 @@ if __name__ == "__main__":
     # python -m examples.mnist
     MnistClassification.launch(
         Config(
+            batch_size=256,
             log_heavy_every_n_seconds=120,
+            # Perform a few updates per step, because otherwise we are sometimes
+            # bottlenecked by the data loader.
+            updates_per_step=8,
         ),
     )

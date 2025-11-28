@@ -2,7 +2,7 @@
 
 import time
 from dataclasses import dataclass
-from typing import Any, Literal, NotRequired, TypedDict, Unpack
+from typing import Any, Literal, NotRequired, TypedDict, Unpack, cast, get_args
 
 import jax
 import jax.numpy as jnp
@@ -18,6 +18,11 @@ Batch = Any
 Output = Any
 
 StepKind = Literal["step", "sample", "second"]
+
+
+def cast_step_kind(s: str) -> StepKind:
+    assert s in get_args(StepKind), f"`step_kind` must be one of {get_args(StepKind)}, not {s}"
+    return cast(StepKind, s)
 
 
 class StateDict(TypedDict, total=False):

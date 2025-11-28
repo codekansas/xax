@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import optax
 from datasets import Dataset, load_dataset
-from jaxtyping import Array, PRNGKeyArray, PyTree
+from jaxtyping import Array, PRNGKeyArray
 from transformers import AutoTokenizer
 from transformers.models.qwen2.tokenization_qwen2_fast import Qwen2TokenizerFast
 
@@ -183,17 +183,29 @@ class ShakespearePrediction(xax.SupervisedTask[Config]):
 
     def compute_metrics(
         self,
-        model: PyTree,
+        model: SequenceModel,
         batch: Batch,
         output: Array,
-        loss: Array,
         state: xax.State,
-    ) -> dict[str, Array]:
+        heavy: bool,
+        key: PRNGKeyArray,
+    ) -> dict[str, xax.Metric]:
         y, yhat = batch["input_ids"][:, 1:], output.argmax(axis=-1)
-        return {
-            "loss": loss,
-            "acc": (yhat == y).astype(float).mean(),
-        }
+        metrics: dict[str, xax.Metric] = {}
+        metrics["acc"] = xax.Scalar((yhat == y).astype(float).mean())
+        if not heavy:
+            return metrics
+
+        # prompt = "To be or not to be, that is the"
+        # prompt_seq = jnp.array(self.tokenizer.encode(prompt))
+        prompt_seq = batch["input_ids"][0, :16]
+        generated_tokens = model.generate_sequence(prompt_seq, max_len=96)
+        metrics["generated"] = xax.Tokens(generated_tokens)
+
+        return metrics
+
+    def decode_tokens(self, tokens: Array) -> str:
+        return self.tokenizer.decode(tokens.tolist())
 
     def get_model(self, params: xax.InitParams) -> SequenceModel:
         match self.config.model_type:
@@ -287,22 +299,6 @@ class ShakespearePrediction(xax.SupervisedTask[Config]):
     ) -> Array:
         y, yhat, mask = batch["input_ids"][:, 1:], output, batch["attention_mask"][:, 1:] == 1
         return optax.softmax_cross_entropy_with_integer_labels(logits=yhat, labels=y, where=mask).mean()
-
-    def log_heavy(
-        self,
-        model: SequenceModel,
-        batch: Batch,
-        output: Array,
-        metrics: xax.FrozenDict[str, Array],
-        state: xax.State,
-        key: PRNGKeyArray,
-    ) -> None:
-        # prompt = "To be or not to be, that is the"
-        # prompt_seq = jnp.array(self.tokenizer.encode(prompt))
-        prompt_seq = batch["input_ids"][0, :16]
-        generated_tokens = model.generate_sequence(prompt_seq, max_len=96)
-        generated_words = self.tokenizer.decode(generated_tokens.tolist())
-        self.logger.log_string("generated_output", generated_words)
 
     def _tokenize(self, examples: dict[str, str]) -> dict[str, list[int]]:
         return self.tokenizer(

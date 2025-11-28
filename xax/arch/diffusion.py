@@ -392,7 +392,6 @@ class GaussianDiffusion(eqx.Module):
             case _:
                 raise NotImplementedError(f"Unknown loss: {loss}")
 
-    @xax_jit(static_argnames=["self", "model", "start_percent", "sampling_timesteps"])
     def partial_sample(
         self,
         key: PRNGKeyArray,
@@ -438,7 +437,6 @@ class GaussianDiffusion(eqx.Module):
             start_percent=start_percent,
         )
 
-    @xax_jit(static_argnames=["self", "model", "shape", "sampling_timesteps"])
     def sample(
         self,
         key: PRNGKeyArray,
@@ -557,10 +555,7 @@ class GaussianDiffusion(eqx.Module):
         t_starts = subseq[:-1]
         t_ends = subseq[1:]
 
-        def scan_fn(
-            x: Array,
-            timesteps: tuple[Array, Array],
-        ) -> tuple[Array, Array]:
+        def scan_fn(x: Array, timesteps: tuple[Array, Array]) -> tuple[Array, Array]:
             t_start, t_end = timesteps
             x = self._sample_step(model, x, t_start, t_end)
             return x, x
