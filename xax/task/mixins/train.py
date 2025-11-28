@@ -205,7 +205,7 @@ class TrainMixin(
         metrics: FrozenDict[str, Array],
         state: State,
         key: PRNGKeyArray,
-    ) -> None: ...
+    ) -> dict[str, Metric]: ...
 
     def log_heavy(
         self,
@@ -215,7 +215,7 @@ class TrainMixin(
         metrics: FrozenDict[str, Array],
         state: State,
         key: PRNGKeyArray,
-    ) -> None: ...
+    ) -> dict[str, Metric]: ...
 
     def log_state_timers(self, state: State) -> None:
         timer = self.state_timer

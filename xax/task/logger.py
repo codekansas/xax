@@ -16,7 +16,7 @@ import re
 import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import TracebackType
 from typing import (
     Any,
@@ -34,8 +34,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax._src.core import ClosedJaxpr
 from jaxtyping import Array
-from PIL import Image, ImageDraw, ImageFont
-from PIL.Image import Image as PILImage
+from PIL import Image as PILImage, ImageDraw, ImageFont
+from PIL.Image import Image as PILImageType
 
 from xax.core.state import State
 from xax.utils.experiments import ContextTimer, IntervalTicker
@@ -50,6 +50,10 @@ Number = int | float | Array | np.ndarray
 ChannelSelectMode = Literal["first", "last", "mean"]
 
 DEFAULT_NAMESPACE = "value"
+DEFAULT_IMAGE_RESOLUTION = (512, 512)
+DEFAULT_IMAGES_RESOLUTION = (256, 256)
+DEFAULT_VIDEO_FPS = 30
+DEFAULT_HISTOGRAM_BINS = 100
 
 NAMESPACE_STACK: list[str] = []
 
@@ -79,10 +83,10 @@ def standardize_text(text: str, max_line_length: int | None = None, remove_non_a
 
 
 def make_human_viewable_resolution(
-    image: PILImage,
-    interpolation: Image.Resampling = Image.Resampling.LANCZOS,
+    image: PILImageType,
+    interpolation: PILImage.Resampling = PILImage.Resampling.LANCZOS,
     trg_res: tuple[int, int] = (512, 512),
-) -> PILImage:
+) -> PILImageType:
     """Resizes image to human-viewable resolution.
 
     Args:
@@ -156,7 +160,7 @@ def ternary_search_optimal_side_counts(height: int, width: int, count: int) -> t
         return factors[hi]
 
 
-def tile_images_different_sizes(images: list[PILImage], sep: int) -> PILImage:
+def tile_images_different_sizes(images: list[PILImageType], sep: int) -> PILImageType:
     """Tiles a list of images into a single image, even if they have different sizes.
 
     Args:
@@ -167,7 +171,7 @@ def tile_images_different_sizes(images: list[PILImage], sep: int) -> PILImage:
         The tiled image.
     """
     total_width, max_height = sum(image.width for image in images), max(image.height for image in images)
-    tiled = Image.new("RGB", (total_width + (len(images) - 1) * sep, max_height))
+    tiled = PILImage.new("RGB", (total_width + (len(images) - 1) * sep, max_height))
     x = 0
     for image in images:
         tiled.paste(image, (x, 0))
@@ -175,7 +179,7 @@ def tile_images_different_sizes(images: list[PILImage], sep: int) -> PILImage:
     return tiled
 
 
-def tile_images(images: list[PILImage], sep: int = 0) -> PILImage:
+def tile_images(images: list[PILImageType], sep: int = 0) -> PILImageType:
     """Tiles a list of images into a single image.
 
     Args:
@@ -186,7 +190,7 @@ def tile_images(images: list[PILImage], sep: int = 0) -> PILImage:
         The tiled image.
     """
     if not images:
-        return Image.new("RGB", (0, 0))
+        return PILImage.new("RGB", (0, 0))
 
     # Gets the optimal side counts.
     height, width = images[0].height, images[0].width
@@ -196,7 +200,7 @@ def tile_images(images: list[PILImage], sep: int = 0) -> PILImage:
     hside, wside = ternary_search_optimal_side_counts(height, width, len(images))
 
     # Tiles the images.
-    tiled = Image.new("RGB", (wside * width + (wside - 1) * sep, hside * height + (hside - 1) * sep))
+    tiled = PILImage.new("RGB", (wside * width + (wside - 1) * sep, hside * height + (hside - 1) * sep))
     for i, image in enumerate(images):
         x, y = i % wside, i // wside
         tiled.paste(image, (x * (width + sep), y * (height + sep)))
@@ -225,6 +229,85 @@ def as_numpy_opt(array: Array | np.ndarray | None) -> np.ndarray | None:
     return as_numpy(array)
 
 
+@dataclass(frozen=True)
+class Scalar:
+    value: Array
+    secondary: bool = field(default=False)
+
+
+@dataclass(frozen=True)
+class Distribution:
+    mean: Array
+    std: Array
+
+
+@dataclass(frozen=True)
+class Histogram:
+    value: Array
+    bins: int = field(default=DEFAULT_HISTOGRAM_BINS)
+
+
+@dataclass(frozen=True)
+class String:
+    value: str
+    secondary: bool = field(default=False)
+
+
+@dataclass(frozen=True)
+class Image:
+    image: Array
+    target_resolution: tuple[int, int] = field(default=DEFAULT_IMAGE_RESOLUTION)
+
+
+@dataclass(frozen=True)
+class LabeledImage:
+    image: Array
+    label: str
+    max_line_length: int | None = field(default=None)
+    max_num_lines: int | None = field(default=None)
+    target_resolution: tuple[int, int] = field(default=DEFAULT_IMAGE_RESOLUTION)
+    line_spacing: int = field(default=2)
+    centered: bool = field(default=True)
+
+
+@dataclass(frozen=True)
+class Images:
+    images: Array
+    max_images: int | None = field(default=None)
+    target_resolution: tuple[int, int] = field(default=DEFAULT_IMAGES_RESOLUTION)
+    sep: int = field(default=0)
+
+
+@dataclass(frozen=True)
+class LabeledImages:
+    images: Array
+    labels: Sequence[str]
+    max_images: int | None = field(default=None)
+    max_line_length: int | None = field(default=None)
+    max_num_lines: int | None = field(default=None)
+    target_resolution: tuple[int, int] = field(default=DEFAULT_IMAGE_RESOLUTION)
+    line_spacing: int = field(default=2)
+    centered: bool = field(default=True)
+    sep: int = field(default=0)
+
+
+@dataclass(frozen=True)
+class Video:
+    video: Array
+    fps: int = field(default=DEFAULT_VIDEO_FPS)
+
+
+@dataclass(frozen=True)
+class Mesh:
+    vertices: Array
+    colors: Array | None = field(default=None)
+    faces: Array | None = field(default=None)
+    config_dict: dict[str, Any] | None = field(default=None)
+
+
+Metric = Scalar | Distribution | Histogram | String | Image | LabeledImage | Images | LabeledImages | Video | Mesh
+
+
 @dataclass(kw_only=True)
 class LogString:
     value: str
@@ -233,7 +316,7 @@ class LogString:
 
 @dataclass(kw_only=True)
 class LogImage:
-    image: PILImage
+    image: PILImageType
 
 
 @dataclass(kw_only=True)
@@ -332,8 +415,8 @@ class LogPing:
     lineno: int | None = None
 
 
-def get_image(image: np.ndarray | Array | PILImage, target_resolution: tuple[int, int] | None = None) -> LogImage:
-    if not isinstance(image, (np.ndarray, Array, PILImage)):
+def get_image(image: np.ndarray | Array | PILImageType, target_resolution: tuple[int, int] | None = None) -> LogImage:
+    if not isinstance(image, (np.ndarray, Array, PILImageType)):
         raise ValueError(f"Unsupported image type: {type(image)}")
     if isinstance(image, Array):
         image = as_numpy(image)
@@ -353,13 +436,13 @@ def get_image(image: np.ndarray | Array | PILImage, target_resolution: tuple[int
 
         # Converts to a PIL image.
         if image.shape[-1] == 1:
-            image = Image.fromarray(image[..., 0])
+            image = PILImage.fromarray(image[..., 0])
         elif image.shape[-1] == 3:
-            image = Image.fromarray(image)
+            image = PILImage.fromarray(image)
         elif image.shape[0] == 1:
-            image = Image.fromarray(image[0])
+            image = PILImage.fromarray(image[0])
         elif image.shape[0] == 3:
-            image = Image.fromarray(image.transpose(1, 2, 0))
+            image = PILImage.fromarray(image.transpose(1, 2, 0))
         else:
             raise ValueError(f"Unsupported image shape: {image.shape}")
 
@@ -369,7 +452,7 @@ def get_image(image: np.ndarray | Array | PILImage, target_resolution: tuple[int
 
 
 def image_with_text(
-    image: PILImage,
+    image: PILImageType,
     text: list[str],
     max_num_lines: int | None,
     line_spacing: int,
@@ -398,7 +481,7 @@ def image_with_text(
     font: ImageFont.ImageFont | ImageFont.FreeTypeFont = ImageFont.load_default()
     _, _, _, line_height = font.getbbox(text[0])
     new_width, new_height = width, int(height + line_spacing + max_num_lines * (line_height + line_spacing))
-    padded_image = Image.new(image.mode, (new_width, new_height), 255)
+    padded_image = PILImage.new(image.mode, (new_width, new_height), 255)
     padded_image.paste(image, (0, 0))
     drawer = ImageDraw.Draw(padded_image)
     for i, text_line in enumerate(text):
@@ -676,6 +759,73 @@ class Logger:
     def resolve_namespace(self, namespace: str | None = None) -> str:
         return "_".join([self.default_namespace if namespace is None else namespace] + NAMESPACE_STACK)
 
+    def log_metric(
+        self,
+        key: str,
+        value: Metric,
+        *,
+        namespace: str | None = None,
+    ) -> None:
+        if not self.active:
+            raise RuntimeError("The logger is not active")
+        namespace = self.resolve_namespace(namespace)
+
+        if isinstance(value, Scalar):
+            self.log_scalar(key, value.value, secondary=value.secondary, namespace=namespace)
+        elif isinstance(value, Distribution):
+            self.log_distribution(key, (value.mean, value.std), namespace=namespace)
+        elif isinstance(value, Histogram):
+            self.log_histogram(key, value.value, bins=value.bins, namespace=namespace)
+        elif isinstance(value, String):
+            self.log_string(key, value.value, namespace=namespace, secondary=value.secondary)
+        elif isinstance(value, Image):
+            self.log_image(key, value.image, namespace=namespace, target_resolution=value.target_resolution)
+        elif isinstance(value, LabeledImage):
+            self.log_labeled_image(
+                key,
+                (value.image, value.label),
+                namespace=namespace,
+                max_line_length=value.max_line_length,
+                max_num_lines=value.max_num_lines,
+                target_resolution=value.target_resolution,
+                line_spacing=value.line_spacing,
+                centered=value.centered,
+            )
+        elif isinstance(value, Images):
+            self.log_images(
+                key,
+                value.images,
+                namespace=namespace,
+                target_resolution=value.target_resolution,
+                sep=value.sep,
+            )
+        elif isinstance(value, LabeledImages):
+            self.log_labeled_images(
+                key,
+                (value.images, value.labels),
+                namespace=namespace,
+                max_images=value.max_images,
+                max_line_length=value.max_line_length,
+                max_num_lines=value.max_num_lines,
+                target_resolution=value.target_resolution,
+                line_spacing=value.line_spacing,
+                centered=value.centered,
+                sep=value.sep,
+            )
+        elif isinstance(value, Video):
+            self.log_video(key, value.video, namespace=namespace, fps=value.fps)
+        elif isinstance(value, Mesh):
+            self.log_mesh(
+                key,
+                value.vertices,
+                colors=value.colors,
+                faces=value.faces,
+                config_dict=value.config_dict,
+                namespace=namespace,
+            )
+        else:
+            raise ValueError(f"Unsupported log type: {type(value)}")
+
     def log_scalar(
         self,
         key: str,
@@ -731,8 +881,9 @@ class Logger:
         @functools.lru_cache(maxsize=None)
         def distribution_future() -> LogDistribution:
             with ContextTimer() as timer:
-                mean, std = value() if callable(value) else value
+                value_concrete = value() if callable(value) else value
             logger.debug("Distribution Key: %s, Time: %s", key, timer.elapsed_time)
+            mean, std = value_concrete
             return LogDistribution(mean=mean, std=std)
 
         self.distributions[namespace][key] = distribution_future
@@ -864,17 +1015,18 @@ class Logger:
 
         @functools.lru_cache(maxsize=None)
         def value_future() -> LogString:
-            return LogString(value=value() if callable(value) else value, secondary=secondary)
+            value_concrete = value() if callable(value) else value
+            return LogString(value=value_concrete, secondary=secondary)
 
         self.strings[namespace][key] = value_future
 
     def log_image(
         self,
         key: str,
-        value: Callable[[], np.ndarray | Array | PILImage] | np.ndarray | Array | PILImage,
+        value: Callable[[], np.ndarray | Array | PILImageType] | np.ndarray | Array | PILImageType,
         *,
         namespace: str | None = None,
-        target_resolution: tuple[int, int] | None = (512, 512),
+        target_resolution: tuple[int, int] | None = DEFAULT_IMAGE_RESOLUTION,
     ) -> None:
         """Logs an image.
 
@@ -892,7 +1044,11 @@ class Logger:
         @functools.lru_cache(maxsize=None)
         def image_future() -> LogImage:
             with ContextTimer() as timer:
-                image = get_image(value() if callable(value) else value, target_resolution)
+                value_concrete = value() if callable(value) else value
+                try:
+                    image = get_image(value_concrete, target_resolution)
+                except Exception as e:
+                    raise ValueError(f"Error with image {namespace}/{key}") from e
             logger.debug("Image Key: %s, Time: %s", key, timer.elapsed_time)
             return image
 
@@ -901,12 +1057,13 @@ class Logger:
     def log_labeled_image(
         self,
         key: str,
-        value: Callable[[], tuple[np.ndarray | Array | PILImage, str]] | tuple[np.ndarray | Array | PILImage, str],
+        value: Callable[[], tuple[np.ndarray | Array | PILImageType, str]]
+        | tuple[np.ndarray | Array | PILImageType, str],
         *,
         namespace: str | None = None,
         max_line_length: int | None = None,
         max_num_lines: int | None = None,
-        target_resolution: tuple[int, int] | None = (512, 512),
+        target_resolution: tuple[int, int] | None = DEFAULT_IMAGE_RESOLUTION,
         line_spacing: int = 2,
         centered: bool = True,
     ) -> None:
@@ -932,10 +1089,13 @@ class Logger:
         def image_future() -> LogImage:
             with ContextTimer() as timer:
                 image, label = value() if callable(value) else value
-                image = get_image(image, target_resolution)
+                try:
+                    image_concrete = get_image(image, target_resolution)
+                except Exception as e:
+                    raise ValueError(f"Error with image {namespace}/{key}") from e
 
                 image_value = image_with_text(
-                    image.image,
+                    image_concrete.image,
                     standardize_text(label, max_line_length),
                     max_num_lines=max_num_lines,
                     line_spacing=line_spacing,
@@ -951,15 +1111,15 @@ class Logger:
         self,
         key: str,
         value: (
-            Callable[[], Sequence[np.ndarray | Array | PILImage] | np.ndarray | Array]
-            | Sequence[np.ndarray | Array | PILImage]
+            Callable[[], Sequence[np.ndarray | Array | PILImageType] | np.ndarray | Array]
+            | Sequence[np.ndarray | Array | PILImageType]
             | np.ndarray
             | Array
         ),
         *,
         namespace: str | None = None,
         max_images: int | None = None,
-        target_resolution: tuple[int, int] | None = (256, 256),
+        target_resolution: tuple[int, int] | None = DEFAULT_IMAGES_RESOLUTION,
         sep: int = 0,
     ) -> None:
         """Logs a set of images.
@@ -990,8 +1150,11 @@ class Logger:
                     images = as_numpy(images)
                 if isinstance(images, Sequence):
                     images = list(images)
-                images = [get_image(image, target_resolution) for image in images]
-                tiled = tile_images([img.image for img in images], sep)
+                try:
+                    images_concrete = [get_image(image, target_resolution) for image in images]
+                except Exception as e:
+                    raise ValueError(f"Error with image {namespace}/{key}") from e
+                tiled = tile_images([img.image for img in images_concrete], sep)
 
             logger.debug("Images Key: %s, Time: %s", key, timer.elapsed_time)
             return LogImage(image=tiled)
@@ -1002,8 +1165,8 @@ class Logger:
         self,
         key: str,
         value: (
-            Callable[[], tuple[Sequence[np.ndarray | Array | PILImage] | np.ndarray | Array, Sequence[str]]]
-            | tuple[Sequence[np.ndarray | Array | PILImage] | np.ndarray | Array, Sequence[str]]
+            Callable[[], tuple[Sequence[np.ndarray | Array | PILImageType] | np.ndarray | Array, Sequence[str]]]
+            | tuple[Sequence[np.ndarray | Array | PILImageType] | np.ndarray | Array, Sequence[str]]
         ),
         *,
         namespace: str | None = None,
@@ -1045,34 +1208,33 @@ class Logger:
                 if max_images is not None:
                     images = images[:max_images]
                     labels = labels[:max_images]
-                images = [get_image(image, target_resolution) for image in images]
-                labeled = [
-                    image_with_text(
-                        img.image,
-                        standardize_text(label, max_line_length),
-                        max_num_lines=max_num_lines,
-                        line_spacing=line_spacing,
-                        centered=centered,
-                    )
-                    for img, label in zip(images, labels, strict=True)
-                ]
-                tiled = tile_images([img.image for img in labeled], sep)
+                try:
+                    images_concrete = [get_image(image, target_resolution) for image in images]
+                    labeled = [
+                        image_with_text(
+                            img.image,
+                            standardize_text(label, max_line_length),
+                            max_num_lines=max_num_lines,
+                            line_spacing=line_spacing,
+                            centered=centered,
+                        )
+                        for img, label in zip(images_concrete, labels, strict=True)
+                    ]
+                    tiled = tile_images([img.image for img in labeled], sep)
+                except Exception as e:
+                    raise ValueError(f"Error with image {namespace}/{key}") from e
 
             logger.debug("Labeled Images Key: %s, Time: %s", key, timer.elapsed_time)
             return LogImage(image=tiled)
 
         self.images[namespace][key] = images_future
 
-    def log_file(self, name: str, contents: str) -> None:
-        for logger in self.loggers:
-            logger.log_file(name, contents)
-
     def log_video(
         self,
         key: str,
         value: Callable[[], np.ndarray | Array] | np.ndarray | Array,
         *,
-        fps: int = 30,
+        fps: int = DEFAULT_VIDEO_FPS,
         namespace: str | None = None,
     ) -> None:
         """Logs a video.
@@ -1165,6 +1327,10 @@ class Logger:
             )
 
         self.meshes[namespace][key] = mesh_future
+
+    def log_file(self, name: str, contents: str) -> None:
+        for logger in self.loggers:
+            logger.log_file(name, contents)
 
     def __enter__(self) -> Self:
         self.active = True

@@ -27,6 +27,7 @@ from jaxtyping import Array, PRNGKeyArray, PyTree
 from xax.core.conf import field
 from xax.core.state import State
 from xax.nn.parallel import is_master
+from xax.task.logger import Metric, Scalar
 from xax.task.mixins.data_loader import iter_samples
 from xax.task.mixins.train import Batch, InitParams, Output, TrainConfig, TrainMixin
 from xax.utils.experiments import (
@@ -104,7 +105,7 @@ class SupervisedMixin(
         output: Output,
         loss: Array,
         state: State,
-    ) -> dict[str, Array]:
+    ) -> dict[str, Metric]:
         """Computes the metrics for the current batch.
 
         Args:
@@ -118,7 +119,7 @@ class SupervisedMixin(
             A dictionary of metrics.
         """
         return {
-            "loss": loss,
+            "loss": Scalar(loss),
         }
 
     @xax_jit(static_argnames=["self", "model_static"], jit_level=3)
@@ -129,7 +130,7 @@ class SupervisedMixin(
         batch: Batch,
         state: State,
         key: PRNGKeyArray,
-    ) -> tuple[Array, tuple[Output, dict[str, Array]]]:
+    ) -> tuple[Array, tuple[Output, dict[str, Metric]]]:
         output_key, loss_key = jax.random.split(key)
         model = eqx.combine(model_arr, model_static)
         output = self.get_output(model, batch, state, output_key)
@@ -151,7 +152,7 @@ class SupervisedMixin(
         batch: Batch,
         state: State,
         key: PRNGKeyArray,
-    ) -> tuple[PyTree, optax.OptState, Output, dict[str, Array]]:
+    ) -> tuple[PyTree, optax.OptState, Output, dict[str, Metric]]:
         grad_fn = jax.grad(self.get_output_and_loss, argnums=0, has_aux=True)
         grad_fn = xax_jit(static_argnums=[1], jit_level=3)(grad_fn)
         grads, (output, metrics) = grad_fn(model_arr, model_static, batch, state, key)
@@ -164,8 +165,7 @@ class SupervisedMixin(
         model_arr = eqx.apply_updates(model_arr, updates)
 
         # Add gradient norm to metrics
-        metrics = dict(metrics)
-        metrics["grad_norm"] = grad_norm
+        metrics["grad_norm"] = Scalar(grad_norm)
 
         return model_arr, opt_state, output, metrics
 
