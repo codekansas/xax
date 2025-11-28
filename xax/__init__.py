@@ -16,15 +16,6 @@ __version__ = "0.4.4"
 
 # This list shouldn't be modified by hand; instead, run the update script.
 __all__ = [
-    "UserConfig",
-    "field",
-    "get_data_dir",
-    "get_pretrained_models_dir",
-    "get_run_dir",
-    "load_user_config",
-    "State",
-    "cast_activation_type",
-    "get_activation",
     "AttentionCache",
     "AttentionCacheDict",
     "CrossAttentionBlock",
@@ -45,6 +36,20 @@ __all__ = [
     "cast_ode_solver_type",
     "get_diffusion_beta_schedule",
     "get_ode_solver",
+    "BaseSSMBlock",
+    "DiagSSMBlock",
+    "SSM",
+    "SSMBlock",
+    "UNet",
+    "UserConfig",
+    "field",
+    "get_data_dir",
+    "get_pretrained_models_dir",
+    "get_run_dir",
+    "load_user_config",
+    "State",
+    "cast_activation_type",
+    "get_activation",
     "Categorical",
     "Distribution",
     "MixtureOfGaussians",
@@ -82,11 +87,6 @@ __all__ = [
     "get_norm_3d",
     "get_norm_linear",
     "is_master",
-    "BaseSSMBlock",
-    "DiagSSMBlock",
-    "SSM",
-    "SSMBlock",
-    "UNet",
     "BaseLauncher",
     "CliLauncher",
     "MultiCpuLauncher",
@@ -246,6 +246,31 @@ del os, shutil, xla_flags
 # This dictionary is auto-generated and shouldn't be modified by hand; instead,
 # run the update script.
 NAME_MAP: dict[str, str] = {
+    "AttentionCache": "arch.attention",
+    "AttentionCacheDict": "arch.attention",
+    "CrossAttentionBlock": "arch.attention",
+    "SelfAttentionBlock": "arch.attention",
+    "Transformer": "arch.attention",
+    "TransformerBlock": "arch.attention",
+    "TransformerCache": "arch.attention",
+    "TransformerStack": "arch.attention",
+    "BaseODESolver": "arch.diffusion",
+    "ConsistencyModel": "arch.diffusion",
+    "EulerODESolver": "arch.diffusion",
+    "GaussianDiffusion": "arch.diffusion",
+    "HeunODESolver": "arch.diffusion",
+    "RK4ODESolver": "arch.diffusion",
+    "cast_beta_schedule": "arch.diffusion",
+    "cast_diffusion_loss_fn": "arch.diffusion",
+    "cast_diffusion_pred_mode": "arch.diffusion",
+    "cast_ode_solver_type": "arch.diffusion",
+    "get_diffusion_beta_schedule": "arch.diffusion",
+    "get_ode_solver": "arch.diffusion",
+    "BaseSSMBlock": "arch.ssm",
+    "DiagSSMBlock": "arch.ssm",
+    "SSM": "arch.ssm",
+    "SSMBlock": "arch.ssm",
+    "UNet": "arch.unet",
     "UserConfig": "core.conf",
     "field": "core.conf",
     "get_data_dir": "core.conf",
@@ -255,26 +280,6 @@ NAME_MAP: dict[str, str] = {
     "State": "core.state",
     "cast_activation_type": "nn.activation",
     "get_activation": "nn.activation",
-    "AttentionCache": "nn.attention",
-    "AttentionCacheDict": "nn.attention",
-    "CrossAttentionBlock": "nn.attention",
-    "SelfAttentionBlock": "nn.attention",
-    "Transformer": "nn.attention",
-    "TransformerBlock": "nn.attention",
-    "TransformerCache": "nn.attention",
-    "TransformerStack": "nn.attention",
-    "BaseODESolver": "nn.diffusion",
-    "ConsistencyModel": "nn.diffusion",
-    "EulerODESolver": "nn.diffusion",
-    "GaussianDiffusion": "nn.diffusion",
-    "HeunODESolver": "nn.diffusion",
-    "RK4ODESolver": "nn.diffusion",
-    "cast_beta_schedule": "nn.diffusion",
-    "cast_diffusion_loss_fn": "nn.diffusion",
-    "cast_diffusion_pred_mode": "nn.diffusion",
-    "cast_ode_solver_type": "nn.diffusion",
-    "get_diffusion_beta_schedule": "nn.diffusion",
-    "get_ode_solver": "nn.diffusion",
     "Categorical": "nn.distributions",
     "Distribution": "nn.distributions",
     "MixtureOfGaussians": "nn.distributions",
@@ -312,11 +317,6 @@ NAME_MAP: dict[str, str] = {
     "get_norm_3d": "nn.norm",
     "get_norm_linear": "nn.norm",
     "is_master": "nn.parallel",
-    "BaseSSMBlock": "nn.ssm",
-    "DiagSSMBlock": "nn.ssm",
-    "SSM": "nn.ssm",
-    "SSMBlock": "nn.ssm",
-    "UNet": "nn.unet",
     "BaseLauncher": "task.launchers.base",
     "CliLauncher": "task.launchers.cli",
     "MultiCpuLauncher": "task.launchers.multi_cpu",
@@ -437,24 +437,22 @@ NAME_MAP.update(
         "ActivationType": "nn.activation",
         "Batch": "task.mixins.train",
         "CollateMode": "utils.data.collate",
-        "DiffusionBetaSchedule": "nn.diffusion",
-        "DiffusionLossFn": "nn.diffusion",
-        "DiffusionPredMode": "nn.diffusion",
+        "DiffusionBetaSchedule": "arch.diffusion",
+        "DiffusionLossFn": "arch.diffusion",
+        "DiffusionPredMode": "arch.diffusion",
         "DTYPE": "nn.equinox",
         "EmbeddingKind": "nn.embeddings",
         "LOG_ERROR_SUMMARY": "utils.logging",
         "LOG_PING": "utils.logging",
         "LOG_STATUS": "utils.logging",
         "NormType": "nn.metrics",
-        "ODESolverType": "nn.diffusion",
+        "ODESolverType": "arch.diffusion",
         "Output": "task.mixins.output",
         "RawConfigType": "task.base",
-        "SigmaType": "nn.diffusion",
+        "SigmaType": "arch.diffusion",
+        "TransformerStack": "arch.attention",
     },
 )
-
-# In NAME_MAP
-NAME_MAP["TransformerStack"] = "nn.attention"
 
 
 def __getattr__(name: str) -> object:
@@ -467,17 +465,7 @@ def __getattr__(name: str) -> object:
 
 
 if IMPORT_ALL or TYPE_CHECKING:
-    from xax.core.conf import (
-        UserConfig,
-        field,
-        get_data_dir,
-        get_pretrained_models_dir,
-        get_run_dir,
-        load_user_config,
-    )
-    from xax.core.state import State
-    from xax.nn.activation import ActivationType, cast_activation_type, get_activation
-    from xax.nn.attention import (
+    from xax.arch.attention import (
         AttentionCache,
         AttentionCacheDict,
         CrossAttentionBlock,
@@ -487,7 +475,7 @@ if IMPORT_ALL or TYPE_CHECKING:
         TransformerCache,
         TransformerStack,
     )
-    from xax.nn.diffusion import (
+    from xax.arch.diffusion import (
         BaseODESolver,
         ConsistencyModel,
         DiffusionBetaSchedule,
@@ -504,6 +492,18 @@ if IMPORT_ALL or TYPE_CHECKING:
         get_diffusion_beta_schedule,
         get_ode_solver,
     )
+    from xax.arch.ssm import SSM, BaseSSMBlock, DiagSSMBlock, SSMBlock
+    from xax.arch.unet import UNet
+    from xax.core.conf import (
+        UserConfig,
+        field,
+        get_data_dir,
+        get_pretrained_models_dir,
+        get_run_dir,
+        load_user_config,
+    )
+    from xax.core.state import State
+    from xax.nn.activation import ActivationType, cast_activation_type, get_activation
     from xax.nn.distributions import (
         Categorical,
         Distribution,
@@ -542,8 +542,6 @@ if IMPORT_ALL or TYPE_CHECKING:
     from xax.nn.metrics import NormType, cast_euclidean_norm_type, dynamic_time_warping, get_euclidean_norm
     from xax.nn.norm import NormType, cast_norm_type, get_norm_1d, get_norm_2d, get_norm_3d, get_norm_linear
     from xax.nn.parallel import is_master
-    from xax.nn.ssm import SSM, BaseSSMBlock, DiagSSMBlock, SSMBlock
-    from xax.nn.unet import UNet
     from xax.task.base import RawConfigType
     from xax.task.launchers.base import BaseLauncher
     from xax.task.launchers.cli import CliLauncher
