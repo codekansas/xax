@@ -173,7 +173,10 @@ class SupervisedMixin(
 
     def log_step(self, metrics: FrozenDict[str, Metric], state: State, heavy: bool) -> None:
         for k, v in metrics.items():
-            self.logger.log_metric(k, v, decode_tokens=self.decode_tokens)
+            try:
+                self.logger.log_metric(k, v, decode_tokens=self.decode_tokens)
+            except Exception as e:
+                raise ValueError(f"Error logging metric {k}") from e
         self.log_state_timers(state)
         self.write_logs(state, heavy)
 
