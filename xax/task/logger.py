@@ -1048,8 +1048,9 @@ class Logger:
     def log_labeled_image(
         self,
         key: str,
-        value: Callable[[], tuple[np.ndarray | Array | PILImageType, str]]
-        | tuple[np.ndarray | Array | PILImageType, str],
+        value: (
+            Callable[[], tuple[np.ndarray | Array | PILImageType, str]] | tuple[np.ndarray | Array | PILImageType, str]
+        ),
         *,
         namespace: str | None = None,
         max_line_length: int | None = None,
