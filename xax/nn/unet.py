@@ -4,6 +4,7 @@ import math
 from collections.abc import Callable
 from typing import Sequence
 
+import chex
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -34,52 +35,53 @@ class _MLP(eqx.Module):
         self.act_fn = act_fn
 
     def __call__(self, x: Array) -> Array:
+        chex.assert_shape(x, (self.linear1.in_features,))
+
         x = self.linear1(x)
         x = self.act_fn(x)
         x = self.linear2(x)
         return x
 
 
-class PositionalEmbedding(eqx.Module):
-    """Positional embedding using sinusoidal encoding."""
+def fourier_embeddings_2d(h: int, w: int, dim: int, max_period: int) -> Array:
+    """Generate 2D Fourier embeddings for a spatial grid.
 
-    dim: int
-    max_length: int
-    embedding: Array
+    Args:
+        h: Height of the spatial grid
+        w: Width of the spatial grid
+        dim: Dimension of the embeddings
+        max_period: Maximum period for the embeddings
 
-    def __init__(self, dim: int, max_length: int = 10000, *, key: PRNGKeyArray | None = None) -> None:
-        self.dim = dim
-        self.max_length = max_length
-        self.embedding = self.make_embedding(dim, max_length)
+    Returns:
+        Embeddings of shape (h, w, dim)
+    """
+    y_coords = jnp.arange(h, dtype=jnp.float32)
+    x_coords = jnp.arange(w, dtype=jnp.float32)
+    y_grid, x_grid = jnp.meshgrid(y_coords, x_coords, indexing="ij")
 
-    @staticmethod
-    def make_embedding(dim: int, max_length: int = 10000) -> Array:
-        """Create sinusoidal positional embeddings."""
-        embedding = jnp.zeros((max_length, dim))
-        position = jnp.arange(0, max_length)[:, None].astype(jnp.float32)
-        div_term = jnp.exp(jnp.arange(0, dim, 2) * (-math.log(max_length / 2 / math.pi) / dim))
-        embedding = embedding.at[:, 0::2].set(jnp.sin(position * div_term))
-        embedding = embedding.at[:, 1::2].set(jnp.cos(position * div_term))
-        return embedding
+    half_dim = dim // 4
+    freqs = jnp.exp(-jnp.arange(0, half_dim, dtype=jnp.float32) * math.log(max_period) / half_dim)
 
-    def __call__(self, x: Array) -> Array:
-        """Forward pass.
+    y_args = y_grid[..., None] * freqs[None, None, :]
+    x_args = x_grid[..., None] * freqs[None, None, :]
 
-        Args:
-            x: Integer indices of shape (...,) or (..., 1)
+    y_emb = jnp.concatenate([jnp.sin(y_args), jnp.cos(y_args)], axis=-1)
+    x_emb = jnp.concatenate([jnp.sin(x_args), jnp.cos(x_args)], axis=-1)
 
-        Returns:
-            Embeddings of shape (..., dim)
-        """
-        # Handle both scalar and array inputs
-        if x.ndim == 0:
-            x = x[None]
-        return self.embedding[x]
+    embedding = jnp.concatenate([y_emb, x_emb], axis=-1)
+
+    if dim % 2:
+        embedding = jnp.concatenate([embedding, jnp.zeros((h, w, 1))], axis=-1)
+
+    return embedding
 
 
 class BasicBlock(eqx.Module):
     """Basic residual block with optional embedding conditioning."""
 
+    in_c: int
+    out_c: int
+    embed_c: int | None
     conv1: eqx.nn.Conv2d
     conv2: eqx.nn.Conv2d
     norm1: Norm2D
@@ -97,6 +99,10 @@ class BasicBlock(eqx.Module):
         *,
         key: PRNGKeyArray,
     ) -> None:
+        self.in_c = in_c
+        self.out_c = out_c
+        self.embed_c = embed_c
+
         key1, key2, key_emb, key_shortcut = jax.random.split(key, 4)
 
         self.conv1 = eqx.nn.Conv2d(in_c, out_c, kernel_size=3, stride=1, padding=1, use_bias=False, key=key1)
@@ -128,12 +134,15 @@ class BasicBlock(eqx.Module):
         Returns:
             Output tensor of shape (out_c, H, W)
         """
+        chex.assert_shape(x, (self.in_c, None, None))
+
         out = self.conv1(x)
         out = self.norm1(out)
 
         if embedding is not None:
             if self.mlp_emb is None:
                 raise ValueError("Embedding was provided but embedding projection is None")
+            chex.assert_shape(embedding, (self.embed_c,))
             tx = self.mlp_emb(embedding)
             out = out + tx[:, None, None]
         elif self.mlp_emb is not None:
@@ -151,58 +160,55 @@ class SelfAttention2d(eqx.Module):
 
     dim: int
     num_heads: int
-    q_conv: eqx.nn.Conv2d
-    k_conv: eqx.nn.Conv2d
-    v_conv: eqx.nn.Conv2d
-    o_conv: eqx.nn.Conv2d
-    dropout: eqx.nn.Dropout
+    emb_dims: int
+    q_proj: eqx.nn.Linear
+    k_proj: eqx.nn.Linear
+    v_proj: eqx.nn.Linear
+    o_proj: eqx.nn.Linear
 
-    def __init__(self, dim: int, num_heads: int = 8, dropout_prob: float = 0.1, *, key: PRNGKeyArray) -> None:
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        dropout_prob: float = 0.1,
+        emb_dims: int = 128,
+        *,
+        key: PRNGKeyArray,
+    ) -> None:
         self.dim = dim
         self.num_heads = num_heads
+        self.emb_dims = emb_dims
         key_q, key_k, key_v, key_o = jax.random.split(key, 4)
-        self.q_conv = eqx.nn.Conv2d(dim, dim, kernel_size=1, use_bias=True, key=key_q)
-        self.k_conv = eqx.nn.Conv2d(dim, dim, kernel_size=1, use_bias=True, key=key_k)
-        self.v_conv = eqx.nn.Conv2d(dim, dim, kernel_size=1, use_bias=True, key=key_v)
-        self.o_conv = eqx.nn.Conv2d(dim, dim, kernel_size=1, use_bias=True, key=key_o)
-        self.dropout = eqx.nn.Dropout(dropout_prob)
+        self.q_proj = eqx.nn.Linear(dim + emb_dims, dim, use_bias=True, key=key_q)
+        self.k_proj = eqx.nn.Linear(dim + emb_dims, dim, use_bias=True, key=key_k)
+        self.v_proj = eqx.nn.Linear(dim + emb_dims, dim, use_bias=True, key=key_v)
+        self.o_proj = eqx.nn.Linear(dim, dim, use_bias=True, key=key_o)
 
-    def __call__(self, x: Array, *, key: PRNGKeyArray | None = None) -> Array:
+    def __call__(self, x: Array) -> Array:
         """Forward pass.
 
         Args:
             x: Input tensor of shape (C, H, W)
-            key: Optional random key for dropout
 
         Returns:
             Output tensor of shape (C, H, W)
         """
+        chex.assert_shape(x, (self.dim, None, None))
+
         _, h, w = x.shape
         head_dim = self.dim // self.num_heads
 
-        q = self.q_conv(x)  # (C, H, W)
-        k = self.k_conv(x)  # (C, H, W)
-        v = self.v_conv(x)  # (C, H, W)
+        emb = fourier_embeddings_2d(h, w, self.emb_dims, max_period=max(h, w) * 2).astype(x.dtype)
+        i = jnp.concatenate([x.transpose(1, 2, 0), emb], axis=-1).reshape(h * w, self.dim + self.emb_dims)
 
-        # Reshape to (num_heads, head_dim, H*W)
-        q = q.reshape(self.num_heads, head_dim, h * w)
-        k = k.reshape(self.num_heads, head_dim, h * w)
-        v = v.reshape(self.num_heads, head_dim, h * w)
+        q = jax.vmap(self.q_proj)(i).reshape(h * w, self.num_heads, head_dim)
+        k = jax.vmap(self.k_proj)(i).reshape(h * w, self.num_heads, head_dim)
+        v = jax.vmap(self.v_proj)(i).reshape(h * w, self.num_heads, head_dim)
 
-        # Compute attention: (num_heads, H*W, H*W)
-        a = jnp.einsum("h d q, h d k -> h q k", q, k) / (self.dim**0.5)
-        a = jax.nn.softmax(a, axis=-1)
-        if key is not None:
-            a = self.dropout(a, key=key)
-        else:
-            a = self.dropout(a, inference=True)
+        # Compute attention.
+        a = jax.nn.dot_product_attention(q, k, v).reshape(h * w, self.dim)
+        o = jax.vmap(self.o_proj)(a).reshape(h, w, self.dim).transpose(2, 0, 1)
 
-        # Apply attention to values: (num_heads, head_dim, H*W)
-        o = jnp.einsum("h q k, h d k -> h d q", a, v)
-
-        # Reshape back to (C, H, W)
-        o = o.reshape(self.dim, h, w)
-        o = self.o_conv(o)
         return o
 
 
@@ -225,6 +231,9 @@ class UNet(eqx.Module):
         x: Output tensor of shape ``(batch_size, in_dim, height, width)``.
     """
 
+    in_dim: int
+    embed_dim: int
+    input_embedding_dim: int | None
     init_embed: eqx.nn.Conv2d
     down_blocks: tuple[BasicBlock | eqx.nn.Conv2d, ...]
     mid_blocks: tuple[BasicBlock | SelfAttention2d, ...]
@@ -240,6 +249,10 @@ class UNet(eqx.Module):
         *,
         key: PRNGKeyArray,
     ) -> None:
+        self.in_dim = in_dim
+        self.embed_dim = embed_dim
+        self.input_embedding_dim = input_embedding_dim
+
         key_init, key = jax.random.split(key)
         self.init_embed = eqx.nn.Conv2d(in_dim, embed_dim, kernel_size=1, key=key_init)
 
@@ -273,7 +286,12 @@ class UNet(eqx.Module):
         # Up blocks
         up_blocks_list: list[BasicBlock | eqx.nn.ConvTranspose2d | eqx.nn.Conv2d] = []
         for idx, (in_c, out_c, skip_c) in enumerate(
-            zip(all_dims[::-1][:-1], all_dims[::-1][1:], all_dims[:-1][::-1], strict=True)
+            zip(
+                all_dims[::-1][:-1],
+                all_dims[::-1][1:],
+                all_dims[:-1][::-1],
+                strict=True,
+            )
         ):
             is_last = idx == len(all_dims) - 2
             block_key1, block_key2, conv_key, key = jax.random.split(key, 4)
@@ -307,6 +325,10 @@ class UNet(eqx.Module):
         Returns:
             Output tensor of shape (C, H, W)
         """
+        chex.assert_shape(x, (self.in_dim, None, None))
+        if embedding is not None:
+            chex.assert_shape(embedding, (self.input_embedding_dim,))
+
         x = self.init_embed(x)
         skip_conns: list[Array] = []
         residual = x
@@ -324,7 +346,7 @@ class UNet(eqx.Module):
             if isinstance(mid_block, BasicBlock):
                 x = mid_block(x, embedding)
             elif isinstance(mid_block, SelfAttention2d):
-                x = mid_block(x, key=key)
+                x = mid_block(x)
 
         # Up blocks
         for up_block in self.up_blocks:
