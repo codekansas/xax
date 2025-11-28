@@ -23,6 +23,7 @@ from typing import (
     Callable,
     Iterator,
     Literal,
+    Mapping,
     Self,
     Sequence,
     TypeVar,
@@ -278,8 +279,7 @@ class Images:
 @dataclass(frozen=True)
 class LabeledImages:
     images: Array
-    labels: Array
-    max_images: int | None = field(default=None)
+    labels: Array | Mapping[str, Array]
     max_line_length: int | None = field(default=None)
     max_num_lines: int | None = field(default=None)
     target_resolution: tuple[int, int] = field(default=DEFAULT_IMAGE_RESOLUTION)
@@ -288,7 +288,13 @@ class LabeledImages:
     sep: int = field(default=0)
 
     def __post_init__(self) -> None:
-        chex.assert_shape(self.labels, (self.images.shape[0],))
+        if isinstance(self.labels, Array):
+            chex.assert_shape(self.labels, (self.images.shape[0],))
+        elif isinstance(self.labels, Mapping):
+            for v in self.labels.values():
+                chex.assert_shape(v, (self.images.shape[0],))
+        else:
+            raise ValueError(f"Unsupported label type: {type(self.labels)}")
 
 
 @jax.tree_util.register_dataclass
@@ -795,11 +801,24 @@ class Logger:
                 sep=value.sep,
             )
         elif isinstance(value, LabeledImages):
+            if isinstance(value.labels, Array):
+                labels = [format_number(label) for label in value.labels.tolist()]
+            elif isinstance(value.labels, Mapping):
+                labels = [
+                    "\n".join(line)
+                    for line in zip(
+                        *[[f"{k}: {format_number(vv)}" for vv in v.tolist()] for k, v in value.labels.items()],
+                        strict=True,
+                    )
+                ]
+
+            else:
+                raise ValueError(f"Unsupported label type: {type(value.labels)}")
+
             self.log_labeled_images(
                 key,
-                (value.images, [format_number(label) for label in value.labels.tolist()]),
+                (value.images, labels),
                 namespace=namespace,
-                max_images=value.max_images,
                 max_line_length=value.max_line_length,
                 max_num_lines=value.max_num_lines,
                 target_resolution=value.target_resolution,

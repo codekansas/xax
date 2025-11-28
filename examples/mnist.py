@@ -24,7 +24,6 @@ class Batch(TypedDict):
 
 @dataclass
 class Config(xax.SupervisedConfig):
-    batch_size: int = xax.field(128, help="The size of a minibatch")
     learning_rate: float = xax.field(1e-3, help="The learning rate")
     hidden_dim: int = xax.field(512, help="Hidden layer dimension")
     num_hidden_layers: int = xax.field(2, help="Number of hidden layers")
@@ -110,8 +109,8 @@ class MnistClassification(xax.SupervisedTask[Config]):
 
         max_images = 16
         batch = jax.tree.map(lambda x: jax.device_get(x[:max_images]), batch)
-        x, yhat = batch["image"], output.argmax(axis=1)
-        metrics["predictions"] = xax.LabeledImages(x, yhat, max_images=max_images)
+        x, y, yhat = batch["image"][:max_images], y[:max_images], yhat[:max_images]
+        metrics["predictions"] = xax.LabeledImages(x, {"pred": yhat, "true": y})
 
         return metrics
 
@@ -150,6 +149,10 @@ if __name__ == "__main__":
     # python -m examples.mnist
     MnistClassification.launch(
         Config(
+            batch_size=256,
             log_heavy_every_n_seconds=120,
+            # Perform a few updates per step, because otherwise we are sometimes
+            # bottlenecked by the data loader.
+            updates_per_step=8,
         ),
     )
