@@ -98,14 +98,22 @@ class MnistClassification(xax.SupervisedTask[Config]):
         model: PyTree,
         batch: Batch,
         output: Array,
-        loss: Array,
         state: xax.State,
-    ) -> dict[str, Array]:
+        heavy: bool,
+        key: PRNGKeyArray,
+    ) -> dict[str, xax.Metric]:
         y, yhat = batch["label"], output.argmax(axis=1)
-        return {
-            "loss": loss,
-            "acc": (yhat == y).astype(float).mean(),
-        }
+        metrics: dict[str, xax.Metric] = {}
+        metrics["acc"] = xax.Scalar((yhat == y).astype(float).mean())
+        if not heavy:
+            return metrics
+
+        max_images = 16
+        batch = jax.tree.map(lambda x: jax.device_get(x[:max_images]), batch)
+        x, yhat = batch["image"], output.argmax(axis=1)
+        metrics["predictions"] = xax.LabeledImages(x, yhat, max_images=max_images)
+
+        return metrics
 
     def log_heavy(
         self,

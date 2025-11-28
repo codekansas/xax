@@ -165,9 +165,15 @@ class SupervisedMixin(
 
         return model_arr, opt_state, output, loss, grad_norm
 
+    def decode_tokens(self, tokens: Array) -> str:
+        raise NotImplementedError(
+            "When using a Tokens metric you must implement the `decode_tokens` method "
+            "to convert to a string which can be logged."
+        )
+
     def log_step(self, metrics: FrozenDict[str, Metric], state: State, heavy: bool) -> None:
         for k, v in metrics.items():
-            self.logger.log_metric(k, v)
+            self.logger.log_metric(k, v, decode_tokens=self.decode_tokens)
         self.log_state_timers(state)
         self.write_logs(state, heavy)
 

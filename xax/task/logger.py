@@ -253,8 +253,8 @@ class Histogram:
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
-class String:
-    value: str
+class Tokens:
+    value: Array
     secondary: bool = field(default=False)
 
 
@@ -307,7 +307,7 @@ class Mesh:
     config_dict: dict[str, Any] | None = field(default=None)
 
 
-Metric = Scalar | Distribution | Histogram | String | Image | Images | LabeledImages | Video | Mesh
+Metric = Scalar | Distribution | Histogram | Tokens | Image | Images | LabeledImages | Video | Mesh
 
 
 @dataclass(kw_only=True)
@@ -767,6 +767,7 @@ class Logger:
         value: Metric,
         *,
         namespace: str | None = None,
+        decode_tokens: Callable[[Array], str] | None = None,
     ) -> None:
         if not self.active:
             raise RuntimeError("The logger is not active")
@@ -778,8 +779,11 @@ class Logger:
             self.log_distribution(key, (value.mean, value.std), namespace=namespace)
         elif isinstance(value, Histogram):
             self.log_histogram(key, value.value, bins=value.bins, namespace=namespace)
-        elif isinstance(value, String):
-            self.log_string(key, value.value, namespace=namespace, secondary=value.secondary)
+        elif isinstance(value, Tokens):
+            if decode_tokens is None:
+                raise ValueError("decode_tokens must be provided when logging Tokens")
+            value_str = decode_tokens(value.value)
+            self.log_string(key, value_str, namespace=namespace, secondary=value.secondary)
         elif isinstance(value, Image):
             self.log_image(key, value.image, namespace=namespace, target_resolution=value.target_resolution)
         elif isinstance(value, Images):

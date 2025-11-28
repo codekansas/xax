@@ -114,7 +114,7 @@ __all__ = [
     "LoggerImpl",
     "Mesh",
     "Scalar",
-    "String",
+    "Tokens",
     "Video",
     "CallbackLogger",
     "JsonLogger",
@@ -356,7 +356,7 @@ NAME_MAP: dict[str, str] = {
     "LoggerImpl": "task.logger",
     "Mesh": "task.logger",
     "Scalar": "task.logger",
-    "String": "task.logger",
+    "Tokens": "task.logger",
     "Video": "task.logger",
     "CallbackLogger": "task.loggers.callback",
     "JsonLogger": "task.loggers.json",
@@ -595,7 +595,7 @@ if IMPORT_ALL or TYPE_CHECKING:
         Mesh,
         Metric,
         Scalar,
-        String,
+        Tokens,
         Video,
     )
     from xax.task.loggers.callback import CallbackLogger
