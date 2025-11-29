@@ -1,4 +1,4 @@
-"""Trains a Gaussian diffusion model to conditionally generate MNIST digits."""
+"""Trains a speech generation model on the LJSpeech dataset."""
 
 from dataclasses import dataclass
 from typing import TypedDict
@@ -15,100 +15,56 @@ import xax
 
 
 class Batch(TypedDict):
-    image: Array
-    label: Array
+    audio: Array
+    text: Array
 
 
 @dataclass
 class Config(xax.SupervisedConfig):
     learning_rate: float = xax.field(1e-3, help="The learning rate")
-    hidden_dim: int = xax.field(128, help="Hidden layer dimension")
-    dim_scales: list[int] = xax.field([1, 2, 4, 8], help="List of dimension scales for UNet")
-    num_timesteps: int = xax.field(500, help="Number of diffusion timesteps")
-    pred_mode: str = xax.field("pred_v", help="Prediction mode: pred_x_0, pred_eps, or pred_v")
-    beta_schedule: str = xax.field("linear", help="Beta schedule type")
-    warmup_steps: int = xax.field(100, help="Number of warmup steps")
-    sampling_timesteps: int | None = xax.field(50, help="Number of timesteps for sampling")
+    hidden_dim: int = xax.field(512, help="Hidden layer dimension")
+    num_layers: int = xax.field(4, help="Number of layers")
+    fast_context_length: int = xax.field(10, help="Context length of the fast transformer")
+    slow_context_length: int = xax.field(512, help="Context length of the slow transformer")
 
 
-class UNet(eqx.Module):
-    class_embs: eqx.nn.Embedding
-    fourier_emb: xax.FourierEmbeddings
-    time_proj_1: eqx.nn.Linear
-    time_proj_2: eqx.nn.Linear
-    unet: xax.UNet
+class SpeechModel(eqx.Module):
+    slow_transformer: xax.TransformerStack
+    fast_transformer: xax.TransformerStack
 
-    def __init__(
-        self,
-        in_dim: int,
-        embed_dim: int,
-        dim_scales: list[int],
-        num_classes: int,
-        *,
-        key: PRNGKeyArray,
-    ) -> None:
-        # Class embeddings.
-        emb_key, key = jax.random.split(key)
-        self.class_embs = eqx.nn.Embedding(
-            num_embeddings=num_classes,
-            embedding_size=embed_dim,
-            key=emb_key,
+    def __init__(self, config: Config, key: PRNGKeyArray) -> None:
+        # Creates the slow transformer, which processes at 5 tokens / second.
+        slow_key, key = jax.random.split(key)
+        self.slow_transformer = xax.TransformerStack(
+            embed_dim=config.hidden_dim,
+            num_heads=config.hidden_dim // 64,
+            ff_dim=config.hidden_dim * 4,
+            num_layers=config.num_layers,
+            causal=True,
+            cross_attention=False,
+            context_length=config.slow_context_length,
+            use_rotary_embeddings=True,
+            key=slow_key,
         )
 
-        # Time embeddings.
-        key1, key2, key = jax.random.split(key, 3)
-        self.fourier_emb = xax.FourierEmbeddings(embed_dim)
-        self.time_proj_1 = eqx.nn.Linear(embed_dim, embed_dim, key=key1)
-        self.time_proj_2 = eqx.nn.Linear(embed_dim, embed_dim, key=key2)
-
-        self.unet = xax.UNet(
-            in_dim=in_dim,
-            embed_dim=embed_dim,
-            dim_scales=dim_scales,
-            input_embedding_dim=embed_dim,
-            key=key,
+        # Creates the fast transformer, which processes at 50 tokens / second.
+        fast_key, key = jax.random.split(key)
+        self.fast_transformer = xax.TransformerStack(
+            embed_dim=config.hidden_dim,
+            num_heads=config.hidden_dim // 64,
+            ff_dim=config.hidden_dim * 4,
+            num_layers=config.num_layers,
+            causal=True,
+            cross_attention=False,
+            context_length=config.fast_context_length,
+            use_rotary_embeddings=True,
+            key=fast_key,
         )
 
-    def __call__(self, x_hw: Array, t: Array, c: Array) -> Array:
-        dtype = self.class_embs.weight.dtype
 
-        # Embed class.
-        c_n = self.class_embs(c)
-
-        # Embed time.
-        t_n = self.fourier_emb(t).astype(dtype)
-        t_n = self.time_proj_1(t_n)
-        t_n = xax.get_activation("silu")(t_n)
-        t_n = self.time_proj_2(t_n)
-
-        # Combine embeddings.
-        e_n = c_n + t_n
-
-        o_hw = self.unet(x_hw[None].astype(dtype), e_n)[0]
-
-        return o_hw
-
-
-class MnistDiffusion(xax.SupervisedTask[Config]):
-    diffusion: xax.GaussianDiffusion
-
-    def __init__(self, config: Config) -> None:
-        super().__init__(config)
-
-        self.diffusion = xax.GaussianDiffusion(
-            beta_schedule=xax.cast_beta_schedule(config.beta_schedule),
-            num_beta_steps=config.num_timesteps,
-            pred_mode=xax.cast_diffusion_pred_mode(config.pred_mode),
-        )
-
-    def get_model(self, params: xax.InitParams) -> UNet:
-        return UNet(
-            in_dim=1,
-            embed_dim=self.config.hidden_dim,
-            dim_scales=self.config.dim_scales,
-            num_classes=10,
-            key=params.key,
-        )
+class SpeechGeneration(xax.SupervisedTask[Config]):
+    def get_model(self, params: xax.InitParams) -> SpeechModel:
+        return SpeechModel(self.config, key=params.key)
 
     def get_optimizer(self) -> xax.Optimizer:
         warmup_schedule = optax.linear_schedule(
@@ -140,12 +96,13 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
 
         return optax.MultiSteps(opt, every_k_schedule=8)
 
-    def get_output(self, model: UNet, batch: Batch, state: xax.State, key: PRNGKeyArray) -> Array:
-        """Computes the diffusion loss.
-
-        The model is called with (x_t, t, class_label) internally, but we need
-        to wrap it to match the diffusion API which expects (x_t, t) -> output.
-        """
+    def get_output(
+        self,
+        model: SpeechModel,
+        batch: Batch,
+        state: xax.State,
+        key: PRNGKeyArray,
+    ) -> Array:
         images_bhw = (batch["image"].astype(np.float32) / 255.0) - 0.5
         labels_b = batch["label"]
 
@@ -155,7 +112,14 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
         loss = self.diffusion.loss(key, model_fn, images_bhw)
         return loss.mean()
 
-    def compute_loss(self, model: UNet, batch: Batch, output: Array, state: xax.State, key: PRNGKeyArray) -> Array:
+    def compute_loss(
+        self,
+        model: SpeechModel,
+        batch: Batch,
+        output: Array,
+        state: xax.State,
+        key: PRNGKeyArray,
+    ) -> Array:
         """The output is already the loss."""
         return output
 
@@ -218,20 +182,18 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
         return metrics
 
     def get_dataset(self) -> Dataset:
-        ds = load_dataset("ylecun/mnist", split="train")
-        ds.set_format(type="numpy", columns=["image", "label"])
+        ds = load_dataset("keithito/lj_speech")
+        breakpoint()
+        ds.set_format(type="numpy", columns=["audio", "label"])
         return ds
 
 
 if __name__ == "__main__":
     # python -m examples.mnist_diffusion
-    MnistDiffusion.launch(
+    SpeechGeneration.launch(
         Config(
-            batch_size=256,
+            batch_size=32,
             log_heavy_every_n_seconds=60 * 5,
             max_grad_norm=1.0,
-            # Perform a few updates per step, because otherwise we are sometimes
-            # bottlenecked by the data loader.
-            updates_per_step=8,
         ),
     )
