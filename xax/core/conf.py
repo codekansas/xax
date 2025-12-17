@@ -13,20 +13,30 @@ from xax.utils.text import show_error
 FieldType = Any
 
 
-def field(value: FieldType, **kwargs: str) -> FieldType:
+def field(
+    value: FieldType,
+    *,
+    help: str | None = None,
+    static: bool = True,
+    **metadata: Any,  # noqa: ANN401
+) -> FieldType:
     """Short-hand function for getting a config field.
 
     Args:
         value: The current field's default value.
-        kwargs: Additional metadata fields to supply.
+        help: An optional help string for the field.
+        static: Whether or not this field is static (i.e., does not change
+            during training).
+        metadata: Additional metadata fields to supply.
 
     Returns:
         The dataclass field.
     """
-    metadata: dict[str, Any] = {}
-    metadata.update(kwargs)
+    metadata["static"] = static
+    if help is not None:
+        metadata["help"] = help
 
-    if hasattr(value, "__call__"):  # noqa: B004
+    if callable(value):
         return field_base(default_factory=value, metadata=metadata)
     if value.__class__.__hash__ is None:
         return field_base(default_factory=lambda: value, metadata=metadata)
