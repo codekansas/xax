@@ -13,6 +13,7 @@ import chex
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+from jax.sharding import set_mesh
 from jaxtyping import Array, PRNGKeyArray
 
 from xax.utils.jax import scan as xax_scan

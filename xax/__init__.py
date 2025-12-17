@@ -209,6 +209,23 @@ __all__ = [
     "freeze_dict",
     "HashableArray",
     "hashable_array",
+    "LoRALinear",
+    "TorchLoRALinear",
+    "lora_filter_spec",
+    "loraize",
+    "loraize_linear",
+    "merge_lora",
+    "torch_loraize",
+    "torch_merge_lora",
+    "LLM",
+    "LLMConfig",
+    "QWEN3_SMALL",
+    "GPT_OSS_SMALL",
+    "DEEPSEEK_R1_SMALL",
+    "build_qwen3_model",
+    "build_gpt_oss_model",
+    "build_deepseek_r1_model",
+    "tie_embedding_and_head",
 ]
 
 __all__ += [
@@ -451,6 +468,29 @@ NAME_MAP: dict[str, str] = {
     "freeze_dict": "utils.types.frozen_dict",
     "HashableArray": "utils.types.hashable_array",
     "hashable_array": "utils.types.hashable_array",
+    "LoRALinear": "nn.lora",
+    "TorchLoRALinear": "nn.lora",
+    "lora_filter_spec": "nn.lora",
+    "loraize": "nn.lora",
+    "loraize_linear": "nn.lora",
+    "merge_lora": "nn.lora",
+    "torch_loraize": "nn.lora",
+    "torch_merge_lora": "nn.lora",
+    "LLM": "arch.llm",
+    "LLMConfig": "arch.llm",
+    "QWEN3_SMALL": "arch.llm",
+    "GPT_OSS_SMALL": "arch.llm",
+    "DEEPSEEK_R1_SMALL": "arch.llm",
+    "build_qwen3_model": "arch.llm",
+    "build_gpt_oss_model": "arch.llm",
+    "build_deepseek_r1_model": "arch.llm",
+    "tie_embedding_and_head": "arch.llm",
+    "generate": "arch.llm",
+    "hf_config_to_llm_config": "arch.llm",
+    "load_hf_config": "arch.llm",
+    "load_hf_weights_into_llm": "arch.llm",
+    "load_tokenizer": "arch.llm",
+    "download_repo": "arch.llm",
 }
 
 # Need to manually set some values which can't be auto-generated.
@@ -516,6 +556,17 @@ if IMPORT_ALL or TYPE_CHECKING:
         get_diffusion_beta_schedule,
         get_ode_solver,
     )
+    from xax.arch.llm import (
+        DEEPSEEK_R1_SMALL,
+        GPT_OSS_SMALL,
+        LLM,
+        QWEN3_SMALL,
+        LLMConfig,
+        build_deepseek_r1_model,
+        build_gpt_oss_model,
+        build_qwen3_model,
+        tie_embedding_and_head,
+    )
     from xax.arch.ssm import SSM, BaseSSMBlock, DiagSSMBlock, SSMBlock
     from xax.arch.unet import UNet
     from xax.core.conf import (
@@ -561,6 +612,16 @@ if IMPORT_ALL or TYPE_CHECKING:
         rotation6d_to_rotation_matrix,
         rotation_matrix_to_quat,
         rotation_matrix_to_rotation6d,
+    )
+    from xax.nn.lora import (
+        LoRALinear,
+        TorchLoRALinear,
+        lora_filter_spec,
+        loraize,
+        loraize_linear,
+        merge_lora,
+        torch_loraize,
+        torch_merge_lora,
     )
     from xax.nn.losses import cross_entropy
     from xax.nn.metrics import NormType, cast_euclidean_norm_type, dynamic_time_warping, get_euclidean_norm
