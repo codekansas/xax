@@ -12,42 +12,29 @@ Key differences:
   by users when loading real checkpoints.
 """
 
-from __future__ import annotations
-
 import json
 import logging
 import os
 import warnings
 from dataclasses import dataclass, replace
-from typing import Callable
+from pathlib import Path
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field as PydanticField
+from safetensors.numpy import load_file as safe_load
 
 from xax.arch.attention import RotaryEmbedding
 
-try:  # Optional HF hub only
+try:
     from huggingface_hub import snapshot_download
 
-    _HF_AVAILABLE = True
-except Exception:  # pragma: no cover - optional
-    _HF_AVAILABLE = False
-
-try:  # Optional tokenizer (avoids transformers dependency)
-    from tokenizers import Tokenizer as HFTokenizer  # type: ignore[tokenized-import]
-
-    _TOKENIZERS_AVAILABLE = True
-except Exception:  # pragma: no cover - optional
-    _TOKENIZERS_AVAILABLE = False
-
-try:  # Optional safetensors for weight loading
-    from safetensors.numpy import load_file as safe_load  # type: ignore[safetensors-import]
-
-    _SAFETENSORS_AVAILABLE = True
-except Exception:  # pragma: no cover - optional
-    _SAFETENSORS_AVAILABLE = False
+except ModuleNotFoundError as e:
+    raise ModuleNotFoundError(
+        "Please install huggingface_hub to access pre-trained LLM weights: `pip install huggingface-hub`"
+    ) from e
 
 logger = logging.getLogger(__name__)
 
@@ -287,83 +274,19 @@ def tie_embedding_and_head(model: LLM) -> LLM:
 # --------------------------------------------------------------------------- #
 
 
-def _assert_hf_available() -> None:
-    if not _HF_AVAILABLE:
-        raise ImportError("huggingface_hub and transformers are required for weight download/conversion.")
-
-
-def download_repo(repo_id: str, revision: str | None = None, cache_dir: str | None = None) -> str:
+def download_repo(repo_id: str, revision: str | None = None, cache_dir: str | None = None) -> Path:
     """Downloads a repo snapshot from the Huggingface Hub and returns the local path."""
-    _assert_hf_available()
-    return snapshot_download(repo_id=repo_id, revision=revision, cache_dir=cache_dir)
+    return Path(snapshot_download(repo_id=repo_id, revision=revision, cache_dir=cache_dir))
 
 
 def load_hf_config(repo_id: str, revision: str | None = None) -> dict[str, object]:
     """Loads HF config.json as dict."""
-    _assert_hf_available()
     path = download_repo(repo_id, revision=revision)
-    with open(os.path.join(path, "config.json"), "r", encoding="utf-8") as f:
+    with open(path / "config.json", "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def load_tokenizer(repo_id: str, revision: str | None = None) -> HFTokenizer:
-    """Loads a tokenizer from HF without requiring transformers if possible."""
-    _assert_hf_available()
-    snapshot_path = download_repo(repo_id, revision=revision)
-    tok_path = f"{snapshot_path}/tokenizer.json"
-    if _TOKENIZERS_AVAILABLE and jax.device_count() >= 0:  # cheap guard to keep lint happy
-        tokenizer = HFTokenizer.from_file(tok_path)
-
-        class _Wrapper:
-            def __init__(self, tok: HFTokenizer) -> None:
-                self.tok = tok
-                self.pad_token_id = tok.token_to_id("<pad>") or tok.token_to_id("<s>") or tok.token_to_id("<unk>")
-                self.eos_token_id = tok.token_to_id("</s>") or self.pad_token_id
-                self.bos_token_id = tok.token_to_id("<s>")
-
-            def __call__(self, text: str, return_tensors: str | None = None) -> dict[str, list[int]]:
-                ids = self.tok.encode(text).ids
-                bos = self.tok.token_to_id("<s>")
-                if bos is not None and (len(ids) == 0 or ids[0] != bos):
-                    ids = [bos] + ids
-                return {"input_ids": ids}
-
-            def decode(self, ids: list[int] | Array, skip_special_tokens: bool = True) -> str:
-                return self.tok.decode(ids)
-
-        return _Wrapper(tokenizer)
-
-    warnings.warn("tokenizers not available; install `tokenizers` for tokenizer support.", stacklevel=2)
-    raise ImportError("Tokenizer loading requires `tokenizers` package.")
-
-
-def _apply_chat_template(
-    tokenizer: HFTokenizer,
-    messages: list[dict[str, str]],
-    *,
-    add_generation_prompt: bool = True,
-    enable_thinking: bool = True,
-) -> str:
-    """Render chat template matching tokenizer_config.json for Qwen chat."""
-    rendered = ""
-    if messages and messages[0]["role"] != "system":
-        rendered += "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-
-    for msg in messages:
-        rendered += f"<|im_start|>{msg['role']}\n{msg['content']}<|im_end|>\n"
-
-    if add_generation_prompt:
-        rendered += "<|im_start|>assistant\n"
-        if enable_thinking and tokenizer.token_to_id("<|think|>") is not None:
-            rendered += "<|think|>"
-
-    return rendered
-
-
 def _fetch_state_dict(repo_id: str, revision: str | None = None) -> tuple[dict[str, object], dict[str, jnp.ndarray]]:
-    _assert_hf_available()
-    if not _SAFETENSORS_AVAILABLE:
-        raise ImportError("safetensors is required to load HF weights.")
     snapshot_path = download_repo(repo_id, revision=revision)
     safes = [os.path.join(snapshot_path, f) for f in os.listdir(snapshot_path) if f.endswith(".safetensors")]
     if not safes:
@@ -385,19 +308,59 @@ def _maybe_get(key_sub: str, state: dict[str, jnp.ndarray]) -> jnp.ndarray:
     return state[matches[0]]
 
 
+class HFConfig(BaseModel):
+    """Subset of HuggingFace config fields needed for LLMConfig derivation."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    hidden_size: int | None = PydanticField(
+        default=None,
+        validation_alias=AliasChoices("hidden_size", "n_embd"),
+    )
+    num_attention_heads: int | None = PydanticField(
+        default=None,
+        validation_alias=AliasChoices("num_attention_heads", "n_head"),
+    )
+    num_key_value_heads: int | None = PydanticField(
+        default=None,
+        validation_alias=AliasChoices("num_key_value_heads", "num_kv_heads", "n_kv_head"),
+    )
+    num_hidden_layers: int | None = PydanticField(
+        default=None,
+        validation_alias=AliasChoices("num_hidden_layers", "n_layer"),
+    )
+    vocab_size: int | None = PydanticField(
+        default=None,
+        validation_alias=AliasChoices("vocab_size", "n_vocab"),
+    )
+    intermediate_size: int | None = PydanticField(
+        default=None,
+        validation_alias=AliasChoices("intermediate_size", "n_inner", "ffn_hidden_size"),
+    )
+    rope_theta: float | None = PydanticField(
+        default=None,
+        validation_alias=AliasChoices("rope_theta", "rotary_emb_base"),
+    )
+    rms_norm_eps: float | None = PydanticField(
+        default=None,
+        validation_alias=AliasChoices("rms_norm_eps", "layer_norm_epsilon"),
+    )
+
+
 def hf_config_to_llm_config(cfg: dict[str, object], base: LLMConfig | None = None) -> LLMConfig:
     """Derive an LLMConfig from an HF config dict."""
     base = base or QWEN3_SMALL
-    embed_dim = int(cfg.get("hidden_size", base.embed_dim))
-    q_heads = int(cfg.get("num_attention_heads", base.q_heads))
-    kv_heads = int(cfg.get("num_key_value_heads", max(1, q_heads // 2)))
+    parsed = HFConfig.model_validate(cfg)
+    embed_dim = parsed.hidden_size or base.embed_dim
+    q_heads = parsed.num_attention_heads or base.q_heads
+    kv_heads = parsed.num_key_value_heads or max(1, q_heads // 2)
     head_dim = embed_dim // q_heads
-    num_layers = int(cfg.get("num_hidden_layers", base.num_layers))
-    vocab_size = int(cfg.get("vocab_size", base.vocab_size))
-    mlp_hidden_dim = int(cfg.get("intermediate_size", embed_dim * base.mlp_mult))
+    num_layers = parsed.num_hidden_layers or base.num_layers
+    vocab_size = parsed.vocab_size or base.vocab_size
+    mlp_hidden_dim = parsed.intermediate_size or (embed_dim * base.mlp_mult)
     mlp_mult = max(1, mlp_hidden_dim // embed_dim)
-    rope_theta = float(cfg.get("rope_theta", base.rope_theta))
-    rms_eps = float(cfg.get("rms_norm_eps", base.rms_eps))
+    rope_theta = parsed.rope_theta or base.rope_theta
+    rms_eps = parsed.rms_norm_eps or base.rms_eps
     return LLMConfig(
         vocab_size=vocab_size,
         embed_dim=embed_dim,
@@ -540,32 +503,16 @@ def load_hf_weights_into_llm(model: LLM, repo_id: str, revision: str | None = No
 
 def generate(
     model: LLM,
-    tokenizer: HFTokenizer | Callable[..., dict[str, Array | list[int]]],
-    prompt: str,
+    tokens: list[int],
+    eos_id: int,
     max_new_tokens: int = 20,
     *,
     temperature: float = 0.7,
     top_p: float = 0.9,
-    chat_template: bool = False,
-) -> str:
+) -> list[int]:
     """Sampling-based decoding for quick sanity checks."""
-    if isinstance(tokenizer, HFTokenizer):
-        if chat_template:
-            formatted_prompt = _apply_chat_template(
-                tokenizer, [{"role": "user", "content": prompt}], add_generation_prompt=True, enable_thinking=True
-            )
-        else:
-            formatted_prompt = prompt
-        tokens = tokenizer(formatted_prompt).input_ids
-    else:
-        formatted_prompt = prompt
-        tokens = tokenizer(formatted_prompt, return_tensors="np")["input_ids"]
-
-    tokens_bt = jnp.array(tokens, dtype=jnp.int32)
-    if tokens_bt.ndim == 1:
-        tokens_bt = tokens_bt[None, :]
+    tokens_bt = jnp.array(tokens, dtype=jnp.int32)[None, :]
     key = jax.random.key(0)
-    eos_id = getattr(tokenizer, "eos_token_id", None)
     for _ in range(max_new_tokens):
         logits_btv = model(tokens_bt, key=key, inference=True)
         logits = logits_btv[:, -1, :]
@@ -585,7 +532,7 @@ def generate(
         tokens_bt = jnp.concatenate([tokens_bt, next_token], axis=1)
         if eos_id is not None and int(next_token[0, 0]) == eos_id:
             break
-    return tokenizer.decode(jnp.array(tokens_bt[0]).tolist(), skip_special_tokens=True)
+    return jnp.array(tokens_bt[0]).tolist()
 
 
 def quantize_state_dict(state: dict[str, jnp.ndarray], num_bits: int = 8) -> dict[str, tuple[jnp.ndarray, jnp.ndarray]]:
@@ -611,6 +558,11 @@ def dequantize_state_dict(qstate: dict[str, tuple[jnp.ndarray, jnp.ndarray]]) ->
 
 
 def main() -> None:
+    try:
+        from transformers import AutoTokenizer  # noqa: PLC0415
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError("Please install transformers to run the LLM demo: `pip install transformers`") from e
+
     import argparse  # noqa: PLC0415
 
     parser = argparse.ArgumentParser(description="Run lightweight LLM with optional HF weights.")
@@ -633,21 +585,40 @@ def main() -> None:
         "deepseek_r1": build_deepseek_r1_model,
     }
     model = builders[args.model](config)
-    tokenizer = load_tokenizer(args.repo, revision=args.revision)
+    tokenizer = AutoTokenizer.from_pretrained(args.repo, revision=args.revision)
     try:
         model = load_hf_weights_into_llm(model, args.repo, revision=args.revision)
         logger.info("Loaded HF weights")
     except Exception as exc:  # noqa: BLE001
         warnings.warn(f"Falling back to randomly initialized weights; reason: {exc}", stacklevel=2)
-    text = generate(
+
+    if args.chat_template or ("chat" in args.repo.lower()):
+        tokens = tokenizer.apply_chat_template(
+            [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": args.prompt},
+            ],
+            add_generation_prompt=True,
+        )
+
+    else:
+        tokens = tokenizer.encode(
+            args.prompt,
+            return_tensors="np",
+            add_special_tokens=False,
+        )[0].tolist()
+
+    output_tokens = generate(
         model,
-        tokenizer,
-        args.prompt,
+        tokens=tokens,
+        eos_id=tokenizer.eos_token_id,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
-        chat_template=args.chat_template or ("chat" in args.repo.lower()),
     )
+
+    # Shows the text to the user.
+    text = tokenizer.decode(output_tokens, skip_special_tokens=True)
     print(text)
 
 

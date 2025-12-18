@@ -137,6 +137,7 @@ def ternary_search_optimal_side_counts(height: int, width: int, count: int) -> t
 
     lo, hi = 0, len(factors) - 1
 
+    # Attempts to make the tiled image as square as possible.
     def penalty(i: int) -> float:
         hval, wval = factors[i]
         h, w = hval * height, wval * width
