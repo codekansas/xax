@@ -5,7 +5,7 @@ import jax
 import xax
 
 
-def _forward_and_shape(config: object) -> None:
+def _forward_and_shape(config: xax.LLMConfig) -> None:
     key = jax.random.key(0)
     tokens_bt = jax.random.randint(key, (2, 5), minval=0, maxval=config.vocab_size)
     if config is xax.QWEN3_SMALL:
