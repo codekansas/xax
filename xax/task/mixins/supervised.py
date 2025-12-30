@@ -15,6 +15,7 @@ from typing import (
     Iterator,
     Sequence,
     TypeVar,
+    cast,
 )
 
 import equinox as eqx
@@ -155,12 +156,11 @@ class SupervisedMixin(
         grad_fn = jax.grad(self.get_output_and_loss, argnums=0, has_aux=True)
         grad_fn = xax_jit(static_argnums=[1], jit_level=3)(grad_fn)
         grads, aux = grad_fn(model_arr, model_static, batch, state, key)
-        loss: Array = aux[0]
-        output: Output = aux[1]
+        loss, output = cast(tuple[Array, Output], aux)
         grad_norm = optax.global_norm(grads)
         if self.config.max_grad_norm is not None:
             clip_fn = optax.clip_by_global_norm(self.config.max_grad_norm)
-            clip_state = clip_fn.init(grads)
+            clip_state = clip_fn.init(grads)  # Fine since this function is init_empty_state
             grads, _ = clip_fn.update(grads, clip_state)
 
         updates, opt_state = optimizer.update(grads, opt_state, model_arr)
