@@ -1,3 +1,9 @@
+#!/usr/bin/env -S uv run --no-project --script
+# /// script
+# dependencies = [
+#     "torch",
+# ]
+# ///
 """LoRA fine-tuning of Qwen3-4B on Shakespeare using the xax LoRA helpers."""
 
 import torch

@@ -83,7 +83,6 @@ def jit(
     device: xc.Device | None = None,
     backend: str | None = None,
     inline: bool = False,
-    abstracted_axes: Any | None = None,  # noqa: ANN401
     compiler_options: dict[str, Any] | None = None,
     jit_level: int | None = None,
     error_on_recompile: bool = False,
@@ -112,7 +111,6 @@ def jit(
             device=device,
             backend=backend,
             inline=inline,
-            abstracted_axes=abstracted_axes,
             compiler_options=compiler_options,
         )
 
