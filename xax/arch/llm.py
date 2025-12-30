@@ -238,12 +238,34 @@ class LLM(eqx.Module):
 
 
 # Small configs for quick unit tests / demos.
-QWEN3_SMALL = LLMConfig(vocab_size=32000, embed_dim=256, q_heads=8, kv_heads=4, head_dim=32, num_layers=4, max_tsz=512)
-GPT_OSS_SMALL = LLMConfig(
-    vocab_size=32000, embed_dim=384, q_heads=12, kv_heads=4, head_dim=32, num_layers=6, max_tsz=512
+QWEN3_SMALL = LLMConfig(
+    vocab_size=32000,
+    embed_dim=256,
+    q_heads=8,
+    kv_heads=4,
+    head_dim=32,
+    num_layers=4,
+    max_tsz=512,
 )
+
+GPT_OSS_SMALL = LLMConfig(
+    vocab_size=32000,
+    embed_dim=384,
+    q_heads=12,
+    kv_heads=4,
+    head_dim=32,
+    num_layers=6,
+    max_tsz=512,
+)
+
 DEEPSEEK_R1_SMALL = LLMConfig(
-    vocab_size=32000, embed_dim=512, q_heads=16, kv_heads=8, head_dim=32, num_layers=8, max_tsz=512
+    vocab_size=32000,
+    embed_dim=512,
+    q_heads=16,
+    kv_heads=8,
+    head_dim=32,
+    num_layers=8,
+    max_tsz=512,
 )
 
 

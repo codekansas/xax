@@ -1,6 +1,5 @@
 """Defines a mixin for running the training loop."""
 
-import enum
 import functools
 import itertools
 import logging
@@ -13,12 +12,10 @@ from typing import (
     Generic,
     Literal,
     Mapping,
-    Protocol,
     Sequence,
     TypeVar,
     get_args,
     overload,
-    runtime_checkable,
 )
 
 import equinox as eqx
@@ -26,7 +23,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import orbax.checkpoint as ocp
 from jaxtyping import Array, PRNGKeyArray, PyTree
 
 from xax.core.conf import field
@@ -54,33 +50,11 @@ from xax.utils.experiments import (
 )
 from xax.utils.jax import jit as xax_jit
 from xax.utils.logging import LOG_PING, LOG_STATUS
+from xax.utils.types.training import Optimizer, Precision, as_shape_dtype
 
 logger = logging.getLogger(__name__)
 
 PRINT_FINISH_TIME_EVERY_N_SECONDS = 60 * 2
-
-
-@runtime_checkable
-class Optimizer(Protocol):
-    def init(self, params: optax.Params) -> optax.OptState: ...
-
-    def update(
-        self,
-        updates: optax.Updates,
-        state: optax.OptState,
-        params: optax.Params | None = None,
-    ) -> tuple[optax.Updates, optax.OptState]: ...
-
-
-class Precision(enum.Enum):
-    FLOAT32 = "float32"
-    BFLOAT16 = "bfloat16"
-
-
-def as_shape_dtype(x: Any) -> Any:  # noqa: ANN401
-    if isinstance(x, Array):
-        return ocp.utils.to_shape_dtype_struct(x)
-    return x
 
 
 @functools.lru_cache(maxsize=None)

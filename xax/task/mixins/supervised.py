@@ -166,7 +166,7 @@ class SupervisedMixin(
         updates, opt_state = optimizer.update(grads, opt_state, model_arr)
         model_arr = eqx.apply_updates(model_arr, updates)
 
-        return model_arr, opt_state, output, loss, grad_norm
+        return model_arr, opt_state, output, loss, grad_norm  # type: ignore[return-value]
 
     def decode_tokens(self, tokens: Array) -> str:
         raise NotImplementedError(
