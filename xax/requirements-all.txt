@@ -1,8 +1,0 @@
-# requirements-full.txt
-
-# Weights and Biases
-wandb[media]
-
-# Huggingface
-tokenizers
-transformers

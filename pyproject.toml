@@ -1,8 +1,91 @@
-[tool.black]
+[project]
 
-line-length = 120
-target-version = ["py311"]
-include = '\.pyi?$'
+name = "xax"
+description = "A library for fast Jax experimentation"
+authors = [
+    { name = "Benjamin Bolte", email = "ben@bolte.cc" },
+]
+license = "MIT"
+readme = "README.md"
+requires-python = ">= 3.11"
+dynamic = ["version"]
+
+dependencies = [
+    # Core ML/JAX dependencies
+    "attrs",
+    "chex",
+    "datasets",
+    "equinox",
+    "etils",
+    "importlib-resources",
+    "jax",
+    "jaxtyping",
+    "optax",
+    "orbax-checkpoint",
+    "tensorflow",
+
+    # Data processing and serialization
+    "pillow",
+
+    # Configuration and project management
+    "omegaconf",
+    "gitpython",
+
+    # Monitoring and logging
+    "tensorboard",
+    "psutil",
+
+    # Networking
+    "requests",
+]
+
+[project.urls]
+
+Repository = "https://github.com/codekansas/xax"
+
+[project.optional-dependencies]
+
+dev = [
+    # Linting.
+    "mypy",
+    "ruff",
+    # Tests.
+    "pytest",
+    # Types.
+    "types-pillow",
+    "types-psutil",
+    "types-requests",
+]
+
+all = [
+    # Weights and Biases.
+    "wandb[media]",
+    # Huggingface.
+    "tokenizers",
+    "transformers",
+]
+
+[build-system]
+
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+
+include-package-data = true
+
+[tool.setuptools.packages.find]
+
+where = ["."]
+include = ["xax*"]
+
+[tool.setuptools.package-data]
+
+xax = ["*.py", "*.txt", "py.typed"]
+
+[tool.setuptools.dynamic]
+
+version = {attr = "xax.__version__"}
 
 [tool.pytest.ini_options]
 
