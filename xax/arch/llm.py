@@ -22,6 +22,7 @@ from pathlib import Path
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jaxtyping import Array
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field as PydanticField
 from safetensors.numpy import load_file as safe_load
@@ -293,18 +294,18 @@ def _fetch_state_dict(repo_id: str, revision: str | None = None) -> tuple[dict[s
         raise FileNotFoundError("No .safetensors files found in snapshot.")
     state: dict[str, jnp.ndarray] = {}
     for sf in safes:
-        state.update(safe_load(sf))
+        loaded_states: dict[str, np.ndarray] = safe_load(sf)
+        state.update({k: jnp.asarray(v) for k, v in loaded_states.items()})
     config = json.loads(open(f"{snapshot_path}/config.json", "r", encoding="utf-8").read())
     return config, state
 
 
 def _maybe_get(key_sub: str, state: dict[str, jnp.ndarray]) -> jnp.ndarray:
-    matches = [k for k in state if key_sub in k]
+    matches: list[str] = [k for k in state if key_sub in k]
     if not matches:
         raise KeyError(f"Missing parameter containing '{key_sub}'")
     if len(matches) > 1:
-        # choose shortest match to reduce ambiguity
-        matches = sorted(matches, key=len)
+        matches.sort(key=len)
     return state[matches[0]]
 
 

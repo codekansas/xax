@@ -1347,7 +1347,7 @@ class Logger:
             logger.start()
         return self
 
-    def __exit__(self, _t: type[BaseException] | None, _e: BaseException | None, _tr: TracebackType | None) -> None:
+    def __exit__(self, t: type[BaseException] | None, e: BaseException | None, tr: TracebackType | None) -> None:
         for logger in self.loggers:
             logger.stop()
         self.active = False

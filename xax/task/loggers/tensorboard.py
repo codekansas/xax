@@ -122,7 +122,7 @@ class TensorboardLogger(LoggerImpl):
             assert self.proc is not None and self.proc.stdout is not None
             lines = []
             for line in self.proc.stdout:
-                line_str = line.decode("utf-8")
+                line_str = line.decode("utf-8") if isinstance(line, bytes) else line
                 if line_str.startswith("TensorBoard"):
                     line_str = parse_url(make_localhost(line_str))
                     logging.log(LOG_STATUS, line_str)

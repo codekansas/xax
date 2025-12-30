@@ -13,7 +13,7 @@ import sys
 from dataclasses import dataclass, is_dataclass
 from pathlib import Path
 from types import TracebackType
-from typing import Generic, Self, TypeVar, cast
+from typing import Generic, Self, Sequence, TypeVar, cast
 
 import jax
 from omegaconf import DictConfig, OmegaConf
@@ -137,7 +137,7 @@ class BaseTask(Generic[Config]):
     def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, _t: type[BaseException] | None, _e: BaseException | None, _tr: TracebackType | None) -> None:
+    def __exit__(self, t: type[BaseException] | None, e: BaseException | None, tr: TracebackType | None) -> None:
         pass
 
     @classmethod
@@ -152,13 +152,13 @@ class BaseTask(Generic[Config]):
             that the generic class has not been used correctly.
         """
         if hasattr(cls, "__orig_bases__"):
-            for base in cls.__orig_bases__:
+            for base in cast(Sequence[type], cls.__orig_bases__):
                 if hasattr(base, "__args__"):
-                    for arg in base.__args__:
+                    for arg in cast(Sequence[type], base.__args__):
                         if isinstance(arg, TypeVar) and arg.__bound__ is not None:
                             arg = arg.__bound__
                         if issubclass(arg, BaseConfig):
-                            return arg
+                            return cast(type[Config], arg)
 
         raise ValueError(
             "The config class could not be parsed from the generic type, which usually means that the task is not "

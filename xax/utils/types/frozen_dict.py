@@ -47,8 +47,7 @@ class FrozenDict(Mapping[K, V]):
     __slots__ = ("_dict", "_hash")
 
     def __init__(self, *args: Any, __unsafe_skip_copy__: bool = False, **kwargs: Any) -> None:  # noqa: ANN401
-        # make sure the dict is as
-        xs = dict(*args, **kwargs)
+        xs: dict[K, V] = dict(*args, **kwargs)
         if __unsafe_skip_copy__:
             self._dict = xs
         else:
@@ -57,7 +56,7 @@ class FrozenDict(Mapping[K, V]):
         self._hash: int | None = None
 
     def __getitem__(self, key: K) -> V:
-        v = self._dict[key]
+        v = self._dict[key]  # type: ignore[index]
         if isinstance(v, dict):
             return FrozenDict(v)  # type: ignore[return-value]
         return v

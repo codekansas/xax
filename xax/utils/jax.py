@@ -236,9 +236,9 @@ def vmap(
 
         ns = next((len(_split_module(a, axis=i)) for i, a in zip(ia, args, strict=True) if i is not None), None)
         if ns is None:
-            return fun(*args, **kwargs)
+            return fun(*args, **kwargs)  # type: ignore[arg-type]
         split_args = [[a] * ns if i is None else _split_module(a, axis=i) for i, a in zip(ia, args, strict=True)]
-        split_outputs = [fun(*sargs, **kwargs) for sargs in zip(*split_args, strict=True)]
+        split_outputs = [fun(*sargs, **kwargs) for sargs in zip(*split_args, strict=True)]  # type: ignore[arg-type]
 
         if not split_outputs:
             return jnp.array([])  # type: ignore[return-value]

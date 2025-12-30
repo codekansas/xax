@@ -210,13 +210,10 @@ __all__ = [
     "HashableArray",
     "hashable_array",
     "LoRALinear",
-    "TorchLoRALinear",
     "lora_filter_spec",
     "loraize",
     "loraize_linear",
     "merge_lora",
-    "torch_loraize",
-    "torch_merge_lora",
     "LLM",
     "LLMConfig",
     "QWEN3_SMALL",
@@ -469,13 +466,10 @@ NAME_MAP: dict[str, str] = {
     "HashableArray": "utils.types.hashable_array",
     "hashable_array": "utils.types.hashable_array",
     "LoRALinear": "nn.lora",
-    "TorchLoRALinear": "nn.lora",
     "lora_filter_spec": "nn.lora",
     "loraize": "nn.lora",
     "loraize_linear": "nn.lora",
     "merge_lora": "nn.lora",
-    "torch_loraize": "nn.lora",
-    "torch_merge_lora": "nn.lora",
     "LLM": "arch.llm",
     "LLMConfig": "arch.llm",
     "QWEN3_SMALL": "arch.llm",
@@ -615,13 +609,10 @@ if IMPORT_ALL or TYPE_CHECKING:
     )
     from xax.nn.lora import (
         LoRALinear,
-        TorchLoRALinear,
         lora_filter_spec,
         loraize,
         loraize_linear,
         merge_lora,
-        torch_loraize,
-        torch_merge_lora,
     )
     from xax.nn.losses import cross_entropy
     from xax.nn.metrics import NormType, cast_euclidean_norm_type, dynamic_time_warping, get_euclidean_norm

@@ -1,6 +1,5 @@
 """LoRA utilities for Equinox modules."""
 
-import math
 from typing import Any, Callable
 
 import equinox as eqx
@@ -44,8 +43,8 @@ class LoRALinear(eqx.Module):
             key = jrandom.key(0)
 
         key_a, _ = jrandom.split(key)
-        in_features = linear.in_features
-        out_features = linear.out_features
+        in_features = int(linear.in_features)
+        out_features = int(linear.out_features)
 
         lora_a_ir = jrandom.normal(key_a, (in_features, rank), dtype=linear.weight.dtype) / jnp.sqrt(float(in_features))
         lora_b_ro = jnp.zeros((rank, out_features), dtype=linear.weight.dtype)
@@ -185,114 +184,3 @@ def merge_lora(module: eqx.Module) -> eqx.Module:
         return node
 
     return jax.tree_util.tree_map(convert, module, is_leaf=lambda node: isinstance(node, LoRALinear))
-
-
-# TODO: Remove any PyTorch logic from this file, it should just be pure Jax.
-try:  # pragma: no cover - optional torch support
-    import torch
-    import torch.nn as torch_nn
-
-    _TORCH_AVAILABLE = True
-except Exception:  # pragma: no cover - torch is optional
-    torch = None
-    torch_nn = None
-    _TORCH_AVAILABLE = False
-
-    class TorchLoRALinear:  # type: ignore[too-few-public-methods]
-        """Placeholder that raises when PyTorch is unavailable."""
-
-        def __init__(self, *args: Any, **kwargs: Any) -> None:  # noqa: ANN401
-            raise ImportError("PyTorch is required for TorchLoRALinear.")
-
-
-if _TORCH_AVAILABLE:  # pragma: no cover - exercised in example usage
-
-    class TorchLoRALinear(torch_nn.Module):
-        """Torch counterpart of :class:`LoRALinear`."""
-
-        def __init__(
-            self,
-            linear: torch_nn.Linear,
-            rank: int,
-            *,
-            alpha: float | None = None,
-            dropout_rate: float = 0.0,
-        ) -> None:
-            super().__init__()
-            if rank < 1:
-                raise ValueError("rank must be at least 1")
-            if alpha is None:
-                alpha = float(rank)
-
-            self.register_buffer("weight_oi", linear.weight.detach().clone())
-            if linear.bias is not None:
-                self.register_buffer("bias_o", linear.bias.detach().clone())
-            else:
-                self.bias_o = None
-
-            self.lora_a_ir = torch_nn.Parameter(
-                torch.randn(linear.in_features, rank, device=linear.weight.device, dtype=linear.weight.dtype)
-                / math.sqrt(float(linear.in_features))
-            )
-            self.lora_b_ro = torch_nn.Parameter(
-                torch.zeros(rank, linear.out_features, device=linear.weight.device, dtype=linear.weight.dtype)
-            )
-            self.scaling = alpha / float(rank)
-            self.dropout = torch_nn.Dropout(dropout_rate) if dropout_rate > 0.0 else None
-
-        def forward(self, x_bi: "torch.Tensor") -> "torch.Tensor":  # type: ignore[name-defined]
-            y_bo = x_bi @ self.weight_oi.T
-            if self.bias_o is not None:
-                y_bo = y_bo + self.bias_o
-
-            x_lora_bi = self.dropout(x_bi) if self.dropout is not None else x_bi
-            delta_bo = (x_lora_bi @ self.lora_a_ir) @ self.lora_b_ro
-            return y_bo + delta_bo * self.scaling
-
-
-def torch_loraize(
-    module: Any,  # noqa: ANN401
-    rank: int,
-    *,
-    alpha: float | None = None,
-    dropout_rate: float = 0.0,
-    predicate: Callable[[Any], bool] | None = None,  # noqa: ANN401
-) -> Any:  # noqa: ANN401
-    """Recursively replace ``torch.nn.Linear`` layers with ``TorchLoRALinear``."""
-    if not _TORCH_AVAILABLE:
-        raise ImportError("PyTorch is required for torch_loraize.")
-    if predicate is None:
-
-        def predicate(_: Any) -> bool:  # noqa: ARG001, ANN401
-            return True
-
-    for name, child in module.named_children():
-        if isinstance(child, torch_nn.Linear) and predicate(child):
-            setattr(module, name, TorchLoRALinear(child, rank, alpha=alpha, dropout_rate=dropout_rate))
-        else:
-            torch_loraize(child, rank, alpha=alpha, dropout_rate=dropout_rate, predicate=predicate)
-    return module
-
-
-def torch_merge_lora(module: Any) -> Any:  # noqa: ANN401
-    """Merge torch LoRA layers into base linear weights in-place."""
-    if not _TORCH_AVAILABLE:
-        raise ImportError("PyTorch is required for torch_merge_lora.")
-
-    for name, child in module.named_children():
-        if isinstance(child, TorchLoRALinear):
-            delta_oi = (child.lora_a_ir @ child.lora_b_ro).T * child.scaling
-            merged = torch_nn.Linear(
-                in_features=child.weight_oi.shape[1],
-                out_features=child.weight_oi.shape[0],
-                bias=child.bias_o is not None,
-                device=child.weight_oi.device,
-                dtype=child.weight_oi.dtype,
-            )
-            merged.weight.data.copy_(child.weight_oi + delta_oi)
-            if child.bias_o is not None:
-                merged.bias.data.copy_(child.bias_o)
-            setattr(module, name, merged)
-        else:
-            torch_merge_lora(child)
-    return module

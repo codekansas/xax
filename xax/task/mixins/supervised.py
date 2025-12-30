@@ -29,7 +29,7 @@ from xax.core.state import Batch, Output, State
 from xax.nn.parallel import is_master
 from xax.task.logger import Metric, Scalar
 from xax.task.mixins.data_loader import iter_samples
-from xax.task.mixins.train import InitParams, TrainConfig, TrainMixin
+from xax.task.mixins.train import InitParams, Optimizer, TrainConfig, TrainMixin
 from xax.utils.experiments import (
     ContextTimer,
     TrainingFinishedError,
@@ -154,11 +154,14 @@ class SupervisedMixin(
     ) -> tuple[PyTree, optax.OptState, Output, Array, Array]:
         grad_fn = jax.grad(self.get_output_and_loss, argnums=0, has_aux=True)
         grad_fn = xax_jit(static_argnums=[1], jit_level=3)(grad_fn)
-        grads, (loss, output) = grad_fn(model_arr, model_static, batch, state, key)
+        grads, aux = grad_fn(model_arr, model_static, batch, state, key)
+        loss: Array = aux[0]
+        output: Output = aux[1]
         grad_norm = optax.global_norm(grads)
         if self.config.max_grad_norm is not None:
             clip_fn = optax.clip_by_global_norm(self.config.max_grad_norm)
-            grads, _ = clip_fn.update(grads, None)
+            clip_state = clip_fn.init(grads)
+            grads, _ = clip_fn.update(grads, clip_state)
 
         updates, opt_state = optimizer.update(grads, opt_state, model_arr)
         model_arr = eqx.apply_updates(model_arr, updates)
@@ -259,7 +262,7 @@ class SupervisedMixin(
     def train_loop(
         self,
         models: Sequence[PyTree],
-        optimizers: Sequence[optax.GradientTransformation],
+        optimizers: Sequence[Optimizer],
         opt_states: Sequence[optax.OptState],
         ds: Iterator[Batch],
         state: State,
@@ -302,11 +305,21 @@ class SupervisedMixin(
 
             if self.should_checkpoint(state):
                 model = eqx.combine(model_arr, model_static)
-                self.save_checkpoint(models=[model], optimizers=[optimizer], opt_states=[opt_state], state=state)
+                self.save_checkpoint(
+                    models=[model],
+                    optimizers=[optimizer],
+                    opt_states=[opt_state],
+                    state=state,
+                )
 
         # After finishing training, save the final checkpoint.
         model = eqx.combine(model_arr, model_static)
-        self.save_checkpoint(models=[model], optimizers=[optimizer], opt_states=[opt_state], state=state)
+        self.save_checkpoint(
+            models=[model],
+            optimizers=[optimizer],
+            opt_states=[opt_state],
+            state=state,
+        )
 
     def run(self) -> None:
         self.run_training()
