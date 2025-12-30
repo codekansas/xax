@@ -62,7 +62,7 @@ class State:
     @classmethod
     def init_state(cls) -> "State":
         return cls(
-            _int32_arr=jnp.array([0, 0], dtype=jnp.int32),
+            _int32_arr=jnp.array([0], dtype=jnp.int32),
             _float32_arr=jnp.array([0.0, time.time(), 0.0, 0.0], dtype=jnp.float32),
         )
 
