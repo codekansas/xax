@@ -1,8 +1,7 @@
 """LoRA fine-tuning of Qwen3-4B on Shakespeare using the xax LoRA helpers."""
-# mypy: disable-error-code="import-not-found"
 
-from datasets import load_dataset
 import torch
+from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,

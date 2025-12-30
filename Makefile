@@ -10,7 +10,7 @@ format:
 
 static-checks:
 	@ruff check xax tests examples
-	@mypy --install-types --non-interactive xax tests examples
+	@ty check xax
 .PHONY: static-checks
 
 test:

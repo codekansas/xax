@@ -99,13 +99,17 @@ def loraize(
 ) -> eqx.Module:
     """Recursively replace ``eqx.nn.Linear`` layers with ``LoRALinear``."""
     if predicate is None:
-        predicate = lambda _: True
+
+        def predicate(_: eqx.nn.Linear) -> bool:  # noqa: ARG001
+            return True
+
     if key is None:
         key = jrandom.key(0)
 
-    def convert(node: Any) -> Any:
+    def convert(node: Any) -> Any:  # noqa: ANN001, ANN401
         nonlocal key
         if isinstance(node, eqx.nn.Linear) and predicate(node):
+            assert key is not None  # Checked above
             key, init_key = jrandom.split(key)
             return loraize_linear(node, rank, alpha=alpha, dropout_rate=dropout_rate, key=init_key)
         return node
@@ -116,17 +120,31 @@ def loraize(
 def lora_filter_spec(module: eqx.Module) -> eqx.Module:
     """Build a filter spec marking only LoRA parameters as trainable."""
 
-    def _mark(model_node: Any, spec_node: Any) -> Any:
+    def _mark(model_node: Any, spec_node: Any) -> Any:  # noqa: ANN001, ANN401
         if isinstance(model_node, LoRALinear):
-            spec_node = eqx.tree_at(lambda l: l.lora_a_ir, spec_node, True)
-            spec_node = eqx.tree_at(lambda l: l.lora_b_ro, spec_node, True)
+
+            def get_lora_a_ir(linear: LoRALinear) -> Array:
+                return linear.lora_a_ir
+
+            def get_lora_b_ro(linear: LoRALinear) -> Array:
+                return linear.lora_b_ro
+
+            spec_node = eqx.tree_at(get_lora_a_ir, spec_node, True)
+            spec_node = eqx.tree_at(get_lora_b_ro, spec_node, True)
             return spec_node
         if hasattr(model_node, "__dataclass_fields__"):
             for fname in model_node.__dataclass_fields__:
                 child_model = getattr(model_node, fname)
                 child_spec = getattr(spec_node, fname)
                 updated_child = _mark(child_model, child_spec)
-                spec_node = eqx.tree_at(lambda m: getattr(m, fname), spec_node, updated_child)
+
+                def make_get_field(field_name: str) -> Callable[[Any], Any]:  # noqa: ANN401
+                    def get_field(m: Any) -> Any:  # noqa: ANN001, ANN401
+                        return getattr(m, field_name)
+
+                    return get_field
+
+                spec_node = eqx.tree_at(make_get_field(fname), spec_node, updated_child)
             return spec_node
         if isinstance(model_node, list):
             return [_mark(m, s) for m, s in zip(model_node, spec_node, strict=False)]
@@ -143,7 +161,7 @@ def lora_filter_spec(module: eqx.Module) -> eqx.Module:
 def merge_lora(module: eqx.Module) -> eqx.Module:
     """Merge LoRA weights back into standard ``eqx.nn.Linear`` layers."""
 
-    def convert(node: Any) -> Any:
+    def convert(node: Any) -> Any:  # noqa: ANN001, ANN401
         if isinstance(node, LoRALinear):
             delta_oi = (node.lora_a_ir @ node.lora_b_ro).T * node.scaling
             merged_weight_oi = node.weight_oi + delta_oi
@@ -153,9 +171,16 @@ def merge_lora(module: eqx.Module) -> eqx.Module:
                 use_bias=node.bias_o is not None,
                 key=jrandom.key(0),
             )
-            merged = eqx.tree_at(lambda l: l.weight, merged, merged_weight_oi)
+
+            def get_weight(linear: eqx.nn.Linear) -> Array:
+                return linear.weight
+
+            def get_bias(linear: eqx.nn.Linear) -> Array | None:
+                return linear.bias
+
+            merged = eqx.tree_at(get_weight, merged, merged_weight_oi)
             if node.bias_o is not None:
-                merged = eqx.tree_at(lambda l: l.bias, merged, node.bias_o)
+                merged = eqx.tree_at(get_bias, merged, node.bias_o)
             return merged
         return node
 
@@ -226,18 +251,20 @@ if _TORCH_AVAILABLE:  # pragma: no cover - exercised in example usage
 
 
 def torch_loraize(
-    module: Any,
+    module: Any,  # noqa: ANN401
     rank: int,
     *,
     alpha: float | None = None,
     dropout_rate: float = 0.0,
-    predicate: Callable[[Any], bool] | None = None,
-) -> Any:
+    predicate: Callable[[Any], bool] | None = None,  # noqa: ANN401
+) -> Any:  # noqa: ANN401
     """Recursively replace ``torch.nn.Linear`` layers with ``TorchLoRALinear``."""
     if not _TORCH_AVAILABLE:
         raise ImportError("PyTorch is required for torch_loraize.")
     if predicate is None:
-        predicate = lambda _: True
+
+        def predicate(_: Any) -> bool:  # noqa: ARG001, ANN401
+            return True
 
     for name, child in module.named_children():
         if isinstance(child, torch_nn.Linear) and predicate(child):
@@ -247,7 +274,7 @@ def torch_loraize(
     return module
 
 
-def torch_merge_lora(module: Any) -> Any:
+def torch_merge_lora(module: Any) -> Any:  # noqa: ANN401
     """Merge torch LoRA layers into base linear weights in-place."""
     if not _TORCH_AVAILABLE:
         raise ImportError("PyTorch is required for torch_merge_lora.")
