@@ -57,10 +57,26 @@ dev = [
     "types-requests",
 ]
 
-all = [
+wandb = [
     # Weights and Biases.
     "wandb[media]",
+]
+
+examples = [
     # Huggingface.
+    "tokenizers",
+    "transformers",
+]
+
+# All extra dependencies.
+all = [
+    "ruff",
+    "ty",
+    "pytest",
+    "types-pillow",
+    "types-psutil",
+    "types-requests",
+    "wandb[media]",
     "tokenizers",
     "transformers",
 ]
