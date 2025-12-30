@@ -1,23 +1,25 @@
 """Defines types that are used during training."""
 
 import enum
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, TypeVar, runtime_checkable
 
 import optax
 import orbax.checkpoint as ocp
 from jaxtyping import Array
 
+S = TypeVar("S")
+
 
 @runtime_checkable
 class Optimizer(Protocol):
-    def init(self, params: optax.Params) -> optax.OptState: ...
+    def init(self, params: optax.Params) -> S: ...
 
     def update(
         self,
         updates: optax.Updates,
-        state: optax.OptState,
+        state: S,
         params: optax.Params | None = None,
-    ) -> tuple[optax.Updates, optax.OptState]: ...
+    ) -> tuple[optax.Updates, S]: ...
 
 
 class Precision(enum.Enum):

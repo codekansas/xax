@@ -252,7 +252,7 @@ class ShakespearePrediction(xax.SupervisedTask[Config]):
             case _:
                 raise ValueError(f"Unknown model type: {self.config.model_type}")
 
-    def get_optimizer(self) -> optax.GradientTransformation:
+    def get_optimizer(self) -> xax.Optimizer:
         # Create learning rate schedule with warmup and cosine decay
         if self.config.max_steps is not None:
             # Warmup schedule

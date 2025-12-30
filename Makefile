@@ -10,7 +10,7 @@ format:
 
 static-checks:
 	@ruff check xax tests examples
-	@ty check xax
+	@ty check xax tests examples
 .PHONY: static-checks
 
 test:

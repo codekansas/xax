@@ -61,7 +61,7 @@ class SimpleTask(xax.SupervisedTask[SimpleConfig]):
     def get_model(self, params: xax.InitParams) -> SimpleModel:
         return SimpleModel(self.config, key=params.key)
 
-    def get_optimizer(self) -> optax.GradientTransformation:
+    def get_optimizer(self) -> xax.Optimizer:
         return optax.adam(self.config.learning_rate)
 
     def get_output(self, model: SimpleModel, batch: Batch, state: xax.State, key: PRNGKeyArray) -> Array:
