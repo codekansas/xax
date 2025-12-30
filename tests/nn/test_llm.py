@@ -36,20 +36,15 @@ def test_tie_embedding_and_head() -> None:
     assert tied.lm_head.weight is tied.embed.weight
 
 
-class _DummyTokenizer:
-    def __call__(self, text: str, return_tensors: str | None = None) -> dict[str, list[list[int]]]:
-        ids = [[ord(c) % 100 for c in text]]
-        return {"input_ids": ids}
-
-    def decode(self, tokens: list[int], skip_special_tokens: bool = True) -> str:  # noqa: ARG002
-        return "".join(chr((t % 26) + 97) for t in tokens)
-
-
 def test_generate_tokens_length() -> None:
-    tokenizer = _DummyTokenizer()
     model = xax.build_qwen3_model(xax.QWEN3_SMALL, key=jax.random.key(0))
-    prompt = "hi"
+    tokens = [ord("h"), ord("i")]
+    eos_id = ord("!")
     max_new = 3
-    text = xax.generate(model, tokenizer, prompt, max_new_tokens=max_new, chat_template=False)
-    assert isinstance(text, str)
-    assert len(text) == len(prompt) + max_new
+    output_tokens = xax.llm_generate(
+        model,
+        tokens,
+        eos_id,
+        max_new_tokens=max_new,
+    )
+    assert len(output_tokens) == len(tokens) + max_new

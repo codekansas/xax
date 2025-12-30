@@ -524,7 +524,7 @@ def load_hf_weights_into_llm(model: LLM, repo_id: str, revision: str | None = No
     return model
 
 
-def generate(
+def llm_generate(
     model: LLM,
     tokens: list[int],
     eos_id: int,
@@ -631,7 +631,7 @@ def main() -> None:
             add_special_tokens=False,
         )[0].tolist()
 
-    output_tokens = generate(
+    output_tokens = llm_generate(
         model,
         tokens=tokens,
         eos_id=tokenizer.eos_token_id,
