@@ -30,29 +30,36 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
       - name: Restore cache
         id: restore-cache
         uses: actions/cache/restore@v3
         with:
           path: |
-            ${{ env.pythonLocation }}
+            .venv/
             .mypy_cache/
-          key: python-requirements-${{ env.pythonLocation }}-${{ github.event.pull_request.base.sha || github.sha }}
+          key: uv-venv-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}-${{ github.event.pull_request.base.sha || github.sha }}
           restore-keys: |
-            python-requirements-${{ env.pythonLocation }}
-            python-requirements-
+            uv-venv-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
+            uv-venv-${{ runner.os }}-
 
-      - name: Install package
+      - name: Create venv and install package
         run: |
-          pip install --upgrade --upgrade-strategy eager '.[dev]' 'jax[cpu]'
+          uv venv .venv --python 3.12 --allow-existing
+          source .venv/bin/activate
+          uv pip install --upgrade '.[all]' 'jax[cpu]'
 
       - name: Run static checks
         run: |
+          source .venv/bin/activate
           mkdir -p .mypy_cache
           make static-checks
 
       - name: Run unit tests
         run: |
+          source .venv/bin/activate
           make test
 
       - name: Save cache
@@ -60,6 +67,6 @@ jobs:
         if: github.ref == 'refs/heads/master'
         with:
           path: |
-            ${{ env.pythonLocation }}
+            .venv/
             .mypy_cache/
           key: ${{ steps.restore-cache.outputs.cache-primary-key }}
