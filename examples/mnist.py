@@ -158,5 +158,6 @@ if __name__ == "__main__":
             log_heavy_every_n_seconds=120,
             # MNIST dataset is very small and this greatly improves throughput.
             load_in_memory=True,
+            batches_per_step=64,
         ),
     )

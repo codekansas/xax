@@ -29,7 +29,7 @@ LOG_ERROR_SUMMARY: int = logging.INFO + 4
 def format_number(value: int | float, precision: int = 4) -> str:
     if isinstance(value, int):
         return f"{value:,}"  # Add commas to the number
-    return f"{value:.{precision}g}"
+    return f"{value:,.{precision}g}"
 
 
 def as_str(value: Any, precision: int = 4) -> str:  # noqa: ANN401

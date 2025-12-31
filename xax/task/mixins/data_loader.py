@@ -1,6 +1,7 @@
 """Defines a mixin for instantiating dataloaders."""
 
 import logging
+import random
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from queue import Empty, Queue
@@ -9,7 +10,6 @@ from typing import Generic, Iterator, TypeVar
 
 import jax
 import numpy as np
-import tensorflow as tf
 from datasets import Dataset, DatasetDict, IterableDataset, IterableDatasetDict
 from jax.sharding import NamedSharding, PartitionSpec as P
 from omegaconf import II
@@ -30,7 +30,7 @@ Tc_co = TypeVar("Tc_co", covariant=True)
 @dataclass
 class DataloadersConfig(ProcessConfig, BaseConfig):
     batch_size: int | None = field(None, help="Size of each batch")
-    prefetch_buffer_size: int = field(4, help="Number of batches to prefetch in background thread")
+    prefetch_buffer_size: int = field(16, help="Number of batches to prefetch in background thread")
     load_in_memory: bool = field(False, help="Load entire dataset into device memory for maximum throughput")
     raise_dataloader_errors: bool = field(False, help="If set, raise dataloader errors inside the worker processes")
     dataset_workers: int = field(II("xax.num_workers:-1"), help="Number of workers for loading training samples")
@@ -42,51 +42,88 @@ class DataloadersConfig(ProcessConfig, BaseConfig):
 Config = TypeVar("Config", bound=DataloadersConfig)
 
 
-class PrefetchIterator(Iterator[Batch]):
-    """Prefetches batches in a background thread to overlap data loading with GPU compute.
+class StreamingBatchIterator(Iterator[Batch]):
+    """Iterator that streams batches from a HuggingFace Dataset with prefetching.
 
-    This iterator runs a background thread that continuously loads batches from the
-    TensorFlow dataset, converts them to numpy, and transfers them to JAX devices.
-    The prefetch buffer allows the GPU to keep computing while the next batches
-    are being prepared.
+    This iterator provides efficient data loading by:
+    - Pre-batching data into contiguous arrays for fast device transfer
+    - Shuffling batch order each epoch for randomization
+    - Repeating infinitely for training
+    - Prefetching in a background thread to overlap with GPU compute
 
     Args:
-        ds: TensorFlow dataset to iterate over.
+        ds: HuggingFace Dataset to iterate over.
+        batch_size: Number of samples per batch.
         sharding: JAX sharding specification for device placement.
-        prefetch_size: Number of batches to buffer ahead. Larger values provide
-            more overlap between data loading and GPU compute, at the cost of
-            memory. A value of 4-8 is typically sufficient.
+        prefetch_size: Number of batches to buffer ahead.
+        seed: Random seed for shuffling.
     """
 
-    def __init__(self, ds: tf.data.Dataset, sharding: NamedSharding, prefetch_size: int = 4) -> None:
-        self._ds_iter = iter(ds)
+    def __init__(
+        self,
+        ds: Dataset,
+        batch_size: int,
+        sharding: NamedSharding,
+        prefetch_size: int = 4,
+        seed: int = 1337,
+    ) -> None:
+        self._batch_size = batch_size
         self._sharding = sharding
         self._prefetch_size = prefetch_size
+        self._seed = seed
+
+        # Pre-batch the data for efficient device transfer
+        # (contiguous memory layout makes device_put ~20x faster)
+        ds.set_format("numpy")
+        column_names = ds.column_names
+        data = {col: np.asarray(ds[col]) for col in column_names}
+        num_samples = len(ds)
+        self._num_batches = num_samples // batch_size
+
+        # Reshape to (num_batches, batch_size, ...)
+        self._batched_data = {
+            col: data[col][: self._num_batches * batch_size].reshape(
+                self._num_batches, batch_size, *data[col].shape[1:]
+            )
+            for col in column_names
+        }
+
+        logger.info(
+            "Prepared streaming iterator: %d samples -> %d batches of %d",
+            num_samples,
+            self._num_batches,
+            batch_size,
+        )
+
         self._queue: Queue[Batch | BaseException | None] = Queue(maxsize=prefetch_size)
         self._stop_event = Event()
         self._error: BaseException | None = None
-        self._thread = Thread(target=self._worker, daemon=True, name="xax-prefetch")
+        self._thread = Thread(target=self._worker, daemon=True, name="xax-streaming")
         self._thread.start()
 
     def _worker(self) -> None:
         """Background worker that loads and prepares batches."""
         try:
-            for sample in self._ds_iter:
-                if self._stop_event.is_set():
-                    break
-                # Convert TF tensors to numpy arrays
-                sample = jax.tree.map(lambda x: x.numpy() if isinstance(x, tf.Tensor) else x, sample)
-                # Transfer to device(s) with specified sharding
-                sample = jax.device_put(sample, self._sharding)
-                self._queue.put(sample)
+            rng = random.Random(self._seed)
+            batch_order = list(range(self._num_batches))
+
+            while True:  # Infinite repeat
+                rng.shuffle(batch_order)
+
+                for batch_idx in batch_order:
+                    if self._stop_event.is_set():
+                        return
+                    # Slice from pre-batched contiguous array (very fast)
+                    batch = {col: self._batched_data[col][batch_idx] for col in self._batched_data}
+                    # Transfer to device
+                    batch = jax.device_put(batch, self._sharding)
+                    self._queue.put(batch)
         except BaseException as e:
-            # Store error to be raised in main thread
             self._queue.put(e)
         finally:
-            # Signal end of iteration
             self._queue.put(None)
 
-    def __iter__(self) -> "PrefetchIterator":
+    def __iter__(self) -> "StreamingBatchIterator":
         return self
 
     def __next__(self) -> Batch:
@@ -94,9 +131,9 @@ class PrefetchIterator(Iterator[Batch]):
             raise self._error
 
         try:
-            item = self._queue.get(timeout=60.0)  # Timeout to prevent infinite hangs
+            item = self._queue.get(timeout=60.0)
         except Empty:
-            raise RuntimeError("Prefetch queue timed out waiting for data") from None
+            raise RuntimeError("Streaming iterator timed out waiting for data") from None
 
         if item is None:
             raise StopIteration
@@ -109,7 +146,6 @@ class PrefetchIterator(Iterator[Batch]):
     def close(self) -> None:
         """Stop the background thread and clean up resources."""
         self._stop_event.set()
-        # Drain the queue to unblock the worker if it's waiting on put()
         while True:
             try:
                 self._queue.get_nowait()
@@ -122,35 +158,7 @@ class PrefetchIterator(Iterator[Batch]):
         try:
             self.close()
         except Exception:
-            pass  # Suppress errors during interpreter shutdown
-
-
-def iter_samples(ds: tf.data.Dataset, sharding: NamedSharding, prefetch_size: int = 1) -> Iterator[Batch]:
-    """Iterate over a TensorFlow dataset, yielding batches on JAX devices.
-
-    Args:
-        ds: TensorFlow dataset to iterate over.
-        sharding: JAX sharding specification for device placement.
-        prefetch_size: Number of batches to prefetch in a background thread.
-            If 1, uses simple single-threaded iteration. If > 1, uses a
-            background thread to overlap data loading with GPU compute.
-
-    Yields:
-        Batches transferred to the specified JAX devices.
-    """
-    if prefetch_size > 1:
-        yield from PrefetchIterator(ds, sharding, prefetch_size)
-    else:
-        # Simple single-threaded implementation with 1-sample lookahead
-        next_sample = None
-        for sample in ds:
-            sample = jax.tree.map(lambda x: x.numpy() if isinstance(x, tf.Tensor) else x, sample)
-            if next_sample is None:
-                next_sample = jax.device_put(sample, sharding)
-                continue
-            sample = jax.device_put(sample, sharding)
-            yield next_sample
-            next_sample = sample
+            pass
 
 
 class InMemoryBatchIterator(Iterator[Batch]):
@@ -200,6 +208,32 @@ class InMemoryBatchIterator(Iterator[Batch]):
 
         return batch
 
+    def get_stacked_batches(self, n: int) -> Batch:
+        """Get n batches pre-stacked into a single array.
+
+        This is more efficient than calling __next__ n times and stacking,
+        as it uses a single gather operation.
+
+        Args:
+            n: Number of batches to get.
+
+        Returns:
+            PyTree with shape (n, batch_size, ...).
+        """
+        if self._current_idx + n > self._num_batches:
+            # Reshuffle for next epoch
+            self._key, subkey = jax.random.split(self._key)
+            self._batch_order = jax.random.permutation(subkey, self._num_batches)
+            self._current_idx = 0
+
+        # Get indices for n batches
+        indices = self._batch_order[self._current_idx : self._current_idx + n]
+        self._current_idx += n
+
+        # Single gather operation for all batches
+        stacked = jax.tree.map(lambda x: x[indices], self._data)
+        return stacked
+
 
 def load_dataset_in_memory(ds: Dataset, batch_size: int, sharding: NamedSharding) -> Batch:
     """Load a HuggingFace Dataset entirely into JAX arrays, pre-batched and pre-sharded.
@@ -241,8 +275,14 @@ def load_dataset_in_memory(ds: Dataset, batch_size: int, sharding: NamedSharding
 
     batched_data = {key: reshape_to_batches(arr) for key, arr in data.items()}
 
-    batched_sharding = NamedSharding(sharding.mesh, P(None, "batch"))
-    batched_data = jax.device_put(batched_data, batched_sharding)
+    # For single device, just put on device without sharding
+    # For multi-device, apply proper sharding
+    num_devices = len(sharding.mesh.devices.flat)
+    if num_devices == 1:
+        batched_data = jax.device_put(batched_data)
+    else:
+        batched_sharding = NamedSharding(sharding.mesh, P(None, "batch"))
+        batched_data = jax.device_put(batched_data, batched_sharding)
 
     logger.info(
         "Loaded dataset into memory: %d samples -> %d batches of %d",
@@ -270,36 +310,51 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
         return self.get_batch_size()
 
     @abstractmethod
-    def get_dataset(self) -> DatasetDict | Dataset | IterableDatasetDict | IterableDataset | tf.data.Dataset:
+    def get_dataset(self) -> DatasetDict | Dataset | IterableDatasetDict | IterableDataset:
         """Returns the dataset.
 
         Returns:
             The dataset to train on.
         """
 
-    def get_tf_dataset(self) -> tf.data.Dataset:
+    def get_streaming_iterator(self, sharding: NamedSharding) -> StreamingBatchIterator:
+        """Get an iterator that streams batches from the dataset.
+
+        This method creates a streaming iterator that loads batches in a
+        background thread with shuffling and prefetching. Use this for
+        datasets that are too large to fit in memory.
+
+        Args:
+            sharding: JAX sharding specification for device placement.
+
+        Returns:
+            Iterator that yields batches from the dataset.
+        """
         ds = self.get_dataset()
 
-        if isinstance(ds, tf.data.Dataset):
-            ds = ds.batch(self.batch_size, drop_remainder=True)
-            ds = ds.repeat(None)
-            ds = ds.prefetch(buffer_size=tf.data.AUTOTUNE)
-            return ds
-
-        if isinstance(ds, Dataset):
-            tfds = ds.to_tf_dataset(
-                batch_size=self.batch_size,
-                shuffle=True,
-                drop_remainder=True,
-                prefetch=True,
+        if isinstance(ds, (IterableDataset, IterableDatasetDict)):
+            raise NotImplementedError(
+                "IterableDataset streaming is not yet implemented. "
+                "Use a regular Dataset or set load_in_memory=True."
             )
-            tfds = tfds.repeat(None)
-            return tfds
 
-        if isinstance(ds, IterableDataset):
-            raise NotImplementedError("IterableDataset is not implemented yet")
+        if isinstance(ds, DatasetDict):
+            # Use the train split if available, otherwise first split
+            if "train" in ds:
+                ds = ds["train"]
+            else:
+                ds = ds[list(ds.keys())[0]]
 
-        raise NotImplementedError(f"Unsupported dataset type: {type(ds)}")
+        if not isinstance(ds, Dataset):
+            raise NotImplementedError(f"Unsupported dataset type: {type(ds)}")
+
+        return StreamingBatchIterator(
+            ds=ds,
+            batch_size=self.batch_size,
+            sharding=sharding,
+            prefetch_size=self.config.prefetch_buffer_size,
+            seed=self.config.shuffle_seed,
+        )
 
     def get_in_memory_iterator(self, sharding: NamedSharding, key: PRNGKeyArray) -> InMemoryBatchIterator:
         """Load dataset into device memory and return an iterator.
@@ -322,11 +377,12 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
                 "Cannot load streaming/iterable datasets into memory. Set load_in_memory=False for streaming datasets."
             )
 
-        if isinstance(ds, tf.data.Dataset):
-            raise ValueError(
-                "Cannot load tf.data.Dataset into memory directly. "
-                "Return a HuggingFace Dataset from get_dataset() instead."
-            )
+        if isinstance(ds, DatasetDict):
+            # Use the train split if available, otherwise first split
+            if "train" in ds:
+                ds = ds["train"]
+            else:
+                ds = ds[list(ds.keys())[0]]
 
         if not isinstance(ds, Dataset):
             raise NotImplementedError(f"Unsupported dataset type for in-memory loading: {type(ds)}")

@@ -28,7 +28,7 @@ from xax.core.conf import field
 from xax.core.state import Batch, Output, State
 from xax.nn.parallel import is_master
 from xax.task.logger import Metric, Scalar
-from xax.task.mixins.data_loader import iter_samples
+from xax.task.mixins.data_loader import InMemoryBatchIterator
 from xax.task.mixins.train import InitParams, Optimizer, TrainConfig, TrainMixin
 from xax.utils.experiments import ContextTimer
 from xax.utils.jax import jit as xax_jit, scan as xax_scan
@@ -190,11 +190,27 @@ class SupervisedMixin(
         model_static: PyTree,
         optimizer: optax.GradientTransformation,
         opt_state: optax.OptState,
-        batches: tuple[Batch, ...],
+        batches_stacked: Batch,
         state: State,
         heavy: bool,
         key: PRNGKeyArray,
     ) -> tuple[PyTree, optax.OptState, FrozenDict[str, Metric], State]:
+        """Run a training step on stacked batches.
+
+        Args:
+            model_arr: The model array.
+            model_static: The model static parameters.
+            optimizer: The optimizer.
+            opt_state: The optimizer state.
+            batches_stacked: Pre-stacked batches with shape (num_batches, batch_size, ...).
+            state: The training state.
+            heavy: Whether to log heavy metrics.
+            key: The PRNG key.
+
+        Returns:
+            The updated model array, optimizer state, metrics and state.
+        """
+
         @xax_jit(donate_argnames=["carry"])
         def update_fn(
             carry: tuple[PyTree, optax.OptState, State, PRNGKeyArray],
@@ -211,12 +227,9 @@ class SupervisedMixin(
                 key,
             )
             state = state.replace(
-                num_steps=state.num_steps + 1,
                 num_samples=state.num_samples + (self.get_size_of_batch(batch) or 0),
             )
             return (model_arr, opt_state, state, key), (output, loss, grad_norm)
-
-        batches_stacked = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *batches)
 
         @xax_jit(donate_argnames=["carry"])
         def update_batch_fn(
@@ -242,8 +255,11 @@ class SupervisedMixin(
             jit_level=3,
         )
 
+        # Increment step count once per train_step call (not per batch).
+        state = state.replace(num_steps=state.num_steps + 1)
+
         # Compute metrics for the final batch and output.
-        batch = batches[-1]
+        batch = jax.tree.map(lambda x: x[-1], batches_stacked)
         output = jax.tree.map(lambda x: x[-1, -1], output)
 
         model = eqx.combine(model_arr, model_static)
@@ -287,10 +303,20 @@ class SupervisedMixin(
         # when the Slurm job gets preempted.
         self.add_signal_handler(save_checkpoint, signal.SIGUSR1, signal.SIGTERM)
 
+        # Check if iterator supports efficient batch stacking
+        use_stacked_iterator = isinstance(ds, InMemoryBatchIterator)
+
         while not self.is_training_over(state):
             with ContextTimer() as timer:
                 self.on_step_start()
-                batches = tuple(itertools.islice(ds, self.config.batches_per_step))
+
+                # Get stacked batches - use optimized path for in-memory iterators
+                if use_stacked_iterator:
+                    batches_stacked = ds.get_stacked_batches(self.config.batches_per_step)
+                else:
+                    batches = tuple(itertools.islice(ds, self.config.batches_per_step))
+                    batches_stacked = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *batches)
+
                 state, heavy_arr = self.get_log_mode(state)
                 heavy = heavy_arr.item()
                 step_key, key = jax.random.split(key)
@@ -299,7 +325,7 @@ class SupervisedMixin(
                     model_static=model_static,
                     optimizer=optimizer,
                     opt_state=opt_state,
-                    batches=batches,
+                    batches_stacked=batches_stacked,
                     state=state,
                     heavy=heavy,
                     key=step_key,
@@ -373,8 +399,7 @@ class SupervisedMixin(
                 if self.config.load_in_memory:
                     ds: Iterator[Batch] = self.get_in_memory_iterator(data_sharding, key)
                 else:
-                    tf_ds = self.get_tf_dataset()
-                    ds = iter_samples(tf_ds, data_sharding, prefetch_size=self.config.prefetch_buffer_size)
+                    ds = self.get_streaming_iterator(data_sharding)
 
                 state = self.train_loop(
                     models=models,
