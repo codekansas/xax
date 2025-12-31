@@ -511,7 +511,9 @@ class CrossAttentionBlock(eqx.Module):
         return x.reshape(seq_len, -1)
 
     def init_cache(
-        self, kv_sn: Array, fp8_scales: Fp8ScalesCache | None = None
+        self,
+        kv_sn: Array,
+        fp8_scales: Fp8ScalesCache | None = None,
     ) -> tuple[AttentionCache, Fp8ScalesCache | None]:
         """Initialize cache for the input.
 
@@ -1053,15 +1055,9 @@ class Transformer(eqx.Module):
         Returns:
             The encoded representation and the updated cache
         """
-        # Token embedding
         x_embedded = jax.vmap(self.token_embedding)(x)
-
-        # Apply transformer stack
         x_embedded, updated_cache = self.layers.forward(x_embedded, mask=mask, cache=cache)
-
-        # Apply final layer norm
         output = jax.vmap(self.layer_norm)(x_embedded)
-
         return output, updated_cache
 
     def decode(
@@ -1085,23 +1081,15 @@ class Transformer(eqx.Module):
         Returns:
             The decoded representation and the updated cache
         """
-        # Token embedding for x
         x_embedded = jax.vmap(self.token_embedding)(x_t)
-
-        # Token embedding for context if needed
         context_embedded = jax.vmap(self.token_embedding)(context_s)
-
-        # Apply transformer stack with cross-attention
         x_embedded, updated_cache = self.layers.forward(
             x_embedded,
             context_sn=context_embedded,
             mask=mask,
             cache=cache,
         )
-
-        # Apply final layer norm
         output = jax.vmap(self.layer_norm)(x_embedded)
-
         return output, updated_cache
 
     def forward(
@@ -1123,13 +1111,9 @@ class Transformer(eqx.Module):
             The output representation and the updated cache
         """
         chex.assert_rank(x, 1)
-
         output, updated_cache = self.encode(x, mask=mask, cache=cache)
-
-        # Apply output layer if it exists
         if self.output_layer is not None:
             output, _ = _apply_linear_batched(self.output_layer, output)
-
         return output, updated_cache
 
     def predict_sequence(self, x_seq: Array) -> Array:
