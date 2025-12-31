@@ -67,11 +67,11 @@ def batch_chunks_schedule(schedule: list[int] | None) -> list[int] | None:
 
 
 @functools.lru_cache(maxsize=None)
-def batches_per_step_schedule(schedule: list[int] | None) -> list[int] | None:
+def gradient_accumulation_schedule(schedule: list[int] | None) -> list[int] | None:
     if schedule is None:
         return None
     if any(s < 1 for s in schedule):
-        raise ValueError("Batch chunk schedule must be positive")
+        raise ValueError("Gradient accumulation schedule must be positive")
     return list(itertools.accumulate([0] + schedule))
 
 

@@ -83,11 +83,8 @@ class MnistClassification(xax.SupervisedTask[Config]):
             key=params.key,
         )
 
-    def get_optimizer(self) -> optax.MultiSteps:
-        opt = optax.adam(self.config.learning_rate)
-
-        # Gradient accumulation.
-        return optax.MultiSteps(opt, every_k_schedule=8)
+    def get_optimizer(self) -> xax.Optimizer:
+        return optax.adam(self.config.learning_rate)
 
     def get_output(self, model: Model, batch: Batch, state: xax.State, key: PRNGKeyArray) -> Array:
         return jax.vmap(model)(batch["image"])
@@ -161,6 +158,6 @@ if __name__ == "__main__":
             log_heavy_every_n_seconds=120,
             # MNIST dataset is very small and this greatly improves throughput.
             load_in_memory=True,
-            batches_per_step=64,
+            gradient_accumulation_steps=64,
         ),
     )
