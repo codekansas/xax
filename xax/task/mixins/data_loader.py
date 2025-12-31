@@ -1,7 +1,6 @@
 """Defines a mixin for instantiating dataloaders."""
 
 import logging
-import random
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from queue import Empty, Queue
@@ -34,7 +33,6 @@ class DataloadersConfig(ProcessConfig, BaseConfig):
     load_in_memory: bool = field(False, help="Load entire dataset into device memory for maximum throughput")
     raise_dataloader_errors: bool = field(False, help="If set, raise dataloader errors inside the worker processes")
     dataset_workers: int = field(II("xax.num_workers:-1"), help="Number of workers for loading training samples")
-    shuffle_buffer_size: int = field(100, help="Size of the shuffle buffer")
     shuffle_seed: int = field(1337, help="Seed for the shuffle")
     debug_dataloader: bool = field(False, help="Debug dataloaders")
 
@@ -46,9 +44,8 @@ class StreamingBatchIterator(Iterator[Batch]):
     """Iterator that streams batches from a HuggingFace Dataset with prefetching.
 
     This iterator provides efficient data loading by:
-    - Pre-batching data into contiguous arrays for fast device transfer
-    - Shuffling batch order each epoch for randomization
-    - Repeating infinitely for training
+    - Using HuggingFace's optimized batch iteration (ds.iter)
+    - Shuffling dataset each epoch for randomization
     - Prefetching in a background thread to overlap with GPU compute
 
     Args:
@@ -64,36 +61,14 @@ class StreamingBatchIterator(Iterator[Batch]):
         ds: Dataset,
         batch_size: int,
         sharding: NamedSharding,
-        prefetch_size: int = 4,
+        prefetch_size: int = 16,
         seed: int = 1337,
     ) -> None:
+        self._ds = ds
         self._batch_size = batch_size
         self._sharding = sharding
         self._prefetch_size = prefetch_size
         self._seed = seed
-
-        # Pre-batch the data for efficient device transfer
-        # (contiguous memory layout makes device_put ~20x faster)
-        ds.set_format("numpy")
-        column_names = ds.column_names
-        data = {col: np.asarray(ds[col]) for col in column_names}
-        num_samples = len(ds)
-        self._num_batches = num_samples // batch_size
-
-        # Reshape to (num_batches, batch_size, ...)
-        self._batched_data = {
-            col: data[col][: self._num_batches * batch_size].reshape(
-                self._num_batches, batch_size, *data[col].shape[1:]
-            )
-            for col in column_names
-        }
-
-        logger.info(
-            "Prepared streaming iterator: %d samples -> %d batches of %d",
-            num_samples,
-            self._num_batches,
-            batch_size,
-        )
 
         self._queue: Queue[Batch | BaseException | None] = Queue(maxsize=prefetch_size)
         self._stop_event = Event()
@@ -104,20 +79,27 @@ class StreamingBatchIterator(Iterator[Batch]):
     def _worker(self) -> None:
         """Background worker that loads and prepares batches."""
         try:
-            rng = random.Random(self._seed)
-            batch_order = list(range(self._num_batches))
+            epoch = 0
 
             while True:  # Infinite repeat
-                rng.shuffle(batch_order)
+                # Shuffle dataset with different seed each epoch
+                shuffled_ds = self._ds.shuffle(seed=self._seed + epoch)
+                shuffled_ds.set_format("numpy")
 
-                for batch_idx in batch_order:
+                # Use HuggingFace's optimized batch iteration
+                for batch in shuffled_ds.iter(batch_size=self._batch_size, drop_last_batch=True):
                     if self._stop_event.is_set():
                         return
-                    # Slice from pre-batched contiguous array (very fast)
-                    batch = {col: self._batched_data[col][batch_idx] for col in self._batched_data}
+
+                    # Convert to numpy arrays (may already be numpy from set_format)
+                    batch = {col: np.asarray(batch[col]) for col in batch}
+
                     # Transfer to device
                     batch = jax.device_put(batch, self._sharding)
                     self._queue.put(batch)
+
+                epoch += 1
+
         except BaseException as e:
             self._queue.put(e)
         finally:
