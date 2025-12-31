@@ -156,8 +156,7 @@ if __name__ == "__main__":
         Config(
             batch_size=256,
             log_heavy_every_n_seconds=120,
-            # Perform a few updates per step, because otherwise we are sometimes
-            # bottlenecked by the data loader.
-            updates_per_step=8,
+            # MNIST dataset is very small and this greatly improves throughput.
+            load_in_memory=True,
         ),
     )

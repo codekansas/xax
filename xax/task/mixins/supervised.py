@@ -28,7 +28,7 @@ from xax.core.conf import field
 from xax.core.state import Batch, Output, State
 from xax.nn.parallel import is_master
 from xax.task.logger import Metric, Scalar
-from xax.task.mixins.data_loader import iter_samples
+from xax.task.mixins.data_loader import InMemoryBatchIterator, iter_samples
 from xax.task.mixins.train import InitParams, Optimizer, TrainConfig, TrainMixin
 from xax.utils.experiments import ContextTimer
 from xax.utils.jax import jit as xax_jit, scan as xax_scan
@@ -369,8 +369,12 @@ class SupervisedMixin(
             self.on_training_start()
 
             try:
-                ds = self.get_tf_dataset()
-                ds = iter_samples(ds, data_sharding)
+                # Choose data loading strategy based on config
+                if self.config.load_in_memory:
+                    ds: Iterator[Batch] = self.get_in_memory_iterator(data_sharding, key)
+                else:
+                    tf_ds = self.get_tf_dataset()
+                    ds = iter_samples(tf_ds, data_sharding, prefetch_size=self.config.prefetch_buffer_size)
 
                 state = self.train_loop(
                     models=models,
