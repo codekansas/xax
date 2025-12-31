@@ -1,12 +1,8 @@
 """Defines a mixin for running the supervised training loop."""
 
-import bdb
 import itertools
 import logging
 import signal
-import sys
-import textwrap
-import traceback
 from abc import ABC
 from dataclasses import dataclass
 from threading import Thread
@@ -35,7 +31,7 @@ from xax.utils.experiments import ContextTimer
 from xax.utils.jax import jit as xax_jit, scan as xax_scan
 from xax.utils.logging import LOG_PING
 from xax.utils.pytree import get_pytree_param_count
-from xax.utils.text import highlight_exception_message, show_info
+from xax.utils.text import show_info
 from xax.utils.types.frozen_dict import FrozenDict
 from xax.utils.types.training import TrainingState
 
@@ -389,24 +385,12 @@ class SupervisedMixin(
             ds = self.get_tf_dataset()
             ds = iter_samples(ds, data_sharding)
 
-            try:
-                self.train_loop(
-                    training_state=latest_state,
-                    optimizers=optimizers,
-                    ds=ds,
-                    key=key,
-                )
-
-            except (KeyboardInterrupt, bdb.BdbQuit):
-                if is_master():
-                    show_info("Interrupted training", important=True)
-                raise
-
-            except BaseException:
-                exception_tb = textwrap.indent(highlight_exception_message(traceback.format_exc()), "  ")
-                sys.stdout.write(f"Caught exception during training loop:\n\n{exception_tb}\n")
-                sys.stdout.flush()
-                raise
+            self.train_loop(
+                training_state=latest_state,
+                optimizers=optimizers,
+                ds=ds,
+                key=key,
+            )
 
             if is_master():
                 num_steps, num_samples = int(latest_state.state.num_steps), int(latest_state.state.num_samples)
