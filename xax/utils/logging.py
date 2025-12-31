@@ -200,6 +200,8 @@ def configure_logging(
 
     # Avoid junk logs from other libraries.
     if config.hide_third_party_logs:
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("jax").setLevel(logging.WARNING)
         logging.getLogger("matplotlib").setLevel(logging.WARNING)
         logging.getLogger("PIL").setLevel(logging.WARNING)
         logging.getLogger("torch").setLevel(logging.WARNING)

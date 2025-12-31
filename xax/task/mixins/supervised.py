@@ -31,15 +31,13 @@ from xax.nn.parallel import is_master
 from xax.task.logger import Metric, Scalar
 from xax.task.mixins.data_loader import iter_samples
 from xax.task.mixins.train import InitParams, Optimizer, TrainConfig, TrainMixin
-from xax.utils.experiments import (
-    ContextTimer,
-    TrainingFinishedError,
-)
+from xax.utils.experiments import ContextTimer
 from xax.utils.jax import jit as xax_jit, scan as xax_scan
 from xax.utils.logging import LOG_PING
 from xax.utils.pytree import get_pytree_param_count
 from xax.utils.text import highlight_exception_message, show_info
 from xax.utils.types.frozen_dict import FrozenDict
+from xax.utils.types.training import TrainingState
 
 logger = logging.getLogger(__name__)
 
@@ -261,13 +259,15 @@ class SupervisedMixin(
 
     def train_loop(
         self,
-        models: Sequence[PyTree],
+        training_state: TrainingState,
         optimizers: Sequence[Optimizer],
-        opt_states: Sequence[optax.OptState],
         ds: Iterator[Batch],
-        state: State,
         key: PRNGKeyArray,
     ) -> None:
+        models = training_state.models
+        opt_states = training_state.opt_states
+        state = training_state.state
+
         if len(models) != 1 or len(optimizers) != 1 or len(opt_states) != 1:
             raise ValueError(
                 "Vanilla training expects a single model, optimizer and optimizer state. "
@@ -300,25 +300,30 @@ class SupervisedMixin(
 
             state = state.replace(elapsed_time_s=state.elapsed_time_s + timer.elapsed_time)
 
+            # Update the state dataclass so that the calling function can
+            # access it in the event of an exception.
+            model = eqx.combine(model_arr, model_static)
+            training_state.models[0] = model
+            training_state.opt_states[0] = opt_state
+            training_state.state = state
+
             if state.num_steps <= 3:
                 logger.log(LOG_PING, "Step %d took %.2f second", state.num_steps, timer.elapsed_time)
 
             if self.should_checkpoint(state):
-                model = eqx.combine(model_arr, model_static)
                 self.save_checkpoint(
-                    models=[model],
-                    optimizers=[optimizer],
-                    opt_states=[opt_state],
-                    state=state,
+                    models=training_state.models,
+                    optimizers=optimizers,
+                    opt_states=training_state.opt_states,
+                    state=training_state.state,
                 )
 
         # After finishing training, save the final checkpoint.
-        model = eqx.combine(model_arr, model_static)
         self.save_checkpoint(
-            models=[model],
-            optimizers=[optimizer],
-            opt_states=[opt_state],
-            state=state,
+            models=training_state.models,
+            optimizers=optimizers,
+            opt_states=training_state.opt_states,
+            state=training_state.state,
         )
 
     def run(self) -> None:
@@ -361,13 +366,25 @@ class SupervisedMixin(
                 load_optimizer=True,
                 model_sharding=model_sharding,
             )
+
+            # Replicate state and optimizer states across all devices.
+            state = jax.tree.map(lambda x: jax.device_put(x, model_sharding), state)
+            opt_states = jax.tree.map(lambda x: jax.device_put(x, model_sharding), opt_states)
+
             logger.info("Model size: %s", f"{get_pytree_param_count(models):,}")
             logger.info("Optimizer size: %s", f"{get_pytree_param_count(opt_states):,}")
 
             self.on_training_start()
 
+            latest_state = TrainingState(models, opt_states, state)
+
             def on_exit() -> None:
-                self.save_checkpoint(models=models, optimizers=optimizers, opt_states=opt_states, state=state)
+                self.save_checkpoint(
+                    models=latest_state.models,
+                    optimizers=optimizers,
+                    opt_states=latest_state.opt_states,
+                    state=latest_state.state,
+                )
 
             # Handle user-defined interrupts during the training loop.
             self.add_signal_handler(on_exit, signal.SIGUSR1, signal.SIGTERM)
@@ -375,32 +392,37 @@ class SupervisedMixin(
             ds = self.get_tf_dataset()
             ds = iter_samples(ds, data_sharding)
 
+            # Replicate the key across all devices.
+            key = jax.device_put(key, model_sharding)
+
             try:
                 self.train_loop(
-                    models=models,
+                    training_state=latest_state,
                     optimizers=optimizers,
-                    opt_states=opt_states,
                     ds=ds,
-                    state=state,
                     key=key,
                 )
-
-            except TrainingFinishedError:
-                if is_master():
-                    num_steps, num_samples = int(state.num_steps), int(state.num_samples)
-                    show_info(f"Finished training after {num_steps} steps, {num_samples} samples", important=True)
-                self.save_checkpoint(models=models, optimizers=optimizers, opt_states=opt_states, state=state)
 
             except (KeyboardInterrupt, bdb.BdbQuit):
                 if is_master():
                     show_info("Interrupted training", important=True)
+                raise
 
             except BaseException:
                 exception_tb = textwrap.indent(highlight_exception_message(traceback.format_exc()), "  ")
                 sys.stdout.write(f"Caught exception during training loop:\n\n{exception_tb}\n")
                 sys.stdout.flush()
-                self.save_checkpoint(models=models, optimizers=optimizers, opt_states=opt_states, state=state)
                 raise
 
-            finally:
-                self.on_training_end()
+            if is_master():
+                num_steps, num_samples = int(latest_state.state.num_steps), int(latest_state.state.num_samples)
+                show_info(f"Finished training after {num_steps} steps, {num_samples} samples", important=True)
+
+            self.save_checkpoint(
+                models=latest_state.models,
+                optimizers=optimizers,
+                opt_states=latest_state.opt_states,
+                state=latest_state.state,
+            )
+
+            self.on_training_end()
