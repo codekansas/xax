@@ -310,6 +310,8 @@ class GPUStatsMixin(ProcessMixin[Config], LoggerMixin[Config], Generic[Config]):
             self.logger.log_scalar(f"sm/{gpu_stat.index}", gpu_stat.sm_util, namespace="🔧 gpu", secondary=True)
             self.logger.log_scalar(f"bw/{gpu_stat.index}", gpu_stat.mem_bw_util, namespace="🔧 gpu", secondary=True)
             self.logger.log_scalar(f"enc/{gpu_stat.index}", gpu_stat.enc_util, namespace="🔧 gpu", secondary=True)
-            self.logger.log_scalar(f"dec/{gpu_stat.index}", gpu_stat.dec_util, namespace="🔧 gpu", secondary=True)
+            # Never used during training in practice.
+            # self.logger.log_scalar(f"dec/{gpu_stat.index}", gpu_stat.dec_util, namespace="🔧 gpu", secondary=True)
             self.logger.log_scalar(f"jpg/{gpu_stat.index}", gpu_stat.jpg_util, namespace="🔧 gpu", secondary=True)
-            self.logger.log_scalar(f"ofa/{gpu_stat.index}", gpu_stat.ofa_util, namespace="🔧 gpu", secondary=True)
+            # Never used during training in practice.
+            # self.logger.log_scalar(f"ofa/{gpu_stat.index}", gpu_stat.ofa_util, namespace="🔧 gpu", secondary=True)
