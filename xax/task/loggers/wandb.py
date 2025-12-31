@@ -1,4 +1,3 @@
-# mypy: disable-error-code="import-not-found"
 """Defines a Weights & Biases logger backend."""
 
 import logging

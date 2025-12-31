@@ -39,7 +39,8 @@ def profile(fn: Callable[P, R]) -> Callable[P, R]:
         ProfileState.total_time += runtime
 
         # Handle class methods by showing class name
-        if fn.__name__ == "__call__" or (args and hasattr(args[0], "__class__")):
+        fn_name = getattr(fn, "__name__", "<unknown>")
+        if fn_name == "__call__" or (args and hasattr(args[0], "__class__")):
             try:
                 class_name = args[0].__class__.__name__ + "."
             except (IndexError, AttributeError):
@@ -50,7 +51,7 @@ def profile(fn: Callable[P, R]) -> Callable[P, R]:
         logger.info(
             "%s %s - call #%s, took %s seconds, total: %s seconds",
             class_name,
-            fn.__name__,
+            fn_name,
             ProfileState.call_count,
             runtime,
             ProfileState.total_time,

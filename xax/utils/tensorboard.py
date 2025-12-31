@@ -30,7 +30,7 @@ from tensorboard.summary.writer.event_file_writer import EventFileWriter
 ImageShape = Literal["HWC", "CHW", "HW", "NHWC", "NCHW", "NHW"]
 
 
-def make_histogram(values: np.ndarray, bins: str | np.ndarray, max_bins: int | None = None) -> HistogramProto:
+def make_histogram(values: np.ndarray, bins: str | np.ndarray, max_bins: int | None = None) -> "HistogramProto":  # type: ignore[valid-type]
     """Convert values into a histogram proto using logic from histogram.cc.
 
     Args:
@@ -104,20 +104,20 @@ def make_mesh_summary(
     config_dict: dict[str, Any] | None,
     display_name: str | None = None,
     description: str | None = None,
-) -> Summary:
+) -> "Summary":  # type: ignore[valid-type]
     json_config = _get_json_config(config_dict)
 
     summaries = []
     tensors = [
-        (vertices, MeshPluginData.VERTEX),
-        (faces, MeshPluginData.FACE),
-        (colors, MeshPluginData.COLOR),
+        (vertices, MeshPluginData.VERTEX),  # type: ignore[attr-defined]
+        (faces, MeshPluginData.FACE),  # type: ignore[attr-defined]
+        (colors, MeshPluginData.COLOR),  # type: ignore[attr-defined]
     ]
     # Filter out None tensors and explicitly type the list
     valid_tensors = [(t, content_type) for t, content_type in tensors if t is not None]
     components = mesh_metadata.get_components_bitmask([content_type for (_, content_type) in valid_tensors])
 
-    for tensor, content_type in valid_tensors:  # Now we know tensor is not None
+    for tensor, content_type in valid_tensors:
         tensor_metadata = mesh_metadata.create_summary_metadata(
             tag,
             display_name,
@@ -133,14 +133,14 @@ def make_mesh_summary(
             float_val=tensor.reshape(-1).tolist(),  # Safe now since tensor is not None
             tensor_shape=TensorShapeProto(
                 dim=[
-                    TensorShapeProto.Dim(size=tensor.shape[0]),  # Safe now since tensor is not None
-                    TensorShapeProto.Dim(size=tensor.shape[1]),
-                    TensorShapeProto.Dim(size=tensor.shape[2]),
+                    TensorShapeProto.Dim(size=tensor.shape[0]),  # type: ignore[attr-defined]
+                    TensorShapeProto.Dim(size=tensor.shape[1]),  # type: ignore[attr-defined]
+                    TensorShapeProto.Dim(size=tensor.shape[2]),  # type: ignore[attr-defined]
                 ]
             ),
         )
 
-        tensor_summary = Summary.Value(
+        tensor_summary = Summary.Value(  # type: ignore[attr-defined]
             tag=mesh_metadata.get_instance_name(tag, content_type),
             tensor=tensor_proto,
             metadata=tensor_metadata,
@@ -177,7 +177,7 @@ class TensorboardProtobufWriter:
 
     def add_event(
         self,
-        event: Event,
+        event: "Event",  # type: ignore[valid-type]
         step: int | None = None,
         walltime: float | None = None,
     ) -> None:
@@ -188,7 +188,7 @@ class TensorboardProtobufWriter:
 
     def add_summary(
         self,
-        summary: Summary,
+        summary: "Summary",  # type: ignore[valid-type]
         global_step: int | None = None,
         walltime: float | None = None,
     ) -> None:
@@ -197,8 +197,8 @@ class TensorboardProtobufWriter:
 
     def add_graph(
         self,
-        graph: GraphDef,
-        run_metadata: RunMetadata | None = None,
+        graph: "GraphDef",  # type: ignore[valid-type]
+        run_metadata: "RunMetadata | None" = None,  # type: ignore[valid-type]
         walltime: float | None = None,
     ) -> None:
         event = Event(graph_def=graph.SerializeToString())
@@ -254,7 +254,7 @@ class TensorboardWriter:
             self.pb_writer.add_summary(
                 Summary(
                     value=[
-                        Summary.Value(
+                        Summary.Value(  # type: ignore[attr-defined]
                             tag=tag,
                             tensor=(
                                 TensorProto(double_val=[value], dtype="DT_DOUBLE")
@@ -262,7 +262,7 @@ class TensorboardWriter:
                                 else TensorProto(float_val=[value], dtype="DT_FLOAT")
                             ),
                             metadata=SummaryMetadata(
-                                plugin_data=SummaryMetadata.PluginData(
+                                plugin_data=SummaryMetadata.PluginData(  # type: ignore[attr-defined]
                                     plugin_name="scalars",
                                 ),
                             ),
@@ -276,7 +276,7 @@ class TensorboardWriter:
             self.pb_writer.add_summary(
                 Summary(
                     value=[
-                        Summary.Value(
+                        Summary.Value(  # type: ignore[attr-defined]
                             tag=tag,
                             simple_value=value,
                         ),
@@ -301,9 +301,9 @@ class TensorboardWriter:
         self.pb_writer.add_summary(
             Summary(
                 value=[
-                    Summary.Value(
+                    Summary.Value(  # type: ignore[attr-defined]
                         tag=tag,
-                        image=Summary.Image(
+                        image=Summary.Image(  # type: ignore[attr-defined]
                             height=value.height,
                             width=value.width,
                             colorspace=3,  # RGB
@@ -373,9 +373,9 @@ class TensorboardWriter:
         self.pb_writer.add_summary(
             Summary(
                 value=[
-                    Summary.Value(
+                    Summary.Value(  # type: ignore[attr-defined]
                         tag=tag,
-                        image=Summary.Image(
+                        image=Summary.Image(  # type: ignore[attr-defined]
                             height=value.shape[1],
                             width=value.shape[2],
                             colorspace=value.shape[3],
@@ -398,17 +398,17 @@ class TensorboardWriter:
         self.pb_writer.add_summary(
             Summary(
                 value=[
-                    Summary.Value(
+                    Summary.Value(  # type: ignore[attr-defined]
                         tag=tag + "/text_summary",
                         metadata=SummaryMetadata(
-                            plugin_data=SummaryMetadata.PluginData(
+                            plugin_data=SummaryMetadata.PluginData(  # type: ignore[attr-defined]
                                 plugin_name="text", content=TextPluginData(version=0).SerializeToString()
                             ),
                         ),
                         tensor=TensorProto(
                             dtype="DT_STRING",
                             string_val=[value.encode(encoding="utf_8")],
-                            tensor_shape=TensorShapeProto(dim=[TensorShapeProto.Dim(size=1)]),
+                            tensor_shape=TensorShapeProto(dim=[TensorShapeProto.Dim(size=1)]),  # type: ignore[attr-defined]
                         ),
                     ),
                 ],
@@ -428,7 +428,7 @@ class TensorboardWriter:
     ) -> None:
         hist = make_histogram(values.astype(float), bins, max_bins)
         self.pb_writer.add_summary(
-            Summary(value=[Summary.Value(tag=tag, histo=hist)]),
+            Summary(value=[Summary.Value(tag=tag, histo=hist)]),  # type: ignore[attr-defined]
             global_step=global_step,
             walltime=walltime,
         )
@@ -474,7 +474,7 @@ class TensorboardWriter:
             bucket=[int(x) for x in bucket_counts],
         )
         self.pb_writer.add_summary(
-            Summary(value=[Summary.Value(tag=tag, histo=hist)]),
+            Summary(value=[Summary.Value(tag=tag, histo=hist)]),  # type: ignore[attr-defined]
             global_step=global_step,
             walltime=walltime,
         )

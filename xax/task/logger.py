@@ -16,7 +16,7 @@ import re
 import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from types import TracebackType
 from typing import (
     Any,
@@ -38,6 +38,7 @@ from jaxtyping import Array
 from PIL import Image as PILImage, ImageDraw, ImageFont
 from PIL.Image import Image as PILImageType
 
+from xax.core.conf import field
 from xax.core.state import State
 from xax.utils.experiments import ContextTimer, IntervalTicker
 from xax.utils.logging import LOG_ERROR_SUMMARY, LOG_PING, LOG_STATUS, format_number
@@ -136,6 +137,7 @@ def ternary_search_optimal_side_counts(height: int, width: int, count: int) -> t
 
     lo, hi = 0, len(factors) - 1
 
+    # Attempts to make the tiled image as square as possible.
     def penalty(i: int) -> float:
         hval, wval = factors[i]
         h, w = hval * height, wval * width
@@ -234,7 +236,7 @@ def as_numpy_opt(array: Array | np.ndarray | None) -> np.ndarray | None:
 @dataclass(frozen=True)
 class Scalar:
     value: Array
-    secondary: bool = field(default=False)
+    secondary: bool = field(value=False)
 
 
 @jax.tree_util.register_dataclass
@@ -248,30 +250,30 @@ class Distribution:
 @dataclass(frozen=True)
 class Histogram:
     value: Array
-    bins: int = field(default=DEFAULT_HISTOGRAM_BINS)
+    bins: int = field(value=DEFAULT_HISTOGRAM_BINS)
 
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class Tokens:
     value: Array
-    secondary: bool = field(default=False)
+    secondary: bool = field(value=False)
 
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class Image:
     image: Array
-    target_resolution: tuple[int, int] = field(default=DEFAULT_IMAGE_RESOLUTION)
+    target_resolution: tuple[int, int] = field(value=DEFAULT_IMAGE_RESOLUTION)
 
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class Images:
     images: Array
-    max_images: int | None = field(default=None)
-    target_resolution: tuple[int, int] = field(default=DEFAULT_IMAGES_RESOLUTION)
-    sep: int = field(default=0)
+    max_images: int | None = field(value=None)
+    target_resolution: tuple[int, int] = field(value=DEFAULT_IMAGES_RESOLUTION)
+    sep: int = field(value=0)
 
 
 @jax.tree_util.register_dataclass
@@ -279,29 +281,29 @@ class Images:
 class LabeledImages:
     images: Array
     labels: Array | Mapping[str, Array]
-    max_images: int | None = field(default=None)
-    max_line_length: int | None = field(default=None)
-    max_num_lines: int | None = field(default=None)
-    target_resolution: tuple[int, int] = field(default=DEFAULT_IMAGE_RESOLUTION)
-    line_spacing: int = field(default=2)
-    centered: bool = field(default=True)
-    sep: int = field(default=0)
+    max_images: int | None = field(value=None)
+    max_line_length: int | None = field(value=None)
+    max_num_lines: int | None = field(value=None)
+    target_resolution: tuple[int, int] = field(value=DEFAULT_IMAGE_RESOLUTION)
+    line_spacing: int = field(value=2)
+    centered: bool = field(value=True)
+    sep: int = field(value=0)
 
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class Video:
     video: Array
-    fps: int = field(default=DEFAULT_VIDEO_FPS)
+    fps: int = field(value=DEFAULT_VIDEO_FPS)
 
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class Mesh:
     vertices: Array
-    colors: Array | None = field(default=None)
-    faces: Array | None = field(default=None)
-    config_dict: dict[str, Any] | None = field(default=None)
+    colors: Array | None = field(value=None, static=False)
+    faces: Array | None = field(value=None, static=False)
+    config_dict: dict[str, Any] | None = field(value=None)
 
 
 Metric = Scalar | Distribution | Histogram | Tokens | Image | Images | LabeledImages | Video | Mesh
@@ -1345,7 +1347,7 @@ class Logger:
             logger.start()
         return self
 
-    def __exit__(self, _t: type[BaseException] | None, _e: BaseException | None, _tr: TracebackType | None) -> None:
+    def __exit__(self, t: type[BaseException] | None, e: BaseException | None, tr: TracebackType | None) -> None:
         for logger in self.loggers:
             logger.stop()
         self.active = False

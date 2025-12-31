@@ -36,8 +36,8 @@ class StateDict(TypedDict, total=False):
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True, kw_only=True)
 class State:
-    _int32_arr: Array = field(MISSING, help="Internal array for storing int64 values")
-    _float32_arr: Array = field(MISSING, help="Internal array for storing floating-point values")
+    _int32_arr: Array = field(MISSING, static=False, help="Internal array for storing int64 values")
+    _float32_arr: Array = field(MISSING, static=False, help="Internal array for storing floating-point values")
 
     @property
     def num_steps(self) -> Array:
@@ -62,7 +62,7 @@ class State:
     @classmethod
     def init_state(cls) -> "State":
         return cls(
-            _int32_arr=jnp.array([0, 0], dtype=jnp.int32),
+            _int32_arr=jnp.array([0], dtype=jnp.int32),
             _float32_arr=jnp.array([0.0, time.time(), 0.0, 0.0], dtype=jnp.float32),
         )
 

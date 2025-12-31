@@ -1,4 +1,4 @@
-# mypy: disable-error-code="import-not-found"
+#!/usr/bin/env -S uv run --no-project --script
 """Trains a state space model on a character-level tokenized dataset of Shakespeare."""
 
 from dataclasses import dataclass
@@ -252,7 +252,7 @@ class ShakespearePrediction(xax.SupervisedTask[Config]):
             case _:
                 raise ValueError(f"Unknown model type: {self.config.model_type}")
 
-    def get_optimizer(self) -> optax.GradientTransformation:
+    def get_optimizer(self) -> xax.Optimizer:
         # Create learning rate schedule with warmup and cosine decay
         if self.config.max_steps is not None:
             # Warmup schedule
@@ -329,7 +329,6 @@ def _tokenize_with_tokenizer(examples: dict[str, str], tokenizer: Qwen2Tokenizer
 
 if __name__ == "__main__":
     # Launch the training task.
-    #   python -m examples.shakespeare
     ShakespearePrediction.launch(
         Config(
             batch_size=8,

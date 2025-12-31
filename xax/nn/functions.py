@@ -1,4 +1,3 @@
-# mypy: disable-error-code="override"
 """Defines helper Jax functions."""
 
 import random

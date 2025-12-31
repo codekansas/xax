@@ -1,0 +1,186 @@
+"""LoRA utilities for Equinox modules."""
+
+from typing import Any, Callable
+
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+import jax.random as jrandom
+from jaxtyping import Array, PRNGKeyArray
+
+
+class LoRALinear(eqx.Module):
+    """Linear layer augmented with a low-rank residual (LoRA).
+
+    The base weight and bias are treated as frozen parameters; only the low-rank
+    matrices ``lora_a_ir`` and ``lora_b_ro`` are updated during fine-tuning.
+    Scaling follows the convention ``alpha / rank``.
+    """
+
+    weight_oi: Array
+    bias_o: Array | None
+    lora_a_ir: Array
+    lora_b_ro: Array
+    scaling: float = eqx.field(static=True)
+    dropout_rate: float = eqx.field(static=True)
+
+    @classmethod
+    def from_linear(
+        cls,
+        linear: eqx.nn.Linear,
+        rank: int,
+        *,
+        alpha: float | None = None,
+        dropout_rate: float = 0.0,
+        key: PRNGKeyArray | None = None,
+    ) -> "LoRALinear":
+        """Create a LoRA-augmented linear layer from an ``eqx.nn.Linear``."""
+        if rank < 1:
+            raise ValueError("rank must be at least 1")
+        if alpha is None:
+            alpha = float(rank)
+        if key is None:
+            key = jrandom.key(0)
+
+        key_a, _ = jrandom.split(key)
+        in_features = int(linear.in_features)
+        out_features = int(linear.out_features)
+
+        lora_a_ir = jrandom.normal(key_a, (in_features, rank), dtype=linear.weight.dtype) / jnp.sqrt(float(in_features))
+        lora_b_ro = jnp.zeros((rank, out_features), dtype=linear.weight.dtype)
+
+        return cls(
+            weight_oi=jax.lax.stop_gradient(linear.weight),
+            bias_o=None if linear.bias is None else jax.lax.stop_gradient(linear.bias),
+            lora_a_ir=lora_a_ir,
+            lora_b_ro=lora_b_ro,
+            scaling=alpha / float(rank),
+            dropout_rate=dropout_rate,
+        )
+
+    def __call__(self, x_bi: Array, *, key: PRNGKeyArray | None = None, inference: bool = False) -> Array:
+        y_bo = x_bi @ self.weight_oi.T
+        if self.bias_o is not None:
+            y_bo = y_bo + self.bias_o
+
+        x_lora_bi = x_bi
+        if self.dropout_rate > 0.0 and not inference:
+            if key is None:
+                raise ValueError("LoRA dropout requires a PRNG key.")
+            keep_prob = 1.0 - self.dropout_rate
+            mask_bi = jrandom.bernoulli(key, keep_prob, x_bi.shape)
+            x_lora_bi = jnp.where(mask_bi, x_bi / keep_prob, 0.0)
+
+        delta_bo = (x_lora_bi @ self.lora_a_ir) @ self.lora_b_ro
+        return y_bo + delta_bo * self.scaling
+
+
+def loraize_linear(
+    linear: eqx.nn.Linear,
+    rank: int,
+    *,
+    alpha: float | None = None,
+    dropout_rate: float = 0.0,
+    key: PRNGKeyArray | None = None,
+) -> LoRALinear:
+    """Replace an Equinox linear layer with a ``LoRALinear``."""
+    return LoRALinear.from_linear(linear, rank, alpha=alpha, dropout_rate=dropout_rate, key=key)
+
+
+def loraize(
+    module: eqx.Module,
+    rank: int,
+    *,
+    alpha: float | None = None,
+    dropout_rate: float = 0.0,
+    predicate: Callable[[eqx.nn.Linear], bool] | None = None,
+    key: PRNGKeyArray | None = None,
+) -> eqx.Module:
+    """Recursively replace ``eqx.nn.Linear`` layers with ``LoRALinear``."""
+    if predicate is None:
+
+        def predicate(_: eqx.nn.Linear) -> bool:  # noqa: ARG001
+            return True
+
+    if key is None:
+        key = jrandom.key(0)
+
+    def convert(node: Any) -> Any:  # noqa: ANN001, ANN401
+        nonlocal key
+        if isinstance(node, eqx.nn.Linear) and predicate(node):
+            assert key is not None  # Checked above
+            key, init_key = jrandom.split(key)
+            return loraize_linear(node, rank, alpha=alpha, dropout_rate=dropout_rate, key=init_key)
+        return node
+
+    return jax.tree_util.tree_map(convert, module, is_leaf=lambda node: isinstance(node, eqx.nn.Linear))
+
+
+def lora_filter_spec(module: eqx.Module) -> eqx.Module:
+    """Build a filter spec marking only LoRA parameters as trainable."""
+
+    def _mark(model_node: Any, spec_node: Any) -> Any:  # noqa: ANN001, ANN401
+        if isinstance(model_node, LoRALinear):
+
+            def get_lora_a_ir(linear: LoRALinear) -> Array:
+                return linear.lora_a_ir
+
+            def get_lora_b_ro(linear: LoRALinear) -> Array:
+                return linear.lora_b_ro
+
+            spec_node = eqx.tree_at(get_lora_a_ir, spec_node, True)
+            spec_node = eqx.tree_at(get_lora_b_ro, spec_node, True)
+            return spec_node
+        if hasattr(model_node, "__dataclass_fields__"):
+            for fname in model_node.__dataclass_fields__:
+                child_model = getattr(model_node, fname)
+                child_spec = getattr(spec_node, fname)
+                updated_child = _mark(child_model, child_spec)
+
+                def make_get_field(field_name: str) -> Callable[[Any], Any]:  # noqa: ANN401
+                    def get_field(m: Any) -> Any:  # noqa: ANN001, ANN401
+                        return getattr(m, field_name)
+
+                    return get_field
+
+                spec_node = eqx.tree_at(make_get_field(fname), spec_node, updated_child)
+            return spec_node
+        if isinstance(model_node, list):
+            return [_mark(m, s) for m, s in zip(model_node, spec_node, strict=False)]
+        if isinstance(model_node, tuple):
+            return tuple(_mark(m, s) for m, s in zip(model_node, spec_node, strict=False))
+        if isinstance(model_node, dict):
+            return {k: _mark(model_node[k], spec_node[k]) for k in model_node}
+        return spec_node
+
+    spec = jax.tree_util.tree_map(lambda _: False, module)
+    return _mark(module, spec)
+
+
+def merge_lora(module: eqx.Module) -> eqx.Module:
+    """Merge LoRA weights back into standard ``eqx.nn.Linear`` layers."""
+
+    def convert(node: Any) -> Any:  # noqa: ANN001, ANN401
+        if isinstance(node, LoRALinear):
+            delta_oi = (node.lora_a_ir @ node.lora_b_ro).T * node.scaling
+            merged_weight_oi = node.weight_oi + delta_oi
+            merged = eqx.nn.Linear(
+                in_features=node.weight_oi.shape[1],
+                out_features=node.weight_oi.shape[0],
+                use_bias=node.bias_o is not None,
+                key=jrandom.key(0),
+            )
+
+            def get_weight(linear: eqx.nn.Linear) -> Array:
+                return linear.weight
+
+            def get_bias(linear: eqx.nn.Linear) -> Array | None:
+                return linear.bias
+
+            merged = eqx.tree_at(get_weight, merged, merged_weight_oi)
+            if node.bias_o is not None:
+                merged = eqx.tree_at(get_bias, merged, node.bias_o)
+            return merged
+        return node
+
+    return jax.tree_util.tree_map(convert, module, is_leaf=lambda node: isinstance(node, LoRALinear))

@@ -1,12 +1,8 @@
 """Defines a mixin for running the supervised training loop."""
 
-import bdb
 import itertools
 import logging
 import signal
-import sys
-import textwrap
-import traceback
 from abc import ABC
 from dataclasses import dataclass
 from threading import Thread
@@ -15,6 +11,7 @@ from typing import (
     Iterator,
     Sequence,
     TypeVar,
+    cast,
 )
 
 import equinox as eqx
@@ -29,16 +26,14 @@ from xax.core.state import Batch, Output, State
 from xax.nn.parallel import is_master
 from xax.task.logger import Metric, Scalar
 from xax.task.mixins.data_loader import iter_samples
-from xax.task.mixins.train import InitParams, TrainConfig, TrainMixin
-from xax.utils.experiments import (
-    ContextTimer,
-    TrainingFinishedError,
-)
+from xax.task.mixins.train import InitParams, Optimizer, TrainConfig, TrainMixin
+from xax.utils.experiments import ContextTimer
 from xax.utils.jax import jit as xax_jit, scan as xax_scan
 from xax.utils.logging import LOG_PING
 from xax.utils.pytree import get_pytree_param_count
-from xax.utils.text import highlight_exception_message, show_info
+from xax.utils.text import show_info
 from xax.utils.types.frozen_dict import FrozenDict
+from xax.utils.types.training import TrainingState
 
 logger = logging.getLogger(__name__)
 
@@ -154,16 +149,18 @@ class SupervisedMixin(
     ) -> tuple[PyTree, optax.OptState, Output, Array, Array]:
         grad_fn = jax.grad(self.get_output_and_loss, argnums=0, has_aux=True)
         grad_fn = xax_jit(static_argnums=[1], jit_level=3)(grad_fn)
-        grads, (loss, output) = grad_fn(model_arr, model_static, batch, state, key)
+        grads, aux = grad_fn(model_arr, model_static, batch, state, key)
+        loss, output = cast(tuple[Array, Output], aux)
         grad_norm = optax.global_norm(grads)
         if self.config.max_grad_norm is not None:
             clip_fn = optax.clip_by_global_norm(self.config.max_grad_norm)
-            grads, _ = clip_fn.update(grads, None)
+            clip_state = clip_fn.init(grads)  # Fine since this function is init_empty_state
+            grads, _ = clip_fn.update(grads, clip_state)
 
         updates, opt_state = optimizer.update(grads, opt_state, model_arr)
         model_arr = eqx.apply_updates(model_arr, updates)
 
-        return model_arr, opt_state, output, loss, grad_norm
+        return model_arr, opt_state, output, loss, grad_norm  # type: ignore[return-value]
 
     def decode_tokens(self, tokens: Array) -> str:
         raise NotImplementedError(
@@ -258,13 +255,15 @@ class SupervisedMixin(
 
     def train_loop(
         self,
-        models: Sequence[PyTree],
-        optimizers: Sequence[optax.GradientTransformation],
-        opt_states: Sequence[optax.OptState],
+        training_state: TrainingState,
+        optimizers: Sequence[Optimizer],
         ds: Iterator[Batch],
-        state: State,
         key: PRNGKeyArray,
     ) -> None:
+        models = training_state.models
+        opt_states = training_state.opt_states
+        state = training_state.state
+
         if len(models) != 1 or len(optimizers) != 1 or len(opt_states) != 1:
             raise ValueError(
                 "Vanilla training expects a single model, optimizer and optimizer state. "
@@ -297,16 +296,31 @@ class SupervisedMixin(
 
             state = state.replace(elapsed_time_s=state.elapsed_time_s + timer.elapsed_time)
 
+            # Update the state dataclass so that the calling function can
+            # access it in the event of an exception.
+            model = eqx.combine(model_arr, model_static)
+            training_state.models[0] = model
+            training_state.opt_states[0] = opt_state
+            training_state.state = state
+
             if state.num_steps <= 3:
                 logger.log(LOG_PING, "Step %d took %.2f second", state.num_steps, timer.elapsed_time)
 
             if self.should_checkpoint(state):
-                model = eqx.combine(model_arr, model_static)
-                self.save_checkpoint(models=[model], optimizers=[optimizer], opt_states=[opt_state], state=state)
+                self.save_checkpoint(
+                    models=training_state.models,
+                    optimizers=optimizers,
+                    opt_states=training_state.opt_states,
+                    state=training_state.state,
+                )
 
         # After finishing training, save the final checkpoint.
-        model = eqx.combine(model_arr, model_static)
-        self.save_checkpoint(models=[model], optimizers=[optimizer], opt_states=[opt_state], state=state)
+        self.save_checkpoint(
+            models=training_state.models,
+            optimizers=optimizers,
+            opt_states=training_state.opt_states,
+            state=training_state.state,
+        )
 
     def run(self) -> None:
         self.run_training()
@@ -348,46 +362,45 @@ class SupervisedMixin(
                 load_optimizer=True,
                 model_sharding=model_sharding,
             )
+
             logger.info("Model size: %s", f"{get_pytree_param_count(models):,}")
             logger.info("Optimizer size: %s", f"{get_pytree_param_count(opt_states):,}")
 
             self.on_training_start()
 
-            def on_exit() -> None:
-                self.save_checkpoint(models=models, optimizers=optimizers, opt_states=opt_states, state=state)
+            latest_state = TrainingState(models, opt_states, state)
 
-            # Handle user-defined interrupts during the training loop.
+            def on_exit() -> None:
+                self.save_checkpoint(
+                    models=latest_state.models,
+                    optimizers=optimizers,
+                    opt_states=latest_state.opt_states,
+                    state=latest_state.state,
+                )
+
+            # Handle user-defined interrupts during the training loop, like
+            # when the Slurm job gets preempted.
             self.add_signal_handler(on_exit, signal.SIGUSR1, signal.SIGTERM)
 
             ds = self.get_tf_dataset()
             ds = iter_samples(ds, data_sharding)
 
-            try:
-                self.train_loop(
-                    models=models,
-                    optimizers=optimizers,
-                    opt_states=opt_states,
-                    ds=ds,
-                    state=state,
-                    key=key,
-                )
+            self.train_loop(
+                training_state=latest_state,
+                optimizers=optimizers,
+                ds=ds,
+                key=key,
+            )
 
-            except TrainingFinishedError:
-                if is_master():
-                    num_steps, num_samples = int(state.num_steps), int(state.num_samples)
-                    show_info(f"Finished training after {num_steps} steps, {num_samples} samples", important=True)
-                self.save_checkpoint(models=models, optimizers=optimizers, opt_states=opt_states, state=state)
+            if is_master():
+                num_steps, num_samples = int(latest_state.state.num_steps), int(latest_state.state.num_samples)
+                show_info(f"Finished training after {num_steps} steps, {num_samples} samples", important=True)
 
-            except (KeyboardInterrupt, bdb.BdbQuit):
-                if is_master():
-                    show_info("Interrupted training", important=True)
+            self.save_checkpoint(
+                models=latest_state.models,
+                optimizers=optimizers,
+                opt_states=latest_state.opt_states,
+                state=latest_state.state,
+            )
 
-            except BaseException:
-                exception_tb = textwrap.indent(highlight_exception_message(traceback.format_exc()), "  ")
-                sys.stdout.write(f"Caught exception during training loop:\n\n{exception_tb}\n")
-                sys.stdout.flush()
-                self.save_checkpoint(models=models, optimizers=optimizers, opt_states=opt_states, state=state)
-                raise
-
-            finally:
-                self.on_training_end()
+            self.on_training_end()

@@ -24,7 +24,7 @@ LOGIT_CLIP = 6.0
 
 class ProbabilityDistribution(ABC):
     @abstractmethod
-    def log_prob(self, x: Array) -> Array: ...
+    def log_prob(self, x_n: Array) -> Array: ...
 
     @abstractmethod
     def sample(self, key: PRNGKeyArray) -> Array: ...
@@ -78,8 +78,8 @@ class Normal(ProbabilityDistribution):
         self.loc_n = loc_n
         self.scale_n = jnp.clip(scale_n, min=std_clip)
 
-    def log_prob(self, x: Array) -> Array:
-        return -0.5 * jnp.log(2 * jnp.pi) - jnp.log(self.scale_n) - (x - self.loc_n) ** 2 / (2 * self.scale_n**2)
+    def log_prob(self, x_n: Array) -> Array:
+        return -0.5 * jnp.log(2 * jnp.pi) - jnp.log(self.scale_n) - (x_n - self.loc_n) ** 2 / (2 * self.scale_n**2)
 
     def sample(self, key: PRNGKeyArray) -> Array:
         return self.loc_n + self.scale_n * jax.random.normal(key, self.loc_n.shape)

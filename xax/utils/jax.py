@@ -83,7 +83,6 @@ def jit(
     device: xc.Device | None = None,
     backend: str | None = None,
     inline: bool = False,
-    abstracted_axes: Any | None = None,  # noqa: ANN401
     compiler_options: dict[str, Any] | None = None,
     jit_level: int | None = None,
     error_on_recompile: bool = False,
@@ -112,7 +111,6 @@ def jit(
             device=device,
             backend=backend,
             inline=inline,
-            abstracted_axes=abstracted_axes,
             compiler_options=compiler_options,
         )
 
@@ -238,9 +236,9 @@ def vmap(
 
         ns = next((len(_split_module(a, axis=i)) for i, a in zip(ia, args, strict=True) if i is not None), None)
         if ns is None:
-            return fun(*args, **kwargs)
+            return fun(*args, **kwargs)  # type: ignore[arg-type]
         split_args = [[a] * ns if i is None else _split_module(a, axis=i) for i, a in zip(ia, args, strict=True)]
-        split_outputs = [fun(*sargs, **kwargs) for sargs in zip(*split_args, strict=True)]
+        split_outputs = [fun(*sargs, **kwargs) for sargs in zip(*split_args, strict=True)]  # type: ignore[arg-type]
 
         if not split_outputs:
             return jnp.array([])  # type: ignore[return-value]

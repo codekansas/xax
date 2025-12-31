@@ -1,3 +1,4 @@
+#!/usr/bin/env -S uv run --no-project --script
 """Trains a simple convolutional neural network on the MNIST dataset.
 
 Run this example with `python -m examples.mnist`.
@@ -151,7 +152,6 @@ class MnistClassification(xax.SupervisedTask[Config]):
 
 
 if __name__ == "__main__":
-    # python -m examples.mnist
     MnistClassification.launch(
         Config(
             batch_size=256,

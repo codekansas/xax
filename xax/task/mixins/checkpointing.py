@@ -19,6 +19,7 @@ from xax.core.conf import field
 from xax.core.state import State
 from xax.nn.parallel import is_master
 from xax.task.mixins.artifacts import ArtifactsConfig, ArtifactsMixin
+from xax.utils.types.training import Optimizer
 
 logger = logging.getLogger(__name__)
 
@@ -213,7 +214,7 @@ class CheckpointingMixin(ArtifactsMixin[Config], Generic[Config]):
     def save_checkpoint(
         self,
         models: Sequence[PyTree] | None = None,
-        optimizers: Sequence[optax.GradientTransformation] | None = None,
+        optimizers: Sequence[Optimizer] | None = None,
         opt_states: Sequence[optax.OptState] | None = None,
         aux_data: PyTree | None = None,
         state: State | None = None,

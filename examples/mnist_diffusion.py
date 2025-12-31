@@ -1,3 +1,4 @@
+#!/usr/bin/env -S uv run --no-project --script
 """Trains a Gaussian diffusion model to conditionally generate MNIST digits.
 
 Run this example with `python -m examples.mnist_diffusion`.
@@ -227,7 +228,6 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
 
 
 if __name__ == "__main__":
-    # python -m examples.mnist_diffusion
     MnistDiffusion.launch(
         Config(
             batch_size=256,

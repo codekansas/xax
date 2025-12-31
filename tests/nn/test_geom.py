@@ -1,6 +1,9 @@
 """Tests geometry functions."""
 
+import math
+
 import jax
+import numpy as np
 import pytest
 from jax import numpy as jnp
 
@@ -82,19 +85,22 @@ def test_euler_to_quat_batch() -> None:
 @pytest.mark.parametrize(
     "vector, euler, expected",
     [
-        (jnp.array([1.0, 0.0, 0.0]), jnp.array([0.0, 0.0, 0.0]), jnp.array([1.0, 0.0, 0.0])),
-        (jnp.array([1.0, 0.0, 0.0]), jnp.array([0.0, 0.0, jnp.pi / 2]), jnp.array([0.0, 1.0, 0.0])),
-        (jnp.array([1.0, 0.0, 0.0]), jnp.array([0.0, jnp.pi / 2, 0.0]), jnp.array([0.0, 0.0, -1.0])),
+        (np.array([1.0, 0.0, 0.0]), np.array([0.0, 0.0, 0.0]), np.array([1.0, 0.0, 0.0])),
+        (np.array([1.0, 0.0, 0.0]), np.array([0.0, 0.0, math.pi / 2]), np.array([0.0, 1.0, 0.0])),
+        (np.array([1.0, 0.0, 0.0]), np.array([0.0, math.pi / 2, 0.0]), np.array([0.0, 0.0, -1.0])),
     ],
 )
 def test_rotate_vector_by_quat(
-    vector: jax.Array,
-    euler: jax.Array,
-    expected: jax.Array,
+    vector: np.ndarray,
+    euler: np.ndarray,
+    expected: np.ndarray,
 ) -> None:
-    quat = xax.euler_to_quat(euler)
-    rotated_vector = xax.rotate_vector_by_quat(vector, quat)
-    assert jnp.allclose(rotated_vector, expected, atol=1e-4)
+    vector_jnp = jnp.array(vector)
+    euler_jnp = jnp.array(euler)
+    expected_jnp = jnp.array(expected)
+    quat = xax.euler_to_quat(euler_jnp)
+    rotated_vector = xax.rotate_vector_by_quat(vector_jnp, quat)
+    assert jnp.allclose(rotated_vector, expected_jnp, atol=1e-4)
 
 
 def test_get_projected_gravity_vector_from_quat() -> None:
