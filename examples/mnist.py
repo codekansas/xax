@@ -84,7 +84,10 @@ class MnistClassification(xax.SupervisedTask[Config]):
         )
 
     def get_optimizer(self) -> optax.GradientTransformation:
-        return optax.adam(self.config.learning_rate)
+        opt = optax.adam(self.config.learning_rate)
+
+        # Gradient accumulation.
+        return optax.MultiSteps(opt, every_k_schedule=8)
 
     def get_output(self, model: Model, batch: Batch, state: xax.State, key: PRNGKeyArray) -> Array:
         return jax.vmap(model)(batch["image"])

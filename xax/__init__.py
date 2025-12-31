@@ -223,6 +223,7 @@ __all__ = [
     "hashable_array",
     "Optimizer",
     "Precision",
+    "PrecisionConfig",
     "as_shape_dtype",
 ]
 
@@ -483,6 +484,7 @@ NAME_MAP: dict[str, str] = {
     "hashable_array": "utils.types.hashable_array",
     "Optimizer": "utils.types.training",
     "Precision": "utils.types.training",
+    "PrecisionConfig": "utils.types.training",
     "as_shape_dtype": "utils.types.training",
 }
 
@@ -745,6 +747,6 @@ if IMPORT_ALL or TYPE_CHECKING:
     )
     from xax.utils.types.frozen_dict import FrozenDict, freeze_dict
     from xax.utils.types.hashable_array import HashableArray, hashable_array
-    from xax.utils.types.training import Optimizer, Precision, as_shape_dtype
+    from xax.utils.types.training import Optimizer, Precision, PrecisionConfig, as_shape_dtype
 
 del TYPE_CHECKING, IMPORT_ALL

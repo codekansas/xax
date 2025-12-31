@@ -8,6 +8,7 @@ from threading import Event, Thread
 from typing import Generic, Iterator, TypeVar
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from datasets import Dataset, DatasetDict, IterableDataset, IterableDatasetDict
 from jax.sharding import NamedSharding, PartitionSpec as P
@@ -47,6 +48,7 @@ class StreamingBatchIterator(Iterator[Batch]):
     - Using HuggingFace's optimized batch iteration (ds.iter)
     - Shuffling dataset each epoch for randomization
     - Prefetching in a background thread to overlap with GPU compute
+    - Optional dtype casting for reduced memory bandwidth
 
     Args:
         ds: HuggingFace Dataset to iterate over.
@@ -54,6 +56,8 @@ class StreamingBatchIterator(Iterator[Batch]):
         sharding: JAX sharding specification for device placement.
         prefetch_size: Number of batches to buffer ahead.
         seed: Random seed for shuffling.
+        data_dtype: Optional JAX dtype to cast floating point data to (e.g., jnp.float16
+            or jnp.float8_e4m3fn for reduced H2D bandwidth).
     """
 
     def __init__(
@@ -63,18 +67,34 @@ class StreamingBatchIterator(Iterator[Batch]):
         sharding: NamedSharding,
         prefetch_size: int = 16,
         seed: int = 1337,
+        data_dtype: jnp.dtype | None = None,
     ) -> None:
         self._ds = ds
         self._batch_size = batch_size
         self._sharding = sharding
         self._prefetch_size = prefetch_size
         self._seed = seed
+        self._data_dtype = data_dtype
 
         self._queue: Queue[Batch | BaseException | None] = Queue(maxsize=prefetch_size)
         self._stop_event = Event()
         self._error: BaseException | None = None
         self._thread = Thread(target=self._worker, daemon=True, name="xax-streaming")
         self._thread.start()
+
+    def _cast_batch(self, batch: dict) -> dict:
+        """Cast floating point arrays to the configured data dtype."""
+        if self._data_dtype is None:
+            return batch
+
+        result = {}
+        for col, arr in batch.items():
+            if np.issubdtype(arr.dtype, np.floating):
+                # Cast to target dtype
+                result[col] = arr.astype(self._data_dtype)
+            else:
+                result[col] = arr
+        return result
 
     def _worker(self) -> None:
         """Background worker that loads and prepares batches."""
@@ -93,6 +113,9 @@ class StreamingBatchIterator(Iterator[Batch]):
 
                     # Convert to numpy arrays (may already be numpy from set_format)
                     batch = {col: np.asarray(batch[col]) for col in batch}
+
+                    # Cast to target dtype if specified
+                    batch = self._cast_batch(batch)
 
                     # Transfer to device
                     batch = jax.device_put(batch, self._sharding)
@@ -217,7 +240,12 @@ class InMemoryBatchIterator(Iterator[Batch]):
         return stacked
 
 
-def load_dataset_in_memory(ds: Dataset, batch_size: int, sharding: NamedSharding) -> Batch:
+def load_dataset_in_memory(
+    ds: Dataset,
+    batch_size: int,
+    sharding: NamedSharding,
+    data_dtype: jnp.dtype | None = None,
+) -> Batch:
     """Load a HuggingFace Dataset entirely into JAX arrays, pre-batched and pre-sharded.
 
     The data is organized into batches and sharded across devices at load time.
@@ -227,6 +255,7 @@ def load_dataset_in_memory(ds: Dataset, batch_size: int, sharding: NamedSharding
         ds: HuggingFace Dataset to load.
         batch_size: Size of each batch.
         sharding: JAX sharding specification for device placement.
+        data_dtype: Optional dtype to cast floating point data to.
 
     Returns:
         PyTree of JAX arrays with shape (num_batches, batch_size, ...).
@@ -256,6 +285,13 @@ def load_dataset_in_memory(ds: Dataset, batch_size: int, sharding: NamedSharding
         return truncated.reshape(new_shape)
 
     batched_data = {key: reshape_to_batches(arr) for key, arr in data.items()}
+
+    # Cast floating point data to target dtype if specified
+    if data_dtype is not None:
+        batched_data = {
+            key: arr.astype(data_dtype) if np.issubdtype(arr.dtype, np.floating) else arr
+            for key, arr in batched_data.items()
+        }
 
     # For single device, just put on device without sharding
     # For multi-device, apply proper sharding
@@ -299,7 +335,11 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
             The dataset to train on.
         """
 
-    def get_streaming_iterator(self, sharding: NamedSharding) -> StreamingBatchIterator:
+    def get_streaming_iterator(
+        self,
+        sharding: NamedSharding,
+        data_dtype: jnp.dtype | None = None,
+    ) -> StreamingBatchIterator:
         """Get an iterator that streams batches from the dataset.
 
         This method creates a streaming iterator that loads batches in a
@@ -308,6 +348,7 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
 
         Args:
             sharding: JAX sharding specification for device placement.
+            data_dtype: Optional dtype to cast floating point data to.
 
         Returns:
             Iterator that yields batches from the dataset.
@@ -336,9 +377,15 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
             sharding=sharding,
             prefetch_size=self.config.prefetch_buffer_size,
             seed=self.config.shuffle_seed,
+            data_dtype=data_dtype,
         )
 
-    def get_in_memory_iterator(self, sharding: NamedSharding, key: PRNGKeyArray) -> InMemoryBatchIterator:
+    def get_in_memory_iterator(
+        self,
+        sharding: NamedSharding,
+        key: PRNGKeyArray,
+        data_dtype: jnp.dtype | None = None,
+    ) -> InMemoryBatchIterator:
         """Load dataset into device memory and return an iterator.
 
         This method loads the entire dataset into JAX arrays on device,
@@ -348,6 +395,7 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
         Args:
             sharding: JAX sharding specification for device placement.
             key: JAX random key for shuffling.
+            data_dtype: Optional dtype to cast floating point data to.
 
         Returns:
             Iterator that yields batches from the in-memory dataset.
@@ -370,6 +418,6 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
             raise NotImplementedError(f"Unsupported dataset type for in-memory loading: {type(ds)}")
 
         # Load dataset into device memory, pre-batched and pre-sharded
-        batched_data = load_dataset_in_memory(ds, self.batch_size, sharding)
+        batched_data = load_dataset_in_memory(ds, self.batch_size, sharding, data_dtype)
 
         return InMemoryBatchIterator(batched_data=batched_data, key=key)

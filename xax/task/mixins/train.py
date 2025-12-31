@@ -50,7 +50,7 @@ from xax.utils.experiments import (
 )
 from xax.utils.jax import jit as xax_jit
 from xax.utils.logging import LOG_PING, LOG_STATUS
-from xax.utils.types.training import Optimizer, Precision, as_shape_dtype
+from xax.utils.types.training import Optimizer, PrecisionConfig, as_shape_dtype
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +100,7 @@ class TrainConfig(
     log_heavy_every_n_seconds: int = field(60 * 5, help="Log heavy metrics every N seconds")
     max_steps: int | None = field(None, help="Maximum number of steps to run")
     step_kind: str = field("step", help=f"How to measure a step; one of [{', '.join(get_args(StepKind))}]")
-    precision: Precision = field(Precision.BFLOAT16, help="Precision to use for the task")
+    precision: PrecisionConfig = field(PrecisionConfig, help="Config specifying floating point precisions")
     random_seed: int = field(1337, help="Random seed for the task")
 
 
@@ -141,24 +141,29 @@ class TrainMixin(
         # The kind of step that was specified in the config.
         self._step_kind = cast_step_kind(self.config.step_kind)
 
-        # Update Jax configuration based on the precision.
-        match self.config.precision:
-            case Precision.FLOAT32:
-                jax.config.update("jax_default_matmul_precision", "float32")
-            case Precision.BFLOAT16:
-                jax.config.update("jax_default_matmul_precision", "bfloat16")
-            case _:
-                raise ValueError(f"Invalid precision: {self.config.precision}")
+        jax.config.update("jax_default_matmul_precision", self.config.precision.compute_dtype.value)
 
-    def cast_dtype(self, x: Any) -> Array:  # noqa: ANN401
+    @property
+    def precision_config(self) -> PrecisionConfig:
+        """Returns the precision configuration for this task."""
+        return self.config.precision
+
+    def cast_data_dtype(self, x: Any) -> Array:  # noqa: ANN401
+        """Cast data to the configured data dtype."""
         if isinstance(x, Array) and jnp.issubdtype(x.dtype, jnp.floating):
-            match self.config.precision:
-                case Precision.FLOAT32:
-                    return x.astype(jnp.float32)
-                case Precision.BFLOAT16:
-                    return x.astype(jnp.bfloat16)
-                case _:
-                    raise ValueError(f"Invalid precision: {self.config.precision}")
+            return x.astype(self.config.precision.data_jax_dtype)
+        return x
+
+    def cast_param_dtype(self, x: Any) -> Array:  # noqa: ANN401
+        """Cast parameters to the configured param dtype."""
+        if isinstance(x, Array) and jnp.issubdtype(x.dtype, jnp.floating):
+            return x.astype(self.config.precision.param_jax_dtype)
+        return x
+
+    def cast_compute_dtype(self, x: Any) -> Array:  # noqa: ANN401
+        """Cast values to the configured compute dtype."""
+        if isinstance(x, Array) and jnp.issubdtype(x.dtype, jnp.floating):
+            return x.astype(self.config.precision.compute_jax_dtype)
         return x
 
     def prng_key(self) -> PRNGKeyArray:
@@ -230,7 +235,19 @@ class TrainMixin(
         models: list[PyTree],
         optimizers: list[Optimizer],
     ) -> list[optax.OptState]:
-        return [opt.init(eqx.filter(model, eqx.is_array)) for model, opt in zip(models, optimizers, strict=True)]
+        # Cast model params to grad_dtype for optimizer initialization
+        # This ensures gradient accumulation happens in grad_dtype precision
+        grad_dtype = self.config.precision.grad_jax_dtype
+
+        def cast_to_grad_dtype(x: Any) -> Any:  # noqa: ANN401
+            if isinstance(x, Array) and jnp.issubdtype(x.dtype, jnp.floating):
+                return x.astype(grad_dtype)
+            return x
+
+        return [
+            opt.init(jax.tree.map(cast_to_grad_dtype, eqx.filter(model, eqx.is_array)))
+            for model, opt in zip(models, optimizers, strict=True)
+        ]
 
     @overload
     def load_initial_state(
@@ -282,7 +299,7 @@ class TrainMixin(
         state = State.init_state()
 
         # Casts the model to the desired dtype.
-        models = jax.tree.map(self.cast_dtype, models)
+        models = jax.tree.map(self.cast_param_dtype, models)
 
         if model_sharding is not None:
             models = jax.tree.map(_shard, models)

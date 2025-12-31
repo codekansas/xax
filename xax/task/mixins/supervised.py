@@ -130,6 +130,8 @@ class SupervisedMixin(
     ) -> tuple[Array, Output]:
         output_key, loss_key = jax.random.split(key)
         model = eqx.combine(model_arr, model_static)
+        # Cast batch from data_dtype to compute_dtype for forward pass
+        batch = jax.tree.map(self.cast_compute_dtype, batch)
         output = self.get_output(model, batch, state, output_key)
         loss = self.compute_loss(model, batch, output, state, loss_key)
         return loss, (loss, output)
@@ -153,6 +155,11 @@ class SupervisedMixin(
         grad_fn = xax_jit(static_argnums=[1], jit_level=3)(grad_fn)
         grads, aux = grad_fn(model_arr, model_static, batch, state, key)
         loss, output = cast(tuple[Array, Output], aux)
+
+        # Cast gradients to grad_dtype for accumulation
+        grad_dtype = self.config.precision.grad_jax_dtype
+        grads = jax.tree.map(lambda g: g.astype(grad_dtype) if eqx.is_inexact_array(g) else g, grads)
+
         grad_norm = optax.global_norm(grads)
         if self.config.max_grad_norm is not None:
             clip_fn = optax.clip_by_global_norm(self.config.max_grad_norm)
@@ -160,6 +167,11 @@ class SupervisedMixin(
             grads, _ = clip_fn.update(grads, clip_state)
 
         updates, opt_state = optimizer.update(grads, opt_state, model_arr)
+
+        # Cast updates to param_dtype before applying (needed when grad_dtype != param_dtype)
+        param_dtype = self.config.precision.param_jax_dtype
+        updates = jax.tree.map(lambda u: u.astype(param_dtype) if eqx.is_inexact_array(u) else u, updates)
+
         model_arr = eqx.apply_updates(model_arr, updates)
 
         return model_arr, opt_state, output, loss, grad_norm  # type: ignore[return-value]
@@ -393,10 +405,11 @@ class SupervisedMixin(
 
             try:
                 # Choose data loading strategy based on config
+                data_dtype = self.config.precision.data_jax_dtype
                 if self.config.load_in_memory:
-                    ds: Iterator[Batch] = self.get_in_memory_iterator(data_sharding, key)
+                    ds: Iterator[Batch] = self.get_in_memory_iterator(data_sharding, key, data_dtype)
                 else:
-                    ds = self.get_streaming_iterator(data_sharding)
+                    ds = self.get_streaming_iterator(data_sharding, data_dtype)
 
                 state = self.train_loop(
                     models=models,
