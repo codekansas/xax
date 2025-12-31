@@ -367,10 +367,6 @@ class SupervisedMixin(
                 model_sharding=model_sharding,
             )
 
-            # Replicate state and optimizer states across all devices.
-            state = jax.tree.map(lambda x: jax.device_put(x, model_sharding), state)
-            opt_states = jax.tree.map(lambda x: jax.device_put(x, model_sharding), opt_states)
-
             logger.info("Model size: %s", f"{get_pytree_param_count(models):,}")
             logger.info("Optimizer size: %s", f"{get_pytree_param_count(opt_states):,}")
 
@@ -386,14 +382,12 @@ class SupervisedMixin(
                     state=latest_state.state,
                 )
 
-            # Handle user-defined interrupts during the training loop.
+            # Handle user-defined interrupts during the training loop, like
+            # when the Slurm job gets preempted.
             self.add_signal_handler(on_exit, signal.SIGUSR1, signal.SIGTERM)
 
             ds = self.get_tf_dataset()
             ds = iter_samples(ds, data_sharding)
-
-            # Replicate the key across all devices.
-            key = jax.device_put(key, model_sharding)
 
             try:
                 self.train_loop(
