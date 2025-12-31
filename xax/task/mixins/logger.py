@@ -11,7 +11,6 @@ import jax
 
 from xax.core.conf import field
 from xax.core.state import State
-from xax.task.base import BaseConfig, BaseTask
 from xax.task.logger import Logger, LoggerImpl
 from xax.task.loggers.json import JsonLogger
 from xax.task.loggers.state import StateLogger
@@ -24,24 +23,25 @@ from xax.task.loggers.wandb import (
     WandbConfigResume,
     WandbLogger,
 )
-from xax.task.mixins.artifacts import ArtifactsMixin
-from xax.utils.text import is_interactive_session
+from xax.task.mixins.artifacts import ArtifactsConfig, ArtifactsMixin
 
 
 class LoggerBackend(str, Enum):
+    STDOUT = "stdout"
+    JSON = "json"
     TENSORBOARD = "tensorboard"
     WANDB = "wandb"
 
 
 @jax.tree_util.register_dataclass
 @dataclass
-class LoggerConfig(BaseConfig):
+class LoggerConfig(ArtifactsConfig):
     log_interval_seconds: float = field(
         value=1.0,
         help="The interval between successive log lines.",
     )
-    logger_backend: LoggerBackend = field(
-        value=LoggerBackend.TENSORBOARD,
+    logger_backend: list[LoggerBackend] = field(
+        value=[LoggerBackend.STDOUT, LoggerBackend.JSON, LoggerBackend.TENSORBOARD],
         help="The logger backend to use",
     )
     tensorboard_log_interval_seconds: float = field(
@@ -95,7 +95,7 @@ def get_env_var(name: str, default: bool) -> bool:
     return os.environ[name].strip() == "1"
 
 
-class LoggerMixin(BaseTask[Config], Generic[Config]):
+class LoggerMixin(ArtifactsMixin[Config], Generic[Config]):
     logger: Logger
 
     def __init__(self, config: Config) -> None:
@@ -110,31 +110,30 @@ class LoggerMixin(BaseTask[Config], Generic[Config]):
         self.logger.add_logger(*logger)
 
     def set_loggers(self) -> None:
-        self.add_logger(
-            StdoutLogger(
-                log_interval_seconds=self.config.log_interval_seconds,
-            )
-            if is_interactive_session()
-            else JsonLogger(
-                log_interval_seconds=self.config.log_interval_seconds,
-            )
-        )
+        for backend in self.config.logger_backend:
+            self.add_logger(self._create_logger_backend(backend))
 
         # If this is also an ArtifactsMixin, we should default add some
         # additional loggers which log data to the artifacts directory.
         if isinstance(self, ArtifactsMixin):
-            self.add_logger(
-                StateLogger(
-                    run_directory=self.exp_dir,
-                ),
-                self._create_logger_backend(),
-            )
+            self.add_logger(StateLogger(run_directory=self.exp_dir))
 
-    def _create_logger_backend(self) -> LoggerImpl:
-        match self.config.logger_backend:
+    def _create_logger_backend(self, backend: LoggerBackend) -> LoggerImpl:
+        match backend:
+            case LoggerBackend.STDOUT:
+                return StdoutLogger(
+                    log_interval_seconds=self.config.log_interval_seconds,
+                )
+
+            case LoggerBackend.JSON:
+                return JsonLogger(
+                    run_directory=self.exp_dir,
+                    log_interval_seconds=self.config.log_interval_seconds,
+                )
+
             case LoggerBackend.TENSORBOARD:
                 return TensorboardLogger(
-                    run_directory=self.exp_dir if isinstance(self, ArtifactsMixin) else "./",
+                    run_directory=self.exp_dir,
                     log_interval_seconds=self.config.tensorboard_log_interval_seconds,
                 )
 
@@ -143,7 +142,7 @@ class LoggerMixin(BaseTask[Config], Generic[Config]):
                     project=self.config.wandb_project,
                     entity=self.config.wandb_entity,
                     name=self.config.wandb_name,
-                    run_directory=self.exp_dir if isinstance(self, ArtifactsMixin) else None,
+                    run_directory=self.exp_dir,
                     config=asdict(self.config),
                     tags=self.config.wandb_tags,
                     notes=self.config.wandb_notes,

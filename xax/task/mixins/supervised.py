@@ -33,7 +33,6 @@ from xax.utils.logging import LOG_PING
 from xax.utils.pytree import get_pytree_param_count
 from xax.utils.text import show_info
 from xax.utils.types.frozen_dict import FrozenDict
-from xax.utils.types.training import TrainingState
 
 logger = logging.getLogger(__name__)
 
@@ -255,15 +254,13 @@ class SupervisedMixin(
 
     def train_loop(
         self,
-        training_state: TrainingState,
+        models: list[PyTree],
+        opt_states: list[optax.OptState],
+        state: State,
         optimizers: Sequence[Optimizer],
         ds: Iterator[Batch],
         key: PRNGKeyArray,
-    ) -> None:
-        models = training_state.models
-        opt_states = training_state.opt_states
-        state = training_state.state
-
+    ) -> State:
         if len(models) != 1 or len(optimizers) != 1 or len(opt_states) != 1:
             raise ValueError(
                 "Vanilla training expects a single model, optimizer and optimizer state. "
@@ -273,6 +270,19 @@ class SupervisedMixin(
         model_arr, model_static = eqx.partition(models[0], self.model_partition_fn)
         optimizer = optimizers[0]
         opt_state = opt_states[0]
+
+        def save_checkpoint() -> None:
+            model = eqx.combine(model_arr, model_static)
+            self.save_checkpoint(
+                models=[model],
+                optimizers=optimizers,
+                opt_states=[opt_state],
+                state=state,
+            )
+
+        # Handle user-defined interrupts during the training loop, like
+        # when the Slurm job gets preempted.
+        self.add_signal_handler(save_checkpoint, signal.SIGUSR1, signal.SIGTERM)
 
         while not self.is_training_over(state):
             with ContextTimer() as timer:
@@ -296,31 +306,16 @@ class SupervisedMixin(
 
             state = state.replace(elapsed_time_s=state.elapsed_time_s + timer.elapsed_time)
 
-            # Update the state dataclass so that the calling function can
-            # access it in the event of an exception.
-            model = eqx.combine(model_arr, model_static)
-            training_state.models[0] = model
-            training_state.opt_states[0] = opt_state
-            training_state.state = state
-
             if state.num_steps <= 3:
                 logger.log(LOG_PING, "Step %d took %.2f second", state.num_steps, timer.elapsed_time)
 
             if self.should_checkpoint(state):
-                self.save_checkpoint(
-                    models=training_state.models,
-                    optimizers=optimizers,
-                    opt_states=training_state.opt_states,
-                    state=training_state.state,
-                )
+                save_checkpoint()
 
         # After finishing training, save the final checkpoint.
-        self.save_checkpoint(
-            models=training_state.models,
-            optimizers=optimizers,
-            opt_states=training_state.opt_states,
-            state=training_state.state,
-        )
+        save_checkpoint()
+
+        return state
 
     def run(self) -> None:
         self.run_training()
@@ -368,39 +363,20 @@ class SupervisedMixin(
 
             self.on_training_start()
 
-            latest_state = TrainingState(models, opt_states, state)
-
-            def on_exit() -> None:
-                self.save_checkpoint(
-                    models=latest_state.models,
-                    optimizers=optimizers,
-                    opt_states=latest_state.opt_states,
-                    state=latest_state.state,
-                )
-
-            # Handle user-defined interrupts during the training loop, like
-            # when the Slurm job gets preempted.
-            self.add_signal_handler(on_exit, signal.SIGUSR1, signal.SIGTERM)
-
             ds = self.get_tf_dataset()
             ds = iter_samples(ds, data_sharding)
 
-            self.train_loop(
-                training_state=latest_state,
+            state = self.train_loop(
+                models=models,
+                opt_states=opt_states,
+                state=state,
                 optimizers=optimizers,
                 ds=ds,
                 key=key,
             )
 
             if is_master():
-                num_steps, num_samples = int(latest_state.state.num_steps), int(latest_state.state.num_samples)
+                num_steps, num_samples = int(state.num_steps), int(state.num_samples)
                 show_info(f"Finished training after {num_steps} steps, {num_samples} samples", important=True)
-
-            self.save_checkpoint(
-                models=latest_state.models,
-                optimizers=optimizers,
-                opt_states=latest_state.opt_states,
-                state=latest_state.state,
-            )
 
             self.on_training_end()

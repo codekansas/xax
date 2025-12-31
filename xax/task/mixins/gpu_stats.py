@@ -1,7 +1,8 @@
 """A task mixin for logging GPU statistics.
 
 This logs GPU memory and utilization in a background process using
-``nvidia-smi``, if a GPU is available in the system.
+``nvidia-smi``, if a GPU is available in the system. Includes detailed
+metrics for memory bandwidth utilization and SM (compute) utilization.
 """
 
 import logging
@@ -20,7 +21,7 @@ import jax
 from xax.core.conf import field
 from xax.task.mixins.logger import LoggerConfig, LoggerMixin
 from xax.task.mixins.process import ProcessConfig, ProcessMixin
-from xax.utils.devices import get_num_gpus, parse_number
+from xax.utils.devices import get_num_gpus
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -44,60 +45,125 @@ Config = TypeVar("Config", bound=GPUStatsConfig)
 class GPUStats(Structure):
     _fields_ = [
         ("index", c_uint32),
-        ("memory_used", c_double),
-        ("temperature", c_double),
-        ("utilization", c_double),
+        ("sm_util", c_double),
+        ("mem_bw_util", c_double),
+        ("enc_util", c_double),
+        ("dec_util", c_double),
+        ("jpg_util", c_double),
+        ("ofa_util", c_double),
     ]
 
 
 @dataclass(frozen=True)
 class GPUStatsInfo:
     index: int
-    memory_used: float
-    temperature: float
-    utilization: float
+    sm_util: float
+    mem_bw_util: float
+    enc_util: float
+    dec_util: float
+    jpg_util: float
+    ofa_util: float
 
     @classmethod
     def from_stats(cls, stats: GPUStats) -> "GPUStatsInfo":
         return cls(
             index=stats.index,
-            memory_used=stats.memory_used,
-            temperature=stats.temperature,
-            utilization=stats.utilization,
+            sm_util=stats.sm_util,
+            mem_bw_util=stats.mem_bw_util,
+            enc_util=stats.enc_util,
+            dec_util=stats.dec_util,
+            jpg_util=stats.jpg_util,
+            ofa_util=stats.ofa_util,
         )
 
 
-def parse_gpu_stats(row: str) -> GPUStats:
-    cols = row.split(",")
-    index = int(cols[0].strip())
-    memory_total, memory_used, temperature, utilization = (parse_number(col) for col in cols[1:])
+def parse_dmon_row(row: str, col_indices: dict[str, int]) -> GPUStats | None:
+    """Parse a row from nvidia-smi dmon output.
 
-    return GPUStats(
-        index=index,
-        memory_used=100 * memory_used / memory_total,
-        temperature=temperature,
-        utilization=utilization,
-    )
+    Args:
+        row: A line from dmon output.
+        col_indices: Mapping of column names to indices.
+
+    Returns:
+        GPUStats or None if parsing failed.
+    """
+    parts = row.split()
+    if not parts or parts[0].startswith("#"):
+        return None
+
+    try:
+        index = int(parts[col_indices["gpu"]])
+        sm_util = float(parts[col_indices["sm"]])
+        mem_bw = float(parts[col_indices["mem"]])
+        enc_util = float(parts[col_indices["enc"]])
+        dec_util = float(parts[col_indices["dec"]])
+        jpg_util = float(parts[col_indices["jpg"]])
+        ofa_util = float(parts[col_indices["ofa"]])
+
+        return GPUStats(
+            index=index,
+            sm_util=sm_util,
+            mem_bw_util=mem_bw,
+            enc_util=enc_util,
+            dec_util=dec_util,
+            jpg_util=jpg_util,
+            ofa_util=ofa_util,
+        )
+    except (ValueError, IndexError, KeyError):
+        return None
 
 
 def gen_gpu_stats(loop_secs: int = 5) -> Iterable[GPUStats]:
-    fields = ",".join(["index", "memory.total", "memory.used", "temperature.gpu", "utilization.gpu"])
-    command = f"nvidia-smi --query-gpu={fields} --format=csv,noheader --loop={loop_secs}"
+    """Generate GPU stats using nvidia-smi dmon for detailed utilization metrics.
+
+    Uses nvidia-smi dmon to get SM utilization (compute throughput) and memory
+    bandwidth utilization, which are better indicators of GPU efficiency than
+    the basic utilization metric.
+
+    Args:
+        loop_secs: Interval between stat collections in seconds.
+
+    Yields:
+        GPUStats objects with utilization metrics.
+    """
+    # Use dmon with utilization metrics (-s u) for SM and memory bandwidth
+    command = f"nvidia-smi dmon -s u -d {loop_secs}"
     visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     visible_device_ids = None if visible_devices is None else {int(i.strip()) for i in visible_devices.split(",") if i}
+
+    col_indices: dict[str, int] = {}
 
     try:
         with subprocess.Popen(command.split(), stdout=subprocess.PIPE, universal_newlines=True) as proc:
             stdout = proc.stdout
             assert stdout is not None
             rows = iter(stdout.readline, "")
+
             for row in rows:
-                try:
-                    stats = parse_gpu_stats(row)
-                except ValueError:
+                row = row.strip()
+                if not row:
                     continue
-                if visible_device_ids is None or stats.index in visible_device_ids:
-                    yield stats
+
+                # Parse header to get column indices
+                # Header format: "# gpu     sm    mem    enc    dec    jpg    ofa"
+                if row.startswith("# gpu"):
+                    parts = row[1:].split()  # Remove leading '#'
+                    col_indices = {name: i for i, name in enumerate(parts)}
+                    continue
+
+                # Skip the units row
+                if row.startswith("# Idx"):
+                    continue
+
+                # Parse data row
+                stats = parse_dmon_row(row, col_indices)
+                if stats is None:
+                    continue
+
+                if visible_device_ids is not None and stats.index not in visible_device_ids:
+                    continue
+
+                yield stats
 
     except BaseException:
         logger.error("Closing GPU stats monitor")
@@ -144,9 +210,12 @@ class GPUStatsMonitor:
                 GPUStats,
                 GPUStats(
                     index=i,
-                    memory_used=0.0,
-                    temperature=0.0,
-                    utilization=0.0,
+                    sm_util=0.0,
+                    mem_bw_util=0.0,
+                    enc_util=0.0,
+                    dec_util=0.0,
+                    jpg_util=0.0,
+                    ofa_util=0.0,
                 ),
             )
             for i in range(num_gpus)
@@ -238,6 +307,9 @@ class GPUStatsMixin(ProcessMixin[Config], LoggerMixin[Config], Generic[Config]):
         for gpu_stat in stats.values():
             if gpu_stat is None:
                 continue
-            self.logger.log_scalar(f"mem/{gpu_stat.index}", gpu_stat.memory_used, namespace="🔧 gpu", secondary=True)
-            self.logger.log_scalar(f"temp/{gpu_stat.index}", gpu_stat.temperature, namespace="🔧 gpu", secondary=True)
-            self.logger.log_scalar(f"util/{gpu_stat.index}", gpu_stat.utilization, namespace="🔧 gpu", secondary=True)
+            self.logger.log_scalar(f"sm/{gpu_stat.index}", gpu_stat.sm_util, namespace="🔧 gpu", secondary=True)
+            self.logger.log_scalar(f"bw/{gpu_stat.index}", gpu_stat.mem_bw_util, namespace="🔧 gpu", secondary=True)
+            self.logger.log_scalar(f"enc/{gpu_stat.index}", gpu_stat.enc_util, namespace="🔧 gpu", secondary=True)
+            self.logger.log_scalar(f"dec/{gpu_stat.index}", gpu_stat.dec_util, namespace="🔧 gpu", secondary=True)
+            self.logger.log_scalar(f"jpg/{gpu_stat.index}", gpu_stat.jpg_util, namespace="🔧 gpu", secondary=True)
+            self.logger.log_scalar(f"ofa/{gpu_stat.index}", gpu_stat.ofa_util, namespace="🔧 gpu", secondary=True)
