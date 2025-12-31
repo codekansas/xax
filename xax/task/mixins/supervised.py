@@ -303,15 +303,12 @@ class SupervisedMixin(
         # when the Slurm job gets preempted.
         self.add_signal_handler(save_checkpoint, signal.SIGUSR1, signal.SIGTERM)
 
-        # Check if iterator supports efficient batch stacking
-        use_stacked_iterator = isinstance(ds, InMemoryBatchIterator)
-
         while not self.is_training_over(state):
             with ContextTimer() as timer:
                 self.on_step_start()
 
                 # Get stacked batches - use optimized path for in-memory iterators
-                if use_stacked_iterator:
+                if isinstance(ds, InMemoryBatchIterator):
                     batches_stacked = ds.get_stacked_batches(self.config.batches_per_step)
                 else:
                     batches = tuple(itertools.islice(ds, self.config.batches_per_step))
