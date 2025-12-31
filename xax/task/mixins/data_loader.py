@@ -8,11 +8,10 @@ from threading import Event, Thread
 from typing import Generic, Iterator, TypeVar
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import tensorflow as tf
 from datasets import Dataset, DatasetDict, IterableDataset, IterableDatasetDict
-from jax.sharding import NamedSharding
+from jax.sharding import NamedSharding, PartitionSpec as P
 from omegaconf import II
 
 from xax.core.conf import field
@@ -242,10 +241,6 @@ def load_dataset_in_memory(ds: Dataset, batch_size: int, sharding: NamedSharding
 
     batched_data = {key: reshape_to_batches(arr) for key, arr in data.items()}
 
-    # Create sharding for batched data: replicate num_batches, shard batch_size
-    # The input sharding is for (batch_size, ...), we need (num_batches, batch_size, ...)
-    from jax.sharding import PartitionSpec as P
-
     batched_sharding = NamedSharding(sharding.mesh, P(None, "batch"))
     batched_data = jax.device_put(batched_data, batched_sharding)
 
@@ -324,16 +319,8 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
 
         if isinstance(ds, (IterableDataset, IterableDatasetDict)):
             raise ValueError(
-                "Cannot load streaming/iterable datasets into memory. "
-                "Set load_in_memory=False for streaming datasets."
+                "Cannot load streaming/iterable datasets into memory. Set load_in_memory=False for streaming datasets."
             )
-
-        if isinstance(ds, DatasetDict):
-            # Use the train split if available
-            if "train" in ds:
-                ds = ds["train"]
-            else:
-                raise ValueError(f"DatasetDict has no 'train' split. Available: {list(ds.keys())}")
 
         if isinstance(ds, tf.data.Dataset):
             raise ValueError(

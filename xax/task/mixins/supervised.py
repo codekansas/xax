@@ -28,7 +28,7 @@ from xax.core.conf import field
 from xax.core.state import Batch, Output, State
 from xax.nn.parallel import is_master
 from xax.task.logger import Metric, Scalar
-from xax.task.mixins.data_loader import InMemoryBatchIterator, iter_samples
+from xax.task.mixins.data_loader import iter_samples
 from xax.task.mixins.train import InitParams, Optimizer, TrainConfig, TrainMixin
 from xax.utils.experiments import ContextTimer
 from xax.utils.jax import jit as xax_jit, scan as xax_scan
