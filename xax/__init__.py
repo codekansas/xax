@@ -12,7 +12,7 @@ and running the update script:
     python -m scripts.update_api --inplace
 """
 
-__version__ = "0.4.4"
+__version__ = "0.4.5"
 
 # This list shouldn't be modified by hand; instead, run the update script.
 __all__ = [
