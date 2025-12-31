@@ -1,11 +1,12 @@
 """Defines a logger which logs JSON lines to a file."""
 
 import json
-import sys
+from pathlib import Path
 from typing import Any, Literal, Mapping, TextIO
 
 from jaxtyping import Array
 
+from xax.nn.parallel import get_rank, get_world_size
 from xax.task.logger import (
     LogError,
     LogErrorSummary,
@@ -27,8 +28,8 @@ def get_json_value(value: Any) -> Any:  # noqa: ANN401
 class JsonLogger(LoggerImpl):
     def __init__(
         self,
-        log_stream: TextIO = sys.stdout,
-        err_log_stream: TextIO = sys.stderr,
+        run_directory: str | Path,
+        subdirectory: str = "json",
         flush_immediately: bool = False,
         open_mode: Literal["w", "a"] = "w",
         line_sep: str = "\n",
@@ -38,8 +39,8 @@ class JsonLogger(LoggerImpl):
         """Defines a simpler logger which logs to stdout.
 
         Args:
-            log_stream: The stream to log to.
-            err_log_stream: The stream to log errors to.
+            run_directory: The directory to log to.
+            subdirectory: The subdirectory to log to.
             flush_immediately: Whether to flush the file after every write.
             open_mode: The file open mode.
             line_sep: The line separator to use.
@@ -51,12 +52,19 @@ class JsonLogger(LoggerImpl):
         """
         super().__init__(log_interval_seconds)
 
-        self.log_stream = log_stream
-        self.err_log_stream = err_log_stream
+        self.run_directory = (Path(run_directory).expanduser() / subdirectory).resolve()
         self.flush_immediately = flush_immediately
         self.open_mode = open_mode
         self.line_sep = line_sep
         self.remove_unicode_from_namespaces = remove_unicode_from_namespaces
+
+        # Open file pointers to the log and error files.
+        rank, world_size = get_rank(), get_world_size()
+        num_digits = len(str(world_size))
+        rank_str = f"{rank:0{num_digits}d}" if world_size > 1 else ""
+        self.run_directory.mkdir(parents=True, exist_ok=True)
+        self._log_fp = (self.run_directory / f"log{rank_str}.json").open(open_mode, encoding="utf-8")
+        self._err_fp = (self.run_directory / f"error{rank_str}.txt").open(open_mode, encoding="utf-8")
 
     def start(self) -> None:
         pass
@@ -64,13 +72,17 @@ class JsonLogger(LoggerImpl):
     def stop(self) -> None:
         pass
 
+    def __del__(self) -> None:
+        self._log_fp.close()
+        self._err_fp.close()
+
     @property
     def fp(self) -> TextIO:
-        return self.log_stream
+        return self._log_fp
 
     @property
     def err_fp(self) -> TextIO:
-        return self.err_log_stream
+        return self._err_fp
 
     def get_json(self, line: LogLine) -> str:
         data: dict = {"state": line.state.to_dict()}

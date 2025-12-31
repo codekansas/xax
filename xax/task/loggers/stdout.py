@@ -17,7 +17,7 @@ from xax.task.logger import (
     LogString,
 )
 from xax.utils.logging import as_str, format_number
-from xax.utils.text import Color, colored, format_timedelta
+from xax.utils.text import Color, colored, format_timedelta, is_interactive_session
 
 
 class StdoutLogger(LoggerImpl):
@@ -32,7 +32,7 @@ class StdoutLogger(LoggerImpl):
         log_interval_seconds: float = 1.0,
         remove_temporary_after: datetime.timedelta = datetime.timedelta(seconds=10),
     ) -> None:
-        """Defines a logger which shows a pop-up using Curses.
+        """Defines a logger which shows a pop-up.
 
         Args:
             write_fp: The file to write logs to.
@@ -71,7 +71,8 @@ class StdoutLogger(LoggerImpl):
         pass
 
     def write_separator(self) -> None:
-        self.write_fp.write("\033[2J\033[H")
+        if is_interactive_session():
+            self.write_fp.write("\033[2J\033[H")
 
     def write_state_window(self, line: LogLine) -> None:
         state_info: dict[str, str] = {
