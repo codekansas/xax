@@ -2,7 +2,10 @@
 
 import itertools
 import logging
+import os
 import signal
+import sys
+import traceback
 from abc import ABC
 from dataclasses import dataclass
 from threading import Thread
@@ -337,6 +340,8 @@ class SupervisedMixin(
         Raises:
             ValueError: If the task is not a supervised learning task
         """
+        training_error: BaseException | None = None
+
         with self:
             key = self.prng_key()
 
@@ -363,20 +368,35 @@ class SupervisedMixin(
 
             self.on_training_start()
 
-            ds = self.get_tf_dataset()
-            ds = iter_samples(ds, data_sharding)
+            try:
+                ds = self.get_tf_dataset()
+                ds = iter_samples(ds, data_sharding)
 
-            state = self.train_loop(
-                models=models,
-                opt_states=opt_states,
-                state=state,
-                optimizers=optimizers,
-                ds=ds,
-                key=key,
-            )
+                state = self.train_loop(
+                    models=models,
+                    opt_states=opt_states,
+                    state=state,
+                    optimizers=optimizers,
+                    ds=ds,
+                    key=key,
+                )
 
-            if is_master():
-                num_steps, num_samples = int(state.num_steps), int(state.num_samples)
-                show_info(f"Finished training after {num_steps} steps, {num_samples} samples", important=True)
+                if is_master():
+                    num_steps, num_samples = int(state.num_steps), int(state.num_samples)
+                    show_info(f"Finished training after {num_steps} steps, {num_samples} samples", important=True)
 
-            self.on_training_end()
+            except BaseException as e:
+                training_error = e
+
+            finally:
+                self.on_training_end()
+
+        # If an error occurred during training, print the traceback and force
+        # exit. This is necessary because JAX/NCCL can leave background threads
+        # in a bad state after an error, which prevents Python from exiting
+        # cleanly.
+        if training_error is not None:
+            traceback.print_exception(type(training_error), training_error, training_error.__traceback__)
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(1)
