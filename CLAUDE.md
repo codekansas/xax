@@ -100,9 +100,22 @@ Launchers in `xax/task/launchers/`:
 
 Abstract `Logger` interface with backends: TensorBoard, W&B, JSON, stdout. Log types include scalars, histograms, images, distributions, meshes.
 
-## Code Style
+### Coding Style
 
 - Python 3.12+, line length 120
-- Google-style docstrings
-- Type hints throughout (jaxtyping for JAX types: `Array`, `PRNGKeyArray`, `PyTree`)
+- Follow Google's Python style guide as closely as possible.
 - Ruff for formatting and linting, ty for type checking
+- Don't add a new line after docstrings (Ruff D202).
+- Almost every repository we're working with uses Python >= 3.11, so we should almost never use `typing.Dict`, `typing.List`, `typing.Union`, or similar - just use `dict`, `list`, `|` or whatever built-in notation.
+- Similarly, we should use advanced Python typing semantics like Protocols to provide proper typechecking for complex components, if needed.
+- Avoid using `typing.Any` as much as possible. If we do use it, we need to mark the line with `noqa: ANN401`
+- Avoid `from __future__ import ...` statements, since we will always expect to use Python 3.11 or later.
+- When writing tests, use pytest functions. Avoid doing `class TestX:` unless it's absolutely necessary.
+
+### Machine Learning
+
+- When useful, use `chex` at the start of a function to do runtime validation on the function's input values.
+- Follow Noam Shazeer's tensor name suffix convention when writing Jax, PyTorch, Tensorflow or Numpy code. This means that, wherever possible, tensor names should be written as `name_bt3` or similar, where `_bt3` represents the tensor dimensions, for example, `b` for batch size, `t` for time, and `3` for a fixed channel dimension.
+- Prefer `idx` over `i` or `index`. Similarly, `for ... in` statements should use variable names that are descriptive.
+- Use `bsz` and `tsz` for tensor batch and time dimension sizes.
+- Don't use capital letters in variable names, even for annotating tensor dimensions. If the letter used to denote the tensor dimension is ambiguous, we can add a comment or docstring message to explain it.

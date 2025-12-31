@@ -357,8 +357,7 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
 
         if isinstance(ds, (IterableDataset, IterableDatasetDict)):
             raise NotImplementedError(
-                "IterableDataset streaming is not yet implemented. "
-                "Use a regular Dataset or set load_in_memory=True."
+                "IterableDataset streaming is not yet implemented. Use a regular Dataset or set load_in_memory=True."
             )
 
         if isinstance(ds, DatasetDict):

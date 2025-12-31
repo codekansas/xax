@@ -17,11 +17,12 @@ __version__ = "0.4.5"
 # This list shouldn't be modified by hand; instead, run the update script.
 __all__ = [
     "AttentionCache",
-    "AttentionCacheDict",
     "CrossAttentionBlock",
+    "Fp8ScalesCache",
     "SelfAttentionBlock",
     "Transformer",
     "TransformerBlock",
+    "TransformerBlockCache",
     "TransformerCache",
     "TransformerStack",
     "BaseODESolver",
@@ -278,11 +279,12 @@ del os, shutil, xla_flags
 # run the update script.
 NAME_MAP: dict[str, str] = {
     "AttentionCache": "arch.attention",
-    "AttentionCacheDict": "arch.attention",
     "CrossAttentionBlock": "arch.attention",
+    "Fp8ScalesCache": "arch.attention",
     "SelfAttentionBlock": "arch.attention",
     "Transformer": "arch.attention",
     "TransformerBlock": "arch.attention",
+    "TransformerBlockCache": "arch.attention",
     "TransformerCache": "arch.attention",
     "TransformerStack": "arch.attention",
     "BaseODESolver": "arch.diffusion",
@@ -529,11 +531,12 @@ def __getattr__(name: str) -> object:
 if IMPORT_ALL or TYPE_CHECKING:
     from xax.arch.attention import (
         AttentionCache,
-        AttentionCacheDict,
         CrossAttentionBlock,
+        Fp8ScalesCache,
         SelfAttentionBlock,
         Transformer,
         TransformerBlock,
+        TransformerBlockCache,
         TransformerCache,
         TransformerStack,
     )

@@ -3,6 +3,8 @@
 This module implements standard attention mechanisms for transformers, but
 supporting a fixed-size context window and caching that can be used to train
 transformers which can be unrolled with a fixed-length cache.
+
+Supports optional FP8 quantization for matrix multiplications when use_fp8=True.
 """
 
 import math
@@ -15,7 +17,131 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, PRNGKeyArray
 
+from xax.nn.fp8 import Fp8Linear, Fp8Scales, init_fp8_scales
 from xax.utils.jax import scan as xax_scan
+
+
+class AttentionCache(TypedDict):
+    k: Array
+    v: Array
+    position: int  # Position counter for rotary embeddings
+
+
+class Fp8ScalesCache(TypedDict):
+    """FP8 scaling state for attention projections."""
+
+    q_proj: NotRequired[Fp8Scales]
+    k_proj: NotRequired[Fp8Scales]
+    v_proj: NotRequired[Fp8Scales]
+    output_proj: NotRequired[Fp8Scales]
+
+
+class TransformerBlockCache(TypedDict):
+    """Cache for a single transformer block including FP8 scales."""
+
+    self_attn: AttentionCache
+    cross_attn: NotRequired[AttentionCache]
+    self_attn_fp8: NotRequired[Fp8ScalesCache]
+    cross_attn_fp8: NotRequired[Fp8ScalesCache]
+
+
+class TransformerCache(TypedDict):
+    """Cache for the entire transformer stack."""
+
+    layers: dict[str, TransformerBlockCache]
+
+
+def _make_linear(
+    in_features: int,
+    out_features: int,
+    key: PRNGKeyArray,
+    use_fp8: bool = False,
+    compute_dtype: jnp.dtype = jnp.bfloat16,
+) -> eqx.nn.Linear | Fp8Linear:
+    """Create a linear layer, optionally with FP8 quantization.
+
+    Args:
+        in_features: Number of input features
+        out_features: Number of output features
+        key: PRNG key for initialization
+        use_fp8: Whether to use FP8 quantization
+        compute_dtype: Compute dtype for FP8 mode
+
+    Returns:
+        Linear layer (Fp8Linear if use_fp8=True, else eqx.nn.Linear)
+    """
+    if use_fp8:
+        return Fp8Linear(
+            in_features,
+            out_features,
+            key=key,
+            use_fp8=True,
+            compute_dtype=compute_dtype,
+        )
+    return eqx.nn.Linear(in_features, out_features, key=key)
+
+
+def _apply_linear_batched(
+    layer: eqx.nn.Linear | Fp8Linear,
+    x: Array,
+    scales: Fp8Scales | None = None,
+) -> tuple[Array, Fp8Scales | None]:
+    """Apply a linear layer to batched input, handling FP8 scaling properly.
+
+    For FP8 with delayed scaling, we want to compute scales from the entire
+    batch/sequence, not per-element. This function handles that case.
+
+    Args:
+        layer: Linear layer (either eqx.nn.Linear or Fp8Linear)
+        x: Input tensor of shape (batch, features)
+        scales: Optional FP8 scales for delayed scaling mode.
+            If None and layer is Fp8Linear, uses current scaling.
+
+    Returns:
+        Tuple of (output tensor, updated scales or None)
+    """
+    if isinstance(layer, Fp8Linear):
+        # For FP8, we want scales computed from the full tensor
+        # Flatten to 1D, apply linear, reshape back
+        batch_shape = x.shape[:-1]
+        x_flat = x.reshape(-1, x.shape[-1])
+
+        # Apply to first element to get scales, then apply to all with those scales
+        if scales is not None:
+            # Delayed scaling: use provided scales, update history from full tensor
+            # Apply linear with vmap but share the scales
+            out_flat, new_scales = jax.vmap(lambda xi: layer(xi, scales=scales))(x_flat)
+            # Take the last updated scales (all should be similar)
+            new_scales = jax.tree.map(lambda x: x[-1], new_scales)
+        else:
+            # Current scaling: compute scale from full tensor
+            # Just vmap and ignore scales (each gets its own current scale)
+            out_flat, _ = jax.vmap(lambda xi: layer(xi, scales=None))(x_flat)
+            new_scales = None
+
+        out = out_flat.reshape(*batch_shape, -1)
+        return out, new_scales
+
+    # Standard linear: just vmap
+    out = jax.vmap(layer)(x)
+    return out, None
+
+
+def _init_fp8_scales_cache(history_length: int) -> Fp8ScalesCache:
+    """Initialize FP8 scales cache for all projection layers.
+
+    Args:
+        history_length: Length of amax history buffer
+
+    Returns:
+        FP8 scales cache for q, k, v, and output projections
+    """
+    return {
+        "q_proj": init_fp8_scales(history_length),
+        "k_proj": init_fp8_scales(history_length),
+        "v_proj": init_fp8_scales(history_length),
+        "output_proj": init_fp8_scales(history_length),
+    }
 
 
 class RotaryEmbedding(eqx.Module):
@@ -109,35 +235,19 @@ class RotaryEmbedding(eqx.Module):
         return result
 
 
-class AttentionCache(TypedDict):
-    k: Array
-    v: Array
-    position: int  # Position counter for rotary embeddings
-
-
-class AttentionCacheDict(TypedDict):
-    self_attn: AttentionCache
-    cross_attn: NotRequired[AttentionCache]
-
-
-class TransformerCache(TypedDict):
-    """Cache for the entire transformer stack."""
-
-    layers: dict[str, AttentionCacheDict]
-
-
 class SelfAttentionBlock(eqx.Module):
     """Self-attention block using jax.nn.dot_product_attention."""
 
-    q_proj: eqx.nn.Linear = eqx.field()
-    k_proj: eqx.nn.Linear = eqx.field()
-    v_proj: eqx.nn.Linear = eqx.field()
-    output_proj: eqx.nn.Linear = eqx.field()
+    q_proj: eqx.nn.Linear | Fp8Linear = eqx.field()
+    k_proj: eqx.nn.Linear | Fp8Linear = eqx.field()
+    v_proj: eqx.nn.Linear | Fp8Linear = eqx.field()
+    output_proj: eqx.nn.Linear | Fp8Linear = eqx.field()
     rotary_emb: RotaryEmbedding | None = eqx.field()
-    num_heads: int = eqx.field()
-    head_dim: int = eqx.field()
-    causal: bool = eqx.field()
-    local_window_size: int | None = eqx.field()
+    num_heads: int = eqx.field(static=True)
+    head_dim: int = eqx.field(static=True)
+    causal: bool = eqx.field(static=True)
+    local_window_size: int | None = eqx.field(static=True)
+    use_fp8: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -149,6 +259,8 @@ class SelfAttentionBlock(eqx.Module):
         context_length: int | None = None,
         use_rotary_embeddings: bool = False,
         rotary_base: float = 10000.0,
+        use_fp8: bool = False,
+        compute_dtype: jnp.dtype = jnp.bfloat16,
     ) -> None:
         if context_length is not None:
             assert context_length > 1, "context_length must be at least 2"
@@ -157,12 +269,13 @@ class SelfAttentionBlock(eqx.Module):
 
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
+        self.use_fp8 = use_fp8
         assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
 
-        self.q_proj = eqx.nn.Linear(embed_dim, embed_dim, key=keys[0])
-        self.k_proj = eqx.nn.Linear(embed_dim, embed_dim, key=keys[1])
-        self.v_proj = eqx.nn.Linear(embed_dim, embed_dim, key=keys[2])
-        self.output_proj = eqx.nn.Linear(embed_dim, embed_dim, key=keys[3])
+        self.q_proj = _make_linear(embed_dim, embed_dim, keys[0], use_fp8, compute_dtype)
+        self.k_proj = _make_linear(embed_dim, embed_dim, keys[1], use_fp8, compute_dtype)
+        self.v_proj = _make_linear(embed_dim, embed_dim, keys[2], use_fp8, compute_dtype)
+        self.output_proj = _make_linear(embed_dim, embed_dim, keys[3], use_fp8, compute_dtype)
 
         # Initialize rotary embeddings if requested
         if use_rotary_embeddings:
@@ -248,7 +361,8 @@ class SelfAttentionBlock(eqx.Module):
         *,
         mask: Array | None = None,
         cache: AttentionCache | None = None,
-    ) -> tuple[Array, AttentionCache]:
+        fp8_scales: Fp8ScalesCache | None = None,
+    ) -> tuple[Array, AttentionCache, Fp8ScalesCache | None]:
         """Apply self-attention.
 
         Args:
@@ -256,16 +370,22 @@ class SelfAttentionBlock(eqx.Module):
             mask: Optional mask of shape (batch_size, num_heads, seq_len,
                 seq_len + cache_len)
             cache: The cached key and value tensors (fixed-length)
+            fp8_scales: Optional FP8 scales for delayed scaling mode.
+                If None and use_fp8=True, uses current scaling.
 
         Returns:
-            The output tensor of shape (seq_len, embed_dim) and updated cache
+            Tuple of (output tensor, updated attention cache, updated FP8 scales)
         """
         chex.assert_rank(x_tn, 2)
 
         # Project inputs to queries, keys, and values
-        q = jax.vmap(self.q_proj)(x_tn)
-        k = jax.vmap(self.k_proj)(x_tn)
-        v = jax.vmap(self.v_proj)(x_tn)
+        q_scales = fp8_scales.get("q_proj") if fp8_scales else None
+        k_scales = fp8_scales.get("k_proj") if fp8_scales else None
+        v_scales = fp8_scales.get("v_proj") if fp8_scales else None
+
+        q, new_q_scales = _apply_linear_batched(self.q_proj, x_tn, q_scales)
+        k, new_k_scales = _apply_linear_batched(self.k_proj, x_tn, k_scales)
+        v, new_v_scales = _apply_linear_batched(self.v_proj, x_tn, v_scales)
 
         # Reshape to multihead format
         q = self._reshape_for_multihead(q)
@@ -313,25 +433,40 @@ class SelfAttentionBlock(eqx.Module):
             )
 
         attn_output = self._combine_heads(attn_output)
-        output = jax.vmap(self.output_proj)(attn_output)
+        out_scales = fp8_scales.get("output_proj") if fp8_scales else None
+        output, new_out_scales = _apply_linear_batched(self.output_proj, attn_output, out_scales)
 
         if self.local_window_size is not None:
             k = k[-self.local_window_size :]
             v = v[-self.local_window_size :]
 
-        return output, {"k": k, "v": v, "position": new_position}
+        # Build updated FP8 scales cache
+        updated_fp8_scales: Fp8ScalesCache | None = None
+        if fp8_scales is not None and self.use_fp8:
+            updated_fp8_scales = {}
+            if new_q_scales is not None:
+                updated_fp8_scales["q_proj"] = new_q_scales
+            if new_k_scales is not None:
+                updated_fp8_scales["k_proj"] = new_k_scales
+            if new_v_scales is not None:
+                updated_fp8_scales["v_proj"] = new_v_scales
+            if new_out_scales is not None:
+                updated_fp8_scales["output_proj"] = new_out_scales
+
+        return output, {"k": k, "v": v, "position": new_position}, updated_fp8_scales
 
 
 class CrossAttentionBlock(eqx.Module):
     """Cross-attention block using jax.nn.dot_product_attention."""
 
-    q_proj: eqx.nn.Linear
-    k_proj: eqx.nn.Linear
-    v_proj: eqx.nn.Linear
-    output_proj: eqx.nn.Linear
+    q_proj: eqx.nn.Linear | Fp8Linear
+    k_proj: eqx.nn.Linear | Fp8Linear
+    v_proj: eqx.nn.Linear | Fp8Linear
+    output_proj: eqx.nn.Linear | Fp8Linear
     rotary_emb: RotaryEmbedding | None
-    num_heads: int = eqx.field()
-    head_dim: int = eqx.field()
+    num_heads: int = eqx.field(static=True)
+    head_dim: int = eqx.field(static=True)
+    use_fp8: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -341,17 +476,20 @@ class CrossAttentionBlock(eqx.Module):
         key: PRNGKeyArray,
         use_rotary_embeddings: bool = False,
         rotary_base: float = 10000.0,
+        use_fp8: bool = False,
+        compute_dtype: jnp.dtype = jnp.bfloat16,
     ) -> None:
         keys = jax.random.split(key, 4)
 
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
+        self.use_fp8 = use_fp8
         assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
 
-        self.q_proj = eqx.nn.Linear(embed_dim, embed_dim, key=keys[0])
-        self.k_proj = eqx.nn.Linear(embed_dim, embed_dim, key=keys[1])
-        self.v_proj = eqx.nn.Linear(embed_dim, embed_dim, key=keys[2])
-        self.output_proj = eqx.nn.Linear(embed_dim, embed_dim, key=keys[3])
+        self.q_proj = _make_linear(embed_dim, embed_dim, keys[0], use_fp8, compute_dtype)
+        self.k_proj = _make_linear(embed_dim, embed_dim, keys[1], use_fp8, compute_dtype)
+        self.v_proj = _make_linear(embed_dim, embed_dim, keys[2], use_fp8, compute_dtype)
+        self.output_proj = _make_linear(embed_dim, embed_dim, keys[3], use_fp8, compute_dtype)
 
         # Initialize rotary embeddings if requested
         if use_rotary_embeddings:
@@ -372,15 +510,42 @@ class CrossAttentionBlock(eqx.Module):
         seq_len, _, _ = x.shape
         return x.reshape(seq_len, -1)
 
-    def init_cache(self, kv_sn: Array) -> AttentionCache:
-        """Initialize cache for the input."""
+    def init_cache(
+        self, kv_sn: Array, fp8_scales: Fp8ScalesCache | None = None
+    ) -> tuple[AttentionCache, Fp8ScalesCache | None]:
+        """Initialize cache for the input.
+
+        Args:
+            kv_sn: Key/value input tensor of shape (kv_seq_len, embed_dim)
+            fp8_scales: Optional FP8 scales for delayed scaling mode
+
+        Returns:
+            Tuple of (attention cache, updated FP8 scales)
+        """
         chex.assert_rank(kv_sn, 2)
-        k = jax.vmap(self.k_proj)(kv_sn)
-        v = jax.vmap(self.v_proj)(kv_sn)
+        k_scales = fp8_scales.get("k_proj") if fp8_scales else None
+        v_scales = fp8_scales.get("v_proj") if fp8_scales else None
+
+        k, new_k_scales = _apply_linear_batched(self.k_proj, kv_sn, k_scales)
+        v, new_v_scales = _apply_linear_batched(self.v_proj, kv_sn, v_scales)
+
         # Reshape to multihead format
         k = self._reshape_for_multihead(k)
         v = self._reshape_for_multihead(v)
-        return {"k": k, "v": v, "position": 0}
+
+        # Build updated FP8 scales
+        updated_fp8_scales: Fp8ScalesCache | None = None
+        if fp8_scales is not None and self.use_fp8:
+            new_fp8: Fp8ScalesCache = {}
+            for key, val in fp8_scales.items():
+                new_fp8[key] = val  # type: ignore[literal-required]
+            if new_k_scales is not None:
+                new_fp8["k_proj"] = new_k_scales
+            if new_v_scales is not None:
+                new_fp8["v_proj"] = new_v_scales
+            updated_fp8_scales = new_fp8
+
+        return {"k": k, "v": v, "position": 0}, updated_fp8_scales
 
     def forward(
         self,
@@ -388,7 +553,8 @@ class CrossAttentionBlock(eqx.Module):
         *,
         kv_sn: Array | None = None,
         cache: AttentionCache | None = None,
-    ) -> tuple[Array, AttentionCache]:
+        fp8_scales: Fp8ScalesCache | None = None,
+    ) -> tuple[Array, AttentionCache, Fp8ScalesCache | None]:
         """Apply cross-attention.
 
         Args:
@@ -397,16 +563,22 @@ class CrossAttentionBlock(eqx.Module):
                 If not provided, then `cache` must be provided.
             cache: The cached key and value tensors. If not provided, then
                 `kv_sn` must be provided.
+            fp8_scales: Optional FP8 scales for delayed scaling mode.
 
         Returns:
-            The output tensor of shape (q_seq_len, embed_dim)
+            Tuple of (output tensor, attention cache, updated FP8 scales)
         """
         chex.assert_rank(q_tn, 2)
 
-        # Project inputs to queries, keys, and values
-        q = jax.vmap(self.q_proj)(q_tn)
+        # Project queries
+        q_scales = fp8_scales.get("q_proj") if fp8_scales else None
+        q, new_q_scales = _apply_linear_batched(self.q_proj, q_tn, q_scales)
         q = self._reshape_for_multihead(q)
         q_seq_len = q.shape[0]
+
+        # Track updated scales
+        new_k_scales = None
+        new_v_scales = None
 
         # Use cached key/value if provided
         if cache is not None:
@@ -415,8 +587,11 @@ class CrossAttentionBlock(eqx.Module):
             q_position = cache["position"]
         elif kv_sn is not None:
             chex.assert_rank(kv_sn, 2)
-            k = jax.vmap(self.k_proj)(kv_sn)
-            v = jax.vmap(self.v_proj)(kv_sn)
+            k_scales = fp8_scales.get("k_proj") if fp8_scales else None
+            v_scales = fp8_scales.get("v_proj") if fp8_scales else None
+
+            k, new_k_scales = _apply_linear_batched(self.k_proj, kv_sn, k_scales)
+            v, new_v_scales = _apply_linear_batched(self.v_proj, kv_sn, v_scales)
             k = self._reshape_for_multihead(k)
             v = self._reshape_for_multihead(v)
             q_position = 0
@@ -446,9 +621,23 @@ class CrossAttentionBlock(eqx.Module):
         attn_output = self._combine_heads(attn_output)
 
         # Final projection
-        output = jax.vmap(self.output_proj)(attn_output)
+        out_scales = fp8_scales.get("output_proj") if fp8_scales else None
+        output, new_out_scales = _apply_linear_batched(self.output_proj, attn_output, out_scales)
 
-        return output, {"k": k, "v": v, "position": q_position + q_seq_len}
+        # Build updated FP8 scales cache
+        updated_fp8_scales: Fp8ScalesCache | None = None
+        if fp8_scales is not None and self.use_fp8:
+            updated_fp8_scales = {}
+            if new_q_scales is not None:
+                updated_fp8_scales["q_proj"] = new_q_scales
+            if new_k_scales is not None:
+                updated_fp8_scales["k_proj"] = new_k_scales
+            if new_v_scales is not None:
+                updated_fp8_scales["v_proj"] = new_v_scales
+            if new_out_scales is not None:
+                updated_fp8_scales["output_proj"] = new_out_scales
+
+        return output, {"k": k, "v": v, "position": q_position + q_seq_len}, updated_fp8_scales
 
 
 class TransformerBlock(eqx.Module):
@@ -458,10 +647,11 @@ class TransformerBlock(eqx.Module):
     layer_norm1: eqx.nn.LayerNorm
     layer_norm2: eqx.nn.LayerNorm
     layer_norm3: eqx.nn.LayerNorm | None
-    num_heads: int = eqx.field()
-    head_dim: int = eqx.field()
-    causal: bool = eqx.field()
-    context_length: int | None = eqx.field()
+    num_heads: int = eqx.field(static=True)
+    head_dim: int = eqx.field(static=True)
+    causal: bool = eqx.field(static=True)
+    context_length: int | None = eqx.field(static=True)
+    use_fp8: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -475,8 +665,12 @@ class TransformerBlock(eqx.Module):
         context_length: int | None = None,
         use_rotary_embeddings: bool = False,
         rotary_base: float = 10000.0,
+        use_fp8: bool = False,
+        compute_dtype: jnp.dtype = jnp.bfloat16,
     ) -> None:
         keys = jax.random.split(key, 3)
+
+        self.use_fp8 = use_fp8
 
         self.self_attn = SelfAttentionBlock(
             embed_dim=embed_dim,
@@ -486,6 +680,8 @@ class TransformerBlock(eqx.Module):
             context_length=context_length,
             use_rotary_embeddings=use_rotary_embeddings,
             rotary_base=rotary_base,
+            use_fp8=use_fp8,
+            compute_dtype=compute_dtype,
         )
 
         if cross_attention:
@@ -495,6 +691,8 @@ class TransformerBlock(eqx.Module):
                 key=keys[1],
                 use_rotary_embeddings=use_rotary_embeddings,
                 rotary_base=rotary_base,
+                use_fp8=use_fp8,
+                compute_dtype=compute_dtype,
             )
             self.layer_norm3 = eqx.nn.LayerNorm(embed_dim)
 
@@ -523,15 +721,38 @@ class TransformerBlock(eqx.Module):
     def embed_dim(self) -> int:
         return self.head_dim * self.num_heads
 
-    def init_cache(self, dtype: jnp.dtype | None = None, context_sn: Array | None = None) -> AttentionCacheDict:
-        """Initialize cache for the input."""
+    def init_cache(
+        self,
+        dtype: jnp.dtype | None = None,
+        context_sn: Array | None = None,
+        fp8_history_length: int | None = None,
+    ) -> TransformerBlockCache:
+        """Initialize cache for the input.
+
+        Args:
+            dtype: Data type for cache tensors
+            context_sn: Context sequence for cross-attention
+            fp8_history_length: If provided, also initialize FP8 scales for delayed scaling
+
+        Returns:
+            Cache containing attention state and optionally FP8 scales
+        """
         if dtype is None and context_sn is not None:
             dtype = context_sn.dtype
-        cache: AttentionCacheDict = {"self_attn": self.self_attn.init_cache(dtype=dtype)}
+        cache: TransformerBlockCache = {"self_attn": self.self_attn.init_cache(dtype=dtype)}
         if self.cross_attn is not None:
             if context_sn is None:
-                raise ValueError("x_tn must be provided if cross_attn is not None")
-            cache["cross_attn"] = self.cross_attn.init_cache(kv_sn=context_sn)
+                raise ValueError("context_sn must be provided if cross_attn is not None")
+            cross_cache, _ = self.cross_attn.init_cache(kv_sn=context_sn)
+            cache["cross_attn"] = cross_cache
+
+        # Initialize FP8 scales if requested
+        if fp8_history_length is not None:
+            if self.self_attn.use_fp8:
+                cache["self_attn_fp8"] = _init_fp8_scales_cache(fp8_history_length)
+            if self.cross_attn is not None and self.cross_attn.use_fp8:
+                cache["cross_attn_fp8"] = _init_fp8_scales_cache(fp8_history_length)
+
         return cache
 
     def init_mask(
@@ -552,8 +773,8 @@ class TransformerBlock(eqx.Module):
         *,
         context_sn: Array | None = None,
         mask: Array | None = None,
-        cache: AttentionCacheDict | None = None,
-    ) -> tuple[Array, AttentionCacheDict]:
+        cache: TransformerBlockCache | None = None,
+    ) -> tuple[Array, TransformerBlockCache]:
         """Apply transformer block.
 
         Args:
@@ -562,6 +783,7 @@ class TransformerBlock(eqx.Module):
             mask: Optional mask of shape (batch_size, num_heads, seq_len,
                 seq_len + cache_len)
             cache: Optional dictionary containing cached key and value tensors
+                and FP8 scales
 
         Returns:
             The output tensor and the updated cache
@@ -571,12 +793,16 @@ class TransformerBlock(eqx.Module):
         # Self-attention block with pre-norm
         norm_x = jax.vmap(self.layer_norm1)(x_tn)
 
-        attn_output, self_attn_cache = self.self_attn.forward(
+        self_attn_fp8 = cache.get("self_attn_fp8") if cache else None
+        attn_output, self_attn_cache, updated_self_fp8 = self.self_attn.forward(
             x_tn=norm_x,
             mask=mask,
-            cache=None if cache is None else cache["self_attn"],
+            cache=None if cache is None else cache.get("self_attn"),
+            fp8_scales=self_attn_fp8,
         )
-        updated_cache: AttentionCacheDict = {"self_attn": self_attn_cache}
+        updated_cache: TransformerBlockCache = {"self_attn": self_attn_cache}
+        if updated_self_fp8 is not None:
+            updated_cache["self_attn_fp8"] = updated_self_fp8
 
         x_tn = x_tn + attn_output
 
@@ -586,11 +812,16 @@ class TransformerBlock(eqx.Module):
 
             norm_x = jax.vmap(self.layer_norm3)(x_tn)
 
-            cross_attn_output, updated_cache["cross_attn"] = self.cross_attn.forward(
+            cross_attn_fp8 = cache.get("cross_attn_fp8") if cache else None
+            cross_attn_output, cross_cache, updated_cross_fp8 = self.cross_attn.forward(
                 q_tn=norm_x,
                 kv_sn=context_sn,
                 cache=None if cache is None else cache.get("cross_attn"),
+                fp8_scales=cross_attn_fp8,
             )
+            updated_cache["cross_attn"] = cross_cache
+            if updated_cross_fp8 is not None:
+                updated_cache["cross_attn_fp8"] = updated_cross_fp8
 
             x_tn = x_tn + cross_attn_output
 
@@ -606,8 +837,9 @@ class TransformerStack(eqx.Module):
     """A stack of transformer blocks."""
 
     layers: tuple[TransformerBlock, ...]
-    num_layers: int = eqx.field()
-    causal: bool = eqx.field()
+    num_layers: int = eqx.field(static=True)
+    causal: bool = eqx.field(static=True)
+    use_fp8: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -622,6 +854,8 @@ class TransformerStack(eqx.Module):
         context_length: int | None = None,
         use_rotary_embeddings: bool = False,
         rotary_base: float = 10000.0,
+        use_fp8: bool = False,
+        compute_dtype: jnp.dtype = jnp.bfloat16,
     ) -> None:
         keys = jax.random.split(key, num_layers)
 
@@ -636,18 +870,35 @@ class TransformerStack(eqx.Module):
                 context_length=context_length,
                 use_rotary_embeddings=use_rotary_embeddings,
                 rotary_base=rotary_base,
+                use_fp8=use_fp8,
+                compute_dtype=compute_dtype,
             )
             for i in range(num_layers)
         )
 
         self.num_layers = num_layers
         self.causal = causal
+        self.use_fp8 = use_fp8
 
-    def init_cache(self, dtype: jnp.dtype | None = None, x_tn: Array | None = None) -> TransformerCache:
-        """Initialize cache for the input."""
+    def init_cache(
+        self,
+        dtype: jnp.dtype | None = None,
+        x_tn: Array | None = None,
+        fp8_history_length: int | None = None,
+    ) -> TransformerCache:
+        """Initialize cache for all layers.
+
+        Args:
+            dtype: Data type for cache tensors
+            x_tn: Context sequence for cross-attention
+            fp8_history_length: If provided, also initialize FP8 scales for delayed scaling
+
+        Returns:
+            Cache containing attention state for all layers
+        """
         cache = {}
         for i, layer in enumerate(self.layers):
-            cache[f"layer_{i}"] = layer.init_cache(dtype=dtype, context_sn=x_tn)
+            cache[f"layer_{i}"] = layer.init_cache(dtype=dtype, context_sn=x_tn, fp8_history_length=fp8_history_length)
         return {"layers": cache}
 
     def init_mask(
@@ -706,11 +957,12 @@ class TransformerStack(eqx.Module):
 class Transformer(eqx.Module):
     token_embedding: eqx.nn.Embedding
     layers: TransformerStack
-    output_layer: eqx.nn.Linear | None
+    output_layer: eqx.nn.Linear | Fp8Linear | None
     layer_norm: eqx.nn.LayerNorm
     embed_dim: int = eqx.field()
     causal: bool = eqx.field()
     context_length: int | None = eqx.field()
+    use_fp8: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -727,12 +979,15 @@ class Transformer(eqx.Module):
         context_length: int | None = None,
         use_rotary_embeddings: bool = False,
         rotary_base: float = 10000.0,
+        use_fp8: bool = False,
+        compute_dtype: jnp.dtype = jnp.bfloat16,
     ) -> None:
         # Calculate number of keys needed
         num_keys = 3 if output_size is None else 4
         keys = jax.random.split(key, num_keys)
 
         self.token_embedding = eqx.nn.Embedding(vocab_size, embed_dim, key=keys[0])
+        self.use_fp8 = use_fp8
 
         self.layers = TransformerStack(
             embed_dim=embed_dim,
@@ -745,11 +1000,13 @@ class Transformer(eqx.Module):
             context_length=context_length,
             use_rotary_embeddings=use_rotary_embeddings,
             rotary_base=rotary_base,
+            use_fp8=use_fp8,
+            compute_dtype=compute_dtype,
         )
 
         self.layer_norm = eqx.nn.LayerNorm(embed_dim)
         if output_size is not None:
-            self.output_layer = eqx.nn.Linear(embed_dim, output_size, key=keys[3])
+            self.output_layer = _make_linear(embed_dim, output_size, keys[3], use_fp8, compute_dtype)
         else:
             self.output_layer = None
 
@@ -757,9 +1014,14 @@ class Transformer(eqx.Module):
         self.causal = causal
         self.context_length = context_length
 
-    def init_cache(self, dtype: jnp.dtype | None = None, x_tn: Array | None = None) -> TransformerCache:
+    def init_cache(
+        self,
+        dtype: jnp.dtype | None = None,
+        x_tn: Array | None = None,
+        fp8_history_length: int | None = None,
+    ) -> TransformerCache:
         """Initialize cache for the input."""
-        return self.layers.init_cache(dtype=dtype, x_tn=x_tn)
+        return self.layers.init_cache(dtype=dtype, x_tn=x_tn, fp8_history_length=fp8_history_length)
 
     def init_mask(
         self,
@@ -866,7 +1128,7 @@ class Transformer(eqx.Module):
 
         # Apply output layer if it exists
         if self.output_layer is not None:
-            output = jax.vmap(self.output_layer)(output)
+            output, _ = _apply_linear_batched(self.output_layer, output)
 
         return output, updated_cache
 

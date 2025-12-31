@@ -83,7 +83,7 @@ class MnistClassification(xax.SupervisedTask[Config]):
             key=params.key,
         )
 
-    def get_optimizer(self) -> optax.GradientTransformation:
+    def get_optimizer(self) -> optax.MultiSteps:
         opt = optax.adam(self.config.learning_rate)
 
         # Gradient accumulation.
