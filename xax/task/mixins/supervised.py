@@ -54,7 +54,7 @@ class SupervisedMixin(
     Generic[Config],
     ABC,
 ):
-    def get_output(self, model: PyTree, batch: Batch, state: State | None, key: PRNGKeyArray) -> Output:
+    def get_output(self, model: PyTree, batch: Batch, state: State, key: PRNGKeyArray) -> Output:
         """Gets the output from the model.
 
         By default, we assume the model is a function that takes the batch as
@@ -72,9 +72,7 @@ class SupervisedMixin(
         """
         raise NotImplementedError("`get_output` must be implemented by the subclass")
 
-    def compute_loss(
-        self, model: PyTree, batch: Batch, output: Output, state: State | None, key: PRNGKeyArray
-    ) -> Array:
+    def compute_loss(self, model: PyTree, batch: Batch, output: Output, state: State, key: PRNGKeyArray) -> Array:
         """Gets the loss for the current batch.
 
         By default, we assume the model is a function that takes the batch as
@@ -134,11 +132,7 @@ class SupervisedMixin(
         self.log_state_timers(state)
         self.write_logs(state, heavy)
 
-    def create_train_step_fn(
-        self,
-        model_static: PyTree,
-        optimizer: Optimizer,
-    ) -> jax.stages.Wrapped:
+    def create_train_step_fn(self, model_static: PyTree, optimizer: Optimizer) -> jax.stages.Wrapped:
         """Create a JIT-compiled training step function.
 
         Args:
