@@ -15,6 +15,7 @@ from typing import (
     Iterator,
     Sequence,
     TypeVar,
+    cast,
 )
 
 import equinox as eqx
@@ -134,16 +135,20 @@ class SupervisedMixin(
         self.write_logs(state, heavy)
 
     def create_train_step_fn(
-        self, model_static: PyTree, optimizer: Optimizer
+        self,
+        model_static: PyTree,
+        optimizer: Optimizer,
+        heavy: bool,
     ) -> Callable[
         [PyTree, optax.OptState, Batch, State, PRNGKeyArray],
-        tuple[PyTree, optax.OptState, Array, Array, Output],
+        tuple[PyTree, optax.OptState, State, dict[str, Metric]],
     ]:
         """Create a JIT-compiled training step function.
 
         Args:
             model_static: The static (non-trainable) parts of the model.
             optimizer: The optimizer.
+            heavy: Whether to compute heavy metrics.
 
         Returns:
             A JIT-compiled function that performs one training step.
@@ -156,6 +161,7 @@ class SupervisedMixin(
         # Capture methods for use in inner function
         get_output = self.get_output
         compute_loss = self.compute_loss
+        compute_metrics = self.compute_metrics
         cast_compute_dtype = self.cast_compute_dtype
 
         def train_step(
@@ -164,7 +170,7 @@ class SupervisedMixin(
             batches: Batch,
             state: State,
             key: PRNGKeyArray,
-        ) -> tuple[PyTree, optax.OptState, Array, Array, Output]:
+        ) -> tuple[PyTree, optax.OptState, State, dict[str, Metric], Array]:
             def compute_grads_and_loss(
                 model_arr: PyTree, batch: Batch, step_key: PRNGKeyArray
             ) -> tuple[PyTree, Array, Output]:
@@ -205,7 +211,7 @@ class SupervisedMixin(
                 acc_loss = acc_loss / num_accum_steps
 
             # Clip gradients if configured
-            grad_norm = optax.global_norm(acc_grads)
+            grad_norm = cast(Array, optax.global_norm(acc_grads))
             if max_grad_norm is not None:
                 clip_fn = optax.clip_by_global_norm(max_grad_norm)
                 clip_state = clip_fn.init(acc_grads)
@@ -218,7 +224,27 @@ class SupervisedMixin(
 
             # Return the last output for metrics
             output = jax.tree.map(lambda x: x[-1], outputs)
-            return new_model_arr, new_opt_state, acc_loss, grad_norm, output  # type: ignore[return-value]
+
+            # Calculate batch size and update state
+            first_leaf = jax.tree.leaves(batches)[0]
+            batch_size = first_leaf.shape[1]
+            total_samples = batch_size * num_accum_steps
+            new_state = state.replace(
+                num_steps=state.num_steps + 1,
+                num_samples=state.num_samples + total_samples,
+            )
+
+            # Extract batch for metrics computation
+            batch = jax.tree.map(lambda x: x[-1], batches)
+            batch = jax.tree.map(lambda x: x.astype(jnp.float32) if eqx.is_inexact_array(x) else x, batch)
+            model = eqx.combine(new_model_arr, model_static)
+
+            # Compute metrics
+            metrics = compute_metrics(model, batch, output, new_state, heavy, key)
+            metrics["loss"] = Scalar(acc_loss)
+            metrics["grad_norm"] = Scalar(grad_norm)
+
+            return new_model_arr, new_opt_state, new_state, metrics
 
         return jax.jit(train_step)
 
@@ -230,7 +256,6 @@ class SupervisedMixin(
         optimizers: Sequence[Optimizer],
         ds: Iterator[Batch],
         key: PRNGKeyArray,
-        devices: Sequence[jax.Device] | None = None,
     ) -> State:
         if len(models) != 1 or len(optimizers) != 1 or len(opt_states) != 1:
             raise ValueError(
@@ -243,7 +268,8 @@ class SupervisedMixin(
         opt_state = opt_states[0]
 
         # Create JIT-compiled train step
-        train_step_fn = self.create_train_step_fn(model_static, optimizer)
+        light_train_step_fn = self.create_train_step_fn(model_static, optimizer, False)
+        heavy_train_step_fn = self.create_train_step_fn(model_static, optimizer, True)
 
         def save_checkpoint() -> None:
             model = eqx.combine(model_arr, model_static)
@@ -267,38 +293,21 @@ class SupervisedMixin(
                     batches = tuple(itertools.islice(ds, self.config.gradient_accumulation_steps))
                     batches_stacked = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *batches)
 
-                state, heavy_arr = self.get_log_mode(state)
-                heavy = heavy_arr.item()
                 step_key, key = jax.random.split(key)
 
-                # Calculate batch size
-                first_leaf = jax.tree.leaves(batches_stacked)[0]
-                batch_size = first_leaf.shape[1]
+                # Get log mode (heavy flag) and update state.
+                state, heavy_arr = self.get_log_mode(state)
+                heavy = heavy_arr.item()
 
                 # Execute training step
-                model_arr, opt_state, loss, grad_norm, output = train_step_fn(
+                train_step_fn = heavy_train_step_fn if heavy else light_train_step_fn
+                model_arr, opt_state, state, metrics = train_step_fn(
                     model_arr,
                     opt_state,
                     batches_stacked,
                     state,
                     step_key,
                 )
-
-                # Compute metrics
-                batch = jax.tree.map(lambda x: x[-1], batches_stacked)
-                batch = jax.tree.map(lambda x: x.astype(jnp.float32) if eqx.is_inexact_array(x) else x, batch)
-                model = eqx.combine(model_arr, model_static)
-                metrics = self.compute_metrics(model, batch, output, state, heavy, step_key)
-
-                # Update state
-                total_samples = batch_size * self.config.gradient_accumulation_steps
-                state = state.replace(
-                    num_steps=state.num_steps + 1,
-                    num_samples=state.num_samples + total_samples,
-                )
-
-                metrics["loss"] = Scalar(loss)
-                metrics["grad_norm"] = Scalar(grad_norm)
 
                 self.log_step(FrozenDict(metrics), state, heavy)
                 self.on_step_end()
