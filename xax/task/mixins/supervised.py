@@ -14,7 +14,6 @@ from typing import (
     Iterator,
     Sequence,
     TypeVar,
-    cast,
 )
 
 import equinox as eqx
@@ -31,7 +30,6 @@ from xax.task.logger import Metric, Scalar
 from xax.task.mixins.data_loader import InMemoryBatchIterator
 from xax.task.mixins.train import InitParams, Optimizer, TrainConfig, TrainMixin
 from xax.utils.experiments import ContextTimer
-from xax.utils.jax import jit as xax_jit
 from xax.utils.logging import LOG_PING
 from xax.utils.pytree import get_pytree_param_count
 from xax.utils.text import show_info
@@ -56,7 +54,7 @@ class SupervisedMixin(
     Generic[Config],
     ABC,
 ):
-    def get_output(self, model: PyTree, batch: Batch, state: State, key: PRNGKeyArray) -> Output:
+    def get_output(self, model: PyTree, batch: Batch, state: State | None, key: PRNGKeyArray) -> Output:
         """Gets the output from the model.
 
         By default, we assume the model is a function that takes the batch as
@@ -66,7 +64,7 @@ class SupervisedMixin(
         Args:
             model: The current model.
             batch: The current minibatch of samples.
-            state: The current training state.
+            state: The current training state, or None during pmap execution.
             key: The current PRNG key.
 
         Returns:
@@ -74,7 +72,9 @@ class SupervisedMixin(
         """
         raise NotImplementedError("`get_output` must be implemented by the subclass")
 
-    def compute_loss(self, model: PyTree, batch: Batch, output: Output, state: State, key: PRNGKeyArray) -> Array:
+    def compute_loss(
+        self, model: PyTree, batch: Batch, output: Output, state: State | None, key: PRNGKeyArray
+    ) -> Array:
         """Gets the loss for the current batch.
 
         By default, we assume the model is a function that takes the batch as
@@ -85,7 +85,7 @@ class SupervisedMixin(
             model: The current model.
             batch: The current minibatch of samples.
             output: The output from the model.
-            state: The current training state.
+            state: The current training state, or None during pmap execution.
             key: The current PRNG key.
 
         Returns:
@@ -119,106 +119,6 @@ class SupervisedMixin(
         """
         return {}
 
-    @xax_jit(static_argnames=["self", "model_static"], jit_level=3)
-    def get_output_and_loss(
-        self,
-        model_arr: PyTree,
-        model_static: PyTree,
-        batch: Batch,
-        state: State,
-        key: PRNGKeyArray,
-    ) -> tuple[Array, Output]:
-        output_key, loss_key = jax.random.split(key)
-        model = eqx.combine(model_arr, model_static)
-        # Cast batch from data_dtype to compute_dtype for forward pass
-        batch = jax.tree.map(self.cast_compute_dtype, batch)
-        output = self.get_output(model, batch, state, output_key)
-        loss = self.compute_loss(model, batch, output, state, loss_key)
-        return loss, (loss, output)
-
-    @xax_jit(
-        static_argnames=["self", "model_static"],
-        donate_argnames=["batch", "key"],
-        jit_level=3,
-    )
-    def compute_gradients(
-        self,
-        model_arr: PyTree,
-        model_static: PyTree,
-        batch: Batch,
-        state: State,
-        key: PRNGKeyArray,
-    ) -> tuple[PyTree, Array, Output]:
-        """Compute gradients for a single batch.
-
-        This function computes gradients without applying them, enabling
-        gradient accumulation across multiple batches before syncing.
-
-        Args:
-            model_arr: The model array parameters.
-            model_static: The model static parameters.
-            batch: The current minibatch of samples.
-            state: The current training state.
-            key: The current PRNG key.
-
-        Returns:
-            A tuple of (gradients, loss, output).
-        """
-        grad_fn = jax.grad(self.get_output_and_loss, argnums=0, has_aux=True)
-        grad_fn = xax_jit(static_argnums=[1], jit_level=3)(grad_fn)
-        grads, aux = grad_fn(model_arr, model_static, batch, state, key)
-        loss, output = cast(tuple[Array, Output], aux)
-
-        # Cast gradients to grad_dtype for accumulation
-        grad_dtype = self.config.precision.grad_jax_dtype
-        grads = jax.tree.map(lambda g: g.astype(grad_dtype) if eqx.is_inexact_array(g) else g, grads)
-
-        return grads, loss, output
-
-    @xax_jit(
-        static_argnames=["self", "optimizer"],
-        donate_argnames=["model_arr", "opt_state", "grads"],
-        jit_level=3,
-    )
-    def apply_gradients(
-        self,
-        model_arr: PyTree,
-        optimizer: optax.GradientTransformation,
-        opt_state: optax.OptState,
-        grads: PyTree,
-        loss: Array,
-    ) -> tuple[PyTree, optax.OptState, Array, Array]:
-        """Apply gradients to update the model.
-
-        This function handles gradient clipping and optimizer updates.
-        Gradient synchronization across devices should be done before calling this.
-
-        Args:
-            model_arr: The model array parameters.
-            optimizer: The optimizer.
-            opt_state: The optimizer state.
-            grads: The gradients (already synchronized if multi-device).
-            loss: The loss (already synchronized if multi-device).
-
-        Returns:
-            A tuple of (updated_model_arr, updated_opt_state, loss, grad_norm).
-        """
-        grad_norm = optax.global_norm(grads)
-        if self.config.max_grad_norm is not None:
-            clip_fn = optax.clip_by_global_norm(self.config.max_grad_norm)
-            clip_state = clip_fn.init(grads)  # Fine since this function is init_empty_state
-            grads, _ = clip_fn.update(grads, clip_state)
-
-        updates, opt_state = optimizer.update(grads, opt_state, model_arr)
-
-        # Cast updates to param_dtype before applying (needed when grad_dtype != param_dtype)
-        param_dtype = self.config.precision.param_jax_dtype
-        updates = jax.tree.map(lambda u: u.astype(param_dtype) if eqx.is_inexact_array(u) else u, updates)
-
-        model_arr = eqx.apply_updates(model_arr, updates)
-
-        return model_arr, opt_state, loss, grad_norm  # type: ignore[return-value]
-
     def decode_tokens(self, tokens: Array) -> str:
         raise NotImplementedError(
             "When using a Tokens metric you must implement the `decode_tokens` method "
@@ -234,140 +134,93 @@ class SupervisedMixin(
         self.log_state_timers(state)
         self.write_logs(state, heavy)
 
-    def train_step_pmap(
+    def create_train_step_fn(
         self,
-        model_arr: PyTree,
         model_static: PyTree,
         optimizer: Optimizer,
-        opt_state: optax.OptState,
-        batches_pmap: Batch,
-        state: State,
-        key: PRNGKeyArray,
-        num_devices: int,
-    ) -> tuple[PyTree, optax.OptState, Array, Array, Output]:
-        """Run a single pmap training step.
-
-        This is the inner training step that runs on replicated model/opt_state.
-        Model and opt_state should already be in replicated form (num_devices, ...).
-        Returns replicated outputs.
+    ) -> jax.stages.Wrapped:
+        """Create a JIT-compiled training step function.
 
         Args:
-            model_arr: Replicated model array (num_devices, ...).
-            model_static: The model static parameters.
+            model_static: The static (non-trainable) parts of the model.
             optimizer: The optimizer.
-            opt_state: Replicated optimizer state (num_devices, ...).
-            batches_pmap: Batches reshaped for pmap (num_devices, num_accum, local_batch, ...).
-            state: The training state.
-            key: The PRNG key.
-            num_devices: Number of devices.
 
         Returns:
-            Replicated (model_arr, opt_state, loss, grad_norm, output).
+            A JIT-compiled function that performs one training step.
         """
         num_accum_steps = self.config.gradient_accumulation_steps
         grad_dtype = self.config.precision.grad_jax_dtype
         param_dtype = self.config.precision.param_jax_dtype
         max_grad_norm = self.config.max_grad_norm
 
-        def compute_grads_and_loss(model_arr: PyTree, batch: Batch, key: PRNGKeyArray) -> tuple[PyTree, Array, Output]:  # noqa: ANN001
-            """Compute gradients and loss for a local batch shard."""
+        # Capture methods for use in inner function
+        get_output = self.get_output
+        compute_loss = self.compute_loss
+        cast_compute_dtype = self.cast_compute_dtype
 
-            def loss_fn(model_arr: PyTree) -> tuple[Array, Output]:  # noqa: ANN001
-                model = eqx.combine(model_arr, model_static)
-                batch_casted = jax.tree.map(self.cast_compute_dtype, batch)
-                output_key, loss_key = jax.random.split(key)
-                output = self.get_output(model, batch_casted, state, output_key)
-                loss = self.compute_loss(model, batch_casted, output, state, loss_key)
-                return loss, output
-
-            (loss, output), grads = jax.value_and_grad(loss_fn, has_aux=True)(model_arr)
-            grads = jax.tree.map(lambda g: g.astype(grad_dtype) if eqx.is_inexact_array(g) else g, grads)
-            return grads, loss, output
-
-        def pmap_train_step(  # noqa: ANN001, ANN202
+        def train_step(
             model_arr: PyTree,
             opt_state: optax.OptState,
             batches: Batch,
-            keys: PRNGKeyArray,
+            state: State,
+            key: PRNGKeyArray,
         ) -> tuple[PyTree, optax.OptState, Array, Array, Output]:
-            """Run training step on each device shard, aggregate gradients."""
+            def compute_grads_and_loss(
+                model_arr: PyTree, batch: Batch, step_key: PRNGKeyArray
+            ) -> tuple[PyTree, Array, Output]:
+                def loss_fn(model_arr: PyTree) -> tuple[Array, Output]:
+                    model = eqx.combine(model_arr, model_static)
+                    batch_casted = jax.tree.map(cast_compute_dtype, batch)
+                    output_key, loss_key = jax.random.split(step_key)
+                    output = get_output(model, batch_casted, state, output_key)
+                    loss = compute_loss(model, batch_casted, output, state, loss_key)
+                    return loss, output
 
-            def accumulate_and_update(  # noqa: ANN001, ANN202
-                model_arr: PyTree, opt_state: optax.OptState, batches: Batch, key: PRNGKeyArray
-            ) -> tuple[PyTree, optax.OptState, Array, Array, Output]:
-                init_grads = jax.tree.map(lambda x: jnp.zeros_like(x, dtype=grad_dtype), model_arr)
-                init_loss = jnp.array(0.0)
+                (loss, output), grads = jax.value_and_grad(loss_fn, has_aux=True)(model_arr)
+                grads = jax.tree.map(lambda g: g.astype(grad_dtype) if eqx.is_inexact_array(g) else g, grads)
+                return grads, loss, output
 
-                def accum_fn(
-                    carry: tuple[PyTree, Array],
-                    batch_and_key: tuple[Batch, PRNGKeyArray],
-                ) -> tuple[tuple[PyTree, Array], Output]:
-                    acc_grads, acc_loss = carry
-                    batch, key = batch_and_key
-                    grads, loss, output = compute_grads_and_loss(model_arr, batch, key)
-                    acc_grads = jax.tree.map(jnp.add, acc_grads, grads)
-                    acc_loss = acc_loss + loss
-                    return (acc_grads, acc_loss), output
+            # Initialize accumulators
+            init_grads = jax.tree.map(lambda x: jnp.zeros_like(x, dtype=grad_dtype), model_arr)
+            init_loss = jnp.array(0.0)
 
-                accum_keys = jax.random.split(key, num_accum_steps)
-                (acc_grads, acc_loss), outputs = jax.lax.scan(accum_fn, (init_grads, init_loss), (batches, accum_keys))
+            def accum_fn(
+                carry: tuple[PyTree, Array],
+                batch_and_key: tuple[Batch, PRNGKeyArray],
+            ) -> tuple[tuple[PyTree, Array], Output]:
+                acc_grads, acc_loss = carry
+                batch, step_key = batch_and_key
+                grads, loss, output = compute_grads_and_loss(model_arr, batch, step_key)
+                acc_grads = jax.tree.map(jnp.add, acc_grads, grads)
+                acc_loss = acc_loss + loss
+                return (acc_grads, acc_loss), output
 
-                if num_accum_steps > 1:
-                    acc_grads = jax.tree.map(lambda g: g / num_accum_steps, acc_grads)
-                    acc_loss = acc_loss / num_accum_steps
+            # Accumulate gradients over micro-batches using scan
+            accum_keys = jax.random.split(key, num_accum_steps)
+            (acc_grads, acc_loss), outputs = jax.lax.scan(accum_fn, (init_grads, init_loss), (batches, accum_keys))
 
-                acc_grads = jax.tree.map(lambda g: jax.lax.pmean(g, axis_name="batch"), acc_grads)
-                acc_loss = jax.lax.pmean(acc_loss, axis_name="batch")
+            # Average gradients and loss
+            if num_accum_steps > 1:
+                acc_grads = jax.tree.map(lambda g: g / num_accum_steps, acc_grads)
+                acc_loss = acc_loss / num_accum_steps
 
-                grad_norm = optax.global_norm(acc_grads)
-                if max_grad_norm is not None:
-                    clip_fn = optax.clip_by_global_norm(max_grad_norm)
-                    clip_state = clip_fn.init(acc_grads)
-                    acc_grads, _ = clip_fn.update(acc_grads, clip_state)
+            # Clip gradients if configured
+            grad_norm = optax.global_norm(acc_grads)
+            if max_grad_norm is not None:
+                clip_fn = optax.clip_by_global_norm(max_grad_norm)
+                clip_state = clip_fn.init(acc_grads)
+                acc_grads, _ = clip_fn.update(acc_grads, clip_state)
 
-                updates, opt_state = optimizer.update(acc_grads, opt_state, model_arr)
-                updates = jax.tree.map(lambda u: u.astype(param_dtype) if eqx.is_inexact_array(u) else u, updates)
-                model_arr = eqx.apply_updates(model_arr, updates)
+            # Apply optimizer updates
+            updates, new_opt_state = optimizer.update(acc_grads, opt_state, model_arr)
+            updates = jax.tree.map(lambda u: u.astype(param_dtype) if eqx.is_inexact_array(u) else u, updates)
+            new_model_arr = eqx.apply_updates(model_arr, updates)
 
-                output = jax.tree.map(lambda x: x[-1], outputs)
-                return model_arr, opt_state, acc_loss, grad_norm, output  # type: ignore[return-value]
+            # Return the last output for metrics
+            output = jax.tree.map(lambda x: x[-1], outputs)
+            return new_model_arr, new_opt_state, acc_loss, grad_norm, output  # type: ignore[return-value]
 
-            return accumulate_and_update(model_arr, opt_state, batches, keys)
-
-        pmap_fn = jax.pmap(pmap_train_step, axis_name="batch")
-        keys = jax.random.split(key, num_devices)
-
-        return pmap_fn(model_arr, opt_state, batches_pmap, keys)
-
-    def reshape_batch_for_pmap(self, batches_stacked: Batch, num_devices: int) -> Batch:
-        """Reshape stacked batches for pmap consumption.
-
-        Args:
-            batches_stacked: Batches with shape (num_accum, batch_size, ...).
-            num_devices: Number of devices.
-
-        Returns:
-            Batches reshaped to (num_devices, num_accum, local_batch_size, ...).
-        """
-
-        def reshape_for_pmap(x: Array) -> Array:  # noqa: ANN001
-            shape = x.shape
-            num_accum = shape[0]
-            batch_size = shape[1]
-            local_batch_size = batch_size // num_devices
-            rest = shape[2:]
-            reshaped = x.reshape(num_accum, num_devices, local_batch_size, *rest)
-            return jnp.transpose(reshaped, (1, 0, 2, *range(3, len(reshaped.shape))))
-
-        return jax.tree.map(reshape_for_pmap, batches_stacked)
-
-    def replicate_for_pmap(self, pytree: PyTree, num_devices: int) -> PyTree:
-        """Replicate a pytree across devices for pmap."""
-        return jax.tree.map(lambda x: jnp.stack([x] * num_devices), pytree)
-
-    def unreplicate_from_pmap(self, pytree: PyTree) -> PyTree:
-        """Extract device 0's copy from a replicated pytree."""
-        return jax.tree.map(lambda x: x[0], pytree)
+        return jax.jit(train_step)
 
     def train_loop(
         self,
@@ -377,7 +230,7 @@ class SupervisedMixin(
         optimizers: Sequence[Optimizer],
         ds: Iterator[Batch],
         key: PRNGKeyArray,
-        num_devices: int = 1,
+        devices: Sequence[jax.Device] | None = None,
     ) -> State:
         if len(models) != 1 or len(optimizers) != 1 or len(opt_states) != 1:
             raise ValueError(
@@ -389,19 +242,15 @@ class SupervisedMixin(
         optimizer = optimizers[0]
         opt_state = opt_states[0]
 
-        # Replicate model and optimizer state once for pmap.
-        # For single device, this creates shape (1, ...) which pmap handles correctly.
-        model_arr_rep = self.replicate_for_pmap(model_arr, num_devices)
-        opt_state_rep = self.replicate_for_pmap(opt_state, num_devices)
+        # Create JIT-compiled train step
+        train_step_fn = self.create_train_step_fn(model_static, optimizer)
 
         def save_checkpoint() -> None:
-            model_arr_local = self.unreplicate_from_pmap(model_arr_rep)
-            opt_state_local = self.unreplicate_from_pmap(opt_state_rep)
-            model = eqx.combine(model_arr_local, model_static)
+            model = eqx.combine(model_arr, model_static)
             self.save_checkpoint(
                 models=[model],
                 optimizers=optimizers,
-                opt_states=[opt_state_local],
+                opt_states=[opt_state],
                 state=state,
             )
 
@@ -411,7 +260,7 @@ class SupervisedMixin(
             with ContextTimer() as timer:
                 self.on_step_start()
 
-                # Get stacked batches
+                # Get stacked batches for gradient accumulation
                 if isinstance(ds, InMemoryBatchIterator):
                     batches_stacked = ds.get_stacked_batches(self.config.gradient_accumulation_steps)
                 else:
@@ -422,38 +271,20 @@ class SupervisedMixin(
                 heavy = heavy_arr.item()
                 step_key, key = jax.random.split(key)
 
-                # Reshape batch for pmap: (num_accum, batch, ...) -> (num_devices, num_accum, local_batch, ...)
-                batches_pmap = self.reshape_batch_for_pmap(batches_stacked, num_devices)
+                # Calculate batch size
+                first_leaf = jax.tree.leaves(batches_stacked)[0]
+                batch_size = first_leaf.shape[1]
 
-                # Run pmap training step
-                model_arr_rep, opt_state_rep, loss_rep, grad_norm_rep, output_rep = self.train_step_pmap(
-                    model_arr=model_arr_rep,
-                    model_static=model_static,
-                    optimizer=optimizer,
-                    opt_state=opt_state_rep,
-                    batches_pmap=batches_pmap,
-                    state=state,
-                    key=step_key,
-                    num_devices=num_devices,
+                # Execute training step
+                model_arr, opt_state, loss, grad_norm, output = train_step_fn(
+                    model_arr, opt_state, batches_stacked, state, step_key
                 )
 
-                # Extract scalars for logging (cheap - just index into replicated array)
-                loss = loss_rep[0]
-                grad_norm = grad_norm_rep[0]
-
-                # Compute metrics - only extract full model/output for heavy logging
-                batch_size = jax.tree.leaves(batches_stacked)[0].shape[1]
-                if heavy:
-                    model_arr_local = self.unreplicate_from_pmap(model_arr_rep)
-                    output = self.unreplicate_from_pmap(output_rep)
-                    batch = jax.tree.map(lambda x: x[0][-1], batches_pmap)  # device 0, last accum step
-                    batch = jax.tree.map(
-                        lambda x: x.astype(jnp.float32) if eqx.is_inexact_array(x) else x, batch
-                    )
-                    model = eqx.combine(model_arr_local, model_static)
-                    metrics = self.compute_metrics(model, batch, output, state, heavy, step_key)
-                else:
-                    metrics = {}
+                # Compute metrics
+                batch = jax.tree.map(lambda x: x[-1], batches_stacked)
+                batch = jax.tree.map(lambda x: x.astype(jnp.float32) if eqx.is_inexact_array(x) else x, batch)
+                model = eqx.combine(model_arr, model_static)
+                metrics = self.compute_metrics(model, batch, output, state, heavy, step_key)
 
                 # Update state
                 total_samples = batch_size * self.config.gradient_accumulation_steps
@@ -483,11 +314,7 @@ class SupervisedMixin(
         self.run_training()
 
     def run_training(self) -> None:
-        """Runs the training loop.
-
-        Uses pmap for data-parallel training across multiple devices.
-        Data is loaded without device sharding, then split by pmap.
-        """
+        """Runs the training loop."""
         training_error: BaseException | None = None
 
         with self:
@@ -498,13 +325,7 @@ class SupervisedMixin(
             if is_master():
                 Thread(target=self.log_state, daemon=True).start()
 
-            # Get number of devices for data parallelism
-            num_devices = jax.local_device_count()
-
-            # For pmap, we don't use sharding - data is loaded to host then split by pmap
-            # Create a simple sharding for data loading (no device sharding)
             mesh = self.get_mesh()
-            # Use replicated sharding for data (pmap will split it)
             data_sharding = NamedSharding(mesh, P())
 
             model_key, key = jax.random.split(key)
@@ -512,7 +333,7 @@ class SupervisedMixin(
             models, optimizers, opt_states, state = self.load_initial_state(
                 init_params,
                 load_optimizer=True,
-                model_sharding=None,  # Don't shard model, pmap handles replication
+                model_sharding=None,
             )
 
             logger.info("Model size: %s", f"{get_pytree_param_count(models):,}")
@@ -522,7 +343,6 @@ class SupervisedMixin(
 
             try:
                 # Choose data loading strategy based on config
-                # For pmap, we load data without device sharding
                 data_dtype = self.config.precision.data_jax_dtype
                 if self.config.load_in_memory:
                     ds: Iterator[Batch] = self.get_in_memory_iterator(data_sharding, key, data_dtype)
@@ -536,7 +356,6 @@ class SupervisedMixin(
                     optimizers=optimizers,
                     ds=ds,
                     key=key,
-                    num_devices=num_devices,
                 )
 
                 if is_master():

@@ -64,7 +64,7 @@ class SimpleTask(xax.SupervisedTask[SimpleConfig]):
     def get_optimizer(self) -> xax.Optimizer:
         return optax.adam(self.config.learning_rate)
 
-    def get_output(self, model: SimpleModel, batch: Batch, state: xax.State, key: PRNGKeyArray) -> Array:
+    def get_output(self, model: SimpleModel, batch: Batch, state: xax.State | None, key: PRNGKeyArray) -> Array:
         return jax.vmap(model)(batch["x"])
 
     def compute_loss(
@@ -72,7 +72,7 @@ class SimpleTask(xax.SupervisedTask[SimpleConfig]):
         model: SimpleModel,
         batch: Batch,
         output: Array,
-        state: xax.State,
+        state: xax.State | None,
         key: PRNGKeyArray,
     ) -> Array:
         y_one_hot = jax.nn.one_hot(batch["y"], 2)

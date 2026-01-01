@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from datasets import Dataset, DatasetDict, IterableDataset, IterableDatasetDict
-from jax.sharding import NamedSharding, PartitionSpec as P
+from jax.sharding import NamedSharding
 from omegaconf import II
 
 from xax.core.conf import field
@@ -169,9 +169,9 @@ class StreamingBatchIterator(Iterator[Batch]):
 class InMemoryBatchIterator(Iterator[Batch]):
     """Iterator that yields batches from pre-batched JAX arrays on device.
 
-    This iterator stores the dataset pre-organized into batches and pre-sharded
-    across devices. During training, it simply returns slices of the pre-sharded
-    arrays, completely eliminating data loading and sharding overhead.
+    This iterator stores the dataset pre-organized into batches on device.
+    During training, it simply returns slices of the pre-batched arrays,
+    completely eliminating data loading overhead.
 
     Args:
         batched_data: PyTree of JAX arrays with shape (num_batches, batch_size, ...).
@@ -207,7 +207,7 @@ class InMemoryBatchIterator(Iterator[Batch]):
 
         # Use Python int for indexing to avoid traced array overhead
         batch_idx = int(self._batch_order[self._current_idx])
-        # Simple slice - no device_put needed, data is already sharded
+        # Simple slice - data is already on device
         batch = jax.tree.map(lambda x: x[batch_idx], self._data)
         self._current_idx += 1
 
@@ -246,10 +246,10 @@ def load_dataset_in_memory(
     sharding: NamedSharding,
     data_dtype: jnp.dtype | None = None,
 ) -> Batch:
-    """Load a HuggingFace Dataset entirely into JAX arrays, pre-batched and pre-sharded.
+    """Load a HuggingFace Dataset entirely into JAX arrays, pre-batched.
 
-    The data is organized into batches and sharded across devices at load time.
-    This eliminates all per-batch data loading and sharding overhead during training.
+    The data is organized into batches at load time, eliminating all
+    per-batch data loading overhead during training.
 
     Args:
         ds: HuggingFace Dataset to load.
@@ -258,7 +258,7 @@ def load_dataset_in_memory(
         data_dtype: Optional dtype to cast floating point data to.
 
     Returns:
-        PyTree of JAX arrays with shape (num_batches, batch_size, ...).
+        PyTree with shape (num_batches, batch_size, ...).
     """
     # Convert to numpy arrays
     ds.set_format("numpy")
@@ -277,9 +277,8 @@ def load_dataset_in_memory(
     num_samples = len(ds)
     num_batches = num_samples // batch_size
 
-    # Reshape into batches: (num_samples, ...) -> (num_batches, batch_size, ...)
+    # Reshape to (num_batches, batch_size, ...)
     def reshape_to_batches(arr: np.ndarray) -> np.ndarray:
-        # Truncate to complete batches and reshape
         truncated = arr[: num_batches * batch_size]
         new_shape = (num_batches, batch_size) + truncated.shape[1:]
         return truncated.reshape(new_shape)
@@ -293,14 +292,7 @@ def load_dataset_in_memory(
             for key, arr in batched_data.items()
         }
 
-    # For single device, just put on device without sharding
-    # For multi-device, apply proper sharding
-    num_devices = len(sharding.mesh.devices.flat)
-    if num_devices == 1:
-        batched_data = jax.device_put(batched_data)
-    else:
-        batched_sharding = NamedSharding(sharding.mesh, P(None, "batch"))
-        batched_data = jax.device_put(batched_data, batched_sharding)
+    batched_data = jax.device_put(batched_data, sharding)
 
     logger.info(
         "Loaded dataset into memory: %d samples -> %d batches of %d",
@@ -308,6 +300,7 @@ def load_dataset_in_memory(
         num_batches,
         batch_size,
     )
+
     return batched_data
 
 
@@ -416,7 +409,7 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
         if not isinstance(ds, Dataset):
             raise NotImplementedError(f"Unsupported dataset type for in-memory loading: {type(ds)}")
 
-        # Load dataset into device memory, pre-batched and pre-sharded
+        # Load dataset into device memory, pre-batched
         batched_data = load_dataset_in_memory(ds, self.batch_size, sharding, data_dtype)
 
         return InMemoryBatchIterator(batched_data=batched_data, key=key)

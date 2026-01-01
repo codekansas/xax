@@ -283,7 +283,7 @@ class ShakespearePrediction(xax.SupervisedTask[Config]):
             weight_decay=0.01,
         )
 
-    def get_output(self, model: SequenceModel, batch: Batch, state: xax.State, key: PRNGKeyArray) -> Array:
+    def get_output(self, model: SequenceModel, batch: Batch, state: xax.State | None, key: PRNGKeyArray) -> Array:
         return jax.vmap(model.predict_sequence)(batch["input_ids"][:, :-1])
 
     def compute_loss(
@@ -291,7 +291,7 @@ class ShakespearePrediction(xax.SupervisedTask[Config]):
         model: SequenceModel,
         batch: Batch,
         output: Array,
-        state: xax.State,
+        state: xax.State | None,
         key: PRNGKeyArray,
     ) -> Array:
         y, yhat, mask = batch["input_ids"][:, 1:], output, batch["attention_mask"][:, 1:] == 1
