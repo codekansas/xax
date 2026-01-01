@@ -83,13 +83,20 @@ class MnistClassification(xax.SupervisedTask[Config]):
             key=params.key,
         )
 
-    def get_optimizer(self) -> optax.GradientTransformation:
+    def get_optimizer(self) -> xax.Optimizer:
         return optax.adam(self.config.learning_rate)
 
     def get_output(self, model: Model, batch: Batch, state: xax.State, key: PRNGKeyArray) -> Array:
         return jax.vmap(model)(batch["image"])
 
-    def compute_loss(self, model: Model, batch: Batch, output: Array, state: xax.State, key: PRNGKeyArray) -> Array:
+    def compute_loss(
+        self,
+        model: Model,
+        batch: Batch,
+        output: Array,
+        state: xax.State,
+        key: PRNGKeyArray,
+    ) -> Array:
         y, yhat = batch["label"], output
         return xax.cross_entropy(y, yhat, axis=1)
 
@@ -156,8 +163,8 @@ if __name__ == "__main__":
         Config(
             batch_size=256,
             log_heavy_every_n_seconds=120,
-            # Perform a few updates per step, because otherwise we are sometimes
-            # bottlenecked by the data loader.
-            updates_per_step=8,
+            # MNIST dataset is very small and this greatly improves throughput.
+            load_in_memory=True,
+            gradient_accumulation_steps=64,
         ),
     )

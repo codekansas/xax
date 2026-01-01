@@ -135,14 +135,12 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
         else:
             learning_rate_schedule = warmup_schedule
 
-        opt = optax.adamw(
+        return optax.adamw(
             learning_rate=learning_rate_schedule,
             weight_decay=1e-4,
             b1=0.9,
             b2=0.999,
         )
-
-        return optax.MultiSteps(opt, every_k_schedule=8)
 
     def get_output(self, model: UNet, batch: Batch, state: xax.State, key: PRNGKeyArray) -> Array:
         """Computes the diffusion loss.
@@ -233,8 +231,8 @@ if __name__ == "__main__":
             batch_size=256,
             log_heavy_every_n_seconds=60 * 5,
             max_grad_norm=1.0,
-            # Perform a few updates per step, because otherwise we are sometimes
-            # bottlenecked by the data loader.
-            updates_per_step=8,
+            # MNIST dataset is very small and this greatly improves throughput.
+            load_in_memory=True,
+            gradient_accumulation_steps=64,
         ),
     )

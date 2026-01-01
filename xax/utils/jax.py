@@ -15,10 +15,6 @@ from jaxtyping import PyTree
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_COMPILE_TIMEOUT = 1.0
-
-Number = int | float | np.ndarray | jnp.ndarray
-
 T = TypeVar("T", bound=PyTree)
 
 P = ParamSpec("P")  # For function parameters

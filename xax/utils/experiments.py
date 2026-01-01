@@ -119,8 +119,8 @@ class StateTimer:
 
     def log_dict(self) -> dict[str, int | float | tuple[int | float, bool]]:
         return {
-            "steps/second": self.step_timer.steps_per_second,
-            "samples/second": (self.sample_timer.steps_per_second, True),
+            "steps/second": (self.step_timer.steps_per_second, True),
+            "samples/second": round(self.sample_timer.steps_per_second),
             "dt": self.iter_timer.iter_seconds,
         }
 

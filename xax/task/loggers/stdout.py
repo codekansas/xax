@@ -24,7 +24,7 @@ class StdoutLogger(LoggerImpl):
     def __init__(
         self,
         write_fp: TextIO = sys.stdout,
-        precision: int = 4,
+        precision: int = 8,
         log_timers: bool = True,
         log_perf: bool = False,
         log_optim: bool = False,

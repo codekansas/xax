@@ -278,13 +278,10 @@ class ShakespearePrediction(xax.SupervisedTask[Config]):
             # Fallback to constant learning rate if max_steps not specified
             learning_rate_schedule = self.config.learning_rate
 
-        opt = optax.adamw(
+        return optax.adamw(
             learning_rate=learning_rate_schedule,
             weight_decay=0.01,
         )
-
-        # Gradient accumulation.
-        return optax.MultiSteps(opt, every_k_schedule=8)
 
     def get_output(self, model: SequenceModel, batch: Batch, state: xax.State, key: PRNGKeyArray) -> Array:
         return jax.vmap(model.predict_sequence)(batch["input_ids"][:, :-1])
@@ -333,5 +330,6 @@ if __name__ == "__main__":
         Config(
             batch_size=8,
             log_heavy_every_n_seconds=120,
+            gradient_accumulation_steps=8,
         ),
     )

@@ -17,11 +17,12 @@ __version__ = "0.4.5"
 # This list shouldn't be modified by hand; instead, run the update script.
 __all__ = [
     "AttentionCache",
-    "AttentionCacheDict",
     "CrossAttentionBlock",
+    "Fp8ScalesCache",
     "SelfAttentionBlock",
     "Transformer",
     "TransformerBlock",
+    "TransformerBlockCache",
     "TransformerCache",
     "TransformerStack",
     "BaseODESolver",
@@ -223,6 +224,7 @@ __all__ = [
     "hashable_array",
     "Optimizer",
     "Precision",
+    "PrecisionConfig",
     "as_shape_dtype",
 ]
 
@@ -277,11 +279,12 @@ del os, shutil, xla_flags
 # run the update script.
 NAME_MAP: dict[str, str] = {
     "AttentionCache": "arch.attention",
-    "AttentionCacheDict": "arch.attention",
     "CrossAttentionBlock": "arch.attention",
+    "Fp8ScalesCache": "arch.attention",
     "SelfAttentionBlock": "arch.attention",
     "Transformer": "arch.attention",
     "TransformerBlock": "arch.attention",
+    "TransformerBlockCache": "arch.attention",
     "TransformerCache": "arch.attention",
     "TransformerStack": "arch.attention",
     "BaseODESolver": "arch.diffusion",
@@ -483,6 +486,7 @@ NAME_MAP: dict[str, str] = {
     "hashable_array": "utils.types.hashable_array",
     "Optimizer": "utils.types.training",
     "Precision": "utils.types.training",
+    "PrecisionConfig": "utils.types.training",
     "as_shape_dtype": "utils.types.training",
 }
 
@@ -527,11 +531,12 @@ def __getattr__(name: str) -> object:
 if IMPORT_ALL or TYPE_CHECKING:
     from xax.arch.attention import (
         AttentionCache,
-        AttentionCacheDict,
         CrossAttentionBlock,
+        Fp8ScalesCache,
         SelfAttentionBlock,
         Transformer,
         TransformerBlock,
+        TransformerBlockCache,
         TransformerCache,
         TransformerStack,
     )
@@ -745,6 +750,6 @@ if IMPORT_ALL or TYPE_CHECKING:
     )
     from xax.utils.types.frozen_dict import FrozenDict, freeze_dict
     from xax.utils.types.hashable_array import HashableArray, hashable_array
-    from xax.utils.types.training import Optimizer, Precision, as_shape_dtype
+    from xax.utils.types.training import Optimizer, Precision, PrecisionConfig, as_shape_dtype
 
 del TYPE_CHECKING, IMPORT_ALL

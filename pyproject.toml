@@ -22,7 +22,6 @@ dependencies = [
     "jaxtyping",
     "optax",
     "orbax-checkpoint",
-    "tensorflow",
 
     # Data processing and serialization
     "pillow",
