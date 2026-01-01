@@ -170,7 +170,7 @@ class SupervisedMixin(
             batches: Batch,
             state: State,
             key: PRNGKeyArray,
-        ) -> tuple[PyTree, optax.OptState, State, dict[str, Metric], Array]:
+        ) -> tuple[PyTree, optax.OptState, State, dict[str, Metric]]:
             def compute_grads_and_loss(
                 model_arr: PyTree, batch: Batch, step_key: PRNGKeyArray
             ) -> tuple[PyTree, Array, Output]:
