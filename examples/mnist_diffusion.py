@@ -233,6 +233,6 @@ if __name__ == "__main__":
             max_grad_norm=1.0,
             # MNIST dataset is very small and this greatly improves throughput.
             load_in_memory=True,
-            gradient_accumulation_steps=64,
+            gradient_accumulation_steps=1,
         ),
     )
