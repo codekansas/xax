@@ -10,6 +10,7 @@ from abc import ABC
 from dataclasses import dataclass
 from threading import Thread
 from typing import (
+    Callable,
     Generic,
     Iterator,
     Sequence,
@@ -132,7 +133,12 @@ class SupervisedMixin(
         self.log_state_timers(state)
         self.write_logs(state, heavy)
 
-    def create_train_step_fn(self, model_static: PyTree, optimizer: Optimizer) -> jax.stages.Wrapped:
+    def create_train_step_fn(
+        self, model_static: PyTree, optimizer: Optimizer
+    ) -> Callable[
+        [PyTree, optax.OptState, Batch, State, PRNGKeyArray],
+        tuple[PyTree, optax.OptState, Array, Array, Output],
+    ]:
         """Create a JIT-compiled training step function.
 
         Args:
@@ -271,7 +277,11 @@ class SupervisedMixin(
 
                 # Execute training step
                 model_arr, opt_state, loss, grad_norm, output = train_step_fn(
-                    model_arr, opt_state, batches_stacked, state, step_key
+                    model_arr,
+                    opt_state,
+                    batches_stacked,
+                    state,
+                    step_key,
                 )
 
                 # Compute metrics
