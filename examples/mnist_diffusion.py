@@ -142,7 +142,7 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
             b2=0.999,
         )
 
-    def get_output(self, model: UNet, batch: Batch, state: xax.State | None, key: PRNGKeyArray) -> Array:
+    def get_output(self, model: UNet, batch: Batch, state: xax.State, key: PRNGKeyArray) -> Array:
         """Computes the diffusion loss.
 
         The model is called with (x_t, t, class_label) internally, but we need
@@ -157,9 +157,7 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
         loss = self.diffusion.loss(key, model_fn, images_bhw)
         return loss.mean()
 
-    def compute_loss(
-        self, model: UNet, batch: Batch, output: Array, state: xax.State | None, key: PRNGKeyArray
-    ) -> Array:
+    def compute_loss(self, model: UNet, batch: Batch, output: Array, state: xax.State, key: PRNGKeyArray) -> Array:
         """The output is already the loss."""
         return output
 

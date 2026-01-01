@@ -86,7 +86,7 @@ class MnistClassification(xax.SupervisedTask[Config]):
     def get_optimizer(self) -> xax.Optimizer:
         return optax.adam(self.config.learning_rate)
 
-    def get_output(self, model: Model, batch: Batch, state: xax.State | None, key: PRNGKeyArray) -> Array:
+    def get_output(self, model: Model, batch: Batch, state: xax.State, key: PRNGKeyArray) -> Array:
         return jax.vmap(model)(batch["image"])
 
     def compute_loss(
@@ -94,7 +94,7 @@ class MnistClassification(xax.SupervisedTask[Config]):
         model: Model,
         batch: Batch,
         output: Array,
-        state: xax.State | None,
+        state: xax.State,
         key: PRNGKeyArray,
     ) -> Array:
         y, yhat = batch["label"], output
