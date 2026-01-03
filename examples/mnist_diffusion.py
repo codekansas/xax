@@ -229,7 +229,7 @@ if __name__ == "__main__":
     MnistDiffusion.launch(
         Config(
             batch_size=256,
-            log_heavy_every_n_seconds=60 * 5,
+            log_heavy_every_n_seconds=60,
             max_grad_norm=1.0,
             # MNIST dataset is very small and this greatly improves throughput.
             load_in_memory=True,

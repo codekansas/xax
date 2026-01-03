@@ -348,9 +348,8 @@ class GaussianDiffusion(eqx.Module):
         bsz = x.shape[0]
         t_key, eps_key = jax.random.split(key)
 
-        # Sample timesteps from [0, num_timesteps]
-        breakpoint()
-        t_sample = jax.random.randint(t_key, (bsz,), 0, self.num_timesteps + 1)
+        # Sample timesteps from [1, num_timesteps] (not 0, since bar_alpha[0]=1.0 means no noise)
+        t_sample = jax.random.randint(t_key, (bsz,), 1, self.num_timesteps + 1)
         eps = jax.random.normal(eps_key, x.shape, dtype=x.dtype)
         bar_alpha = self._get_bar_alpha(t_sample, x.ndim)
         x_t = jnp.sqrt(bar_alpha) * x + jnp.sqrt(1 - bar_alpha) * eps
