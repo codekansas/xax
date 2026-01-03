@@ -94,7 +94,6 @@ __all__ = [
     "loraize",
     "loraize_linear",
     "merge_lora",
-    "cross_entropy",
     "cast_euclidean_norm_type",
     "dynamic_time_warping",
     "get_euclidean_norm",
@@ -356,7 +355,6 @@ NAME_MAP: dict[str, str] = {
     "loraize": "nn.lora",
     "loraize_linear": "nn.lora",
     "merge_lora": "nn.lora",
-    "cross_entropy": "nn.losses",
     "cast_euclidean_norm_type": "nn.metrics",
     "dynamic_time_warping": "nn.metrics",
     "get_euclidean_norm": "nn.metrics",
@@ -625,7 +623,6 @@ if IMPORT_ALL or TYPE_CHECKING:
         loraize_linear,
         merge_lora,
     )
-    from xax.nn.losses import cross_entropy
     from xax.nn.metrics import NormType, cast_euclidean_norm_type, dynamic_time_warping, get_euclidean_norm
     from xax.nn.norm import NormType, cast_norm_type, get_norm_1d, get_norm_2d, get_norm_3d, get_norm_linear
     from xax.nn.parallel import is_master
