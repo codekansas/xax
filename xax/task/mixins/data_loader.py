@@ -276,6 +276,13 @@ def load_dataset_in_memory(
     # Compute number of complete batches
     num_samples = len(ds)
     num_batches = num_samples // batch_size
+    if (remainder := num_samples % batch_size) > 0:
+        logger.warning(
+            "Dataset size %d is not a multiple of batch size %d, %d samples will be truncated",
+            num_samples,
+            batch_size,
+            remainder,
+        )
 
     # Reshape to (num_batches, batch_size, ...)
     def reshape_to_batches(arr: np.ndarray) -> np.ndarray:

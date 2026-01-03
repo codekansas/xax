@@ -22,7 +22,6 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import optax
-from jax.sharding import NamedSharding, PartitionSpec as P
 from jaxtyping import Array, PRNGKeyArray, PyTree
 
 from xax.core.conf import field
@@ -339,7 +338,7 @@ class SupervisedMixin(
                 Thread(target=self.log_state, daemon=True).start()
 
             mesh = self.get_mesh()
-            data_sharding = NamedSharding(mesh, P())
+            data_sharding = self.get_data_sharding(mesh)
 
             model_key, key = jax.random.split(key)
             init_params = InitParams(key=model_key)
