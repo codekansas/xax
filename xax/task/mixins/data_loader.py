@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from datasets import Dataset, DatasetDict, IterableDataset, IterableDatasetDict
-from jax.sharding import NamedSharding
+from jax.sharding import NamedSharding, PartitionSpec as P
 from omegaconf import II
 
 from xax.core.conf import field
@@ -175,6 +175,8 @@ class InMemoryBatchIterator(Iterator[Batch]):
 
     Args:
         batched_data: PyTree of JAX arrays with shape (num_batches, batch_size, ...).
+            If the data is sharded then this will yield minibatches which are
+            sharded along the `batch_size` axis.
         key: JAX random key for shuffling batch order.
     """
 
@@ -189,6 +191,16 @@ class InMemoryBatchIterator(Iterator[Batch]):
         # Get number of batches from first leaf
         first_leaf = jax.tree.leaves(batched_data)[0]
         self._num_batches = first_leaf.shape[0]
+
+        # For minibatches, since we're indexing along the `batch_size` axis
+        # and putting the stacked minibatches along axis 0, we need the output
+        # sharding to have axis 0 sharding as None.
+        sharding = first_leaf.sharding
+        self._out_sharding = jax.sharding.NamedSharding(
+            mesh=sharding.mesh,
+            spec=P(None, *sharding.spec),
+            memory_kind=sharding.memory_kind,
+        )
 
         # Initialize shuffled batch order
         self._key, subkey = jax.random.split(self._key)
@@ -208,7 +220,7 @@ class InMemoryBatchIterator(Iterator[Batch]):
         # Use Python int for indexing to avoid traced array overhead
         batch_idx = int(self._batch_order[self._current_idx])
         # Simple slice - data is already on device
-        batch = jax.tree.map(lambda x: x[batch_idx], self._data)
+        batch = jax.tree.map(lambda x: x.at[batch_idx].get(out_sharding=self._out_sharding), self._data)
         self._current_idx += 1
 
         return batch
@@ -236,7 +248,8 @@ class InMemoryBatchIterator(Iterator[Batch]):
         self._current_idx += n
 
         # Single gather operation for all batches
-        stacked = jax.tree.map(lambda x: x[indices], self._data)
+        stacked = jax.tree.map(lambda x: x.at[indices].get(out_sharding=self._out_sharding), self._data)
+
         return stacked
 
 

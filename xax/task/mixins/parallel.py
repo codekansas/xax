@@ -30,8 +30,12 @@ class ParallelMixin(BaseTask[Config], Generic[Config], ABC):
         super().__init__(config)
 
     def get_mesh(self) -> jax.sharding.Mesh:
-        ndevices = jax.local_device_count()
-        return jax.make_mesh((ndevices,), axis_names=("batch",))
+        devices = jax.local_devices()
+        return jax.sharding.Mesh(
+            devices=devices,
+            axis_names=("batch",),
+            axis_types=(jax.sharding.AxisType.Explicit,),
+        )
 
     def get_data_sharding(self, mesh: jax.sharding.Mesh) -> jax.sharding.NamedSharding:
         return jax.sharding.NamedSharding(mesh, P("batch"))

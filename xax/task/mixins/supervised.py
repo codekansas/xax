@@ -190,19 +190,18 @@ class SupervisedMixin(
             init_loss = jnp.array(0.0)
 
             def accum_fn(
-                carry: tuple[PyTree, Array],
-                batch_and_key: tuple[Batch, PRNGKeyArray],
-            ) -> tuple[tuple[PyTree, Array], Output]:
-                acc_grads, acc_loss = carry
-                batch, step_key = batch_and_key
+                carry: tuple[PyTree, Array, PRNGKeyArray],
+                batch: Batch,
+            ) -> tuple[tuple[PyTree, Array, PRNGKeyArray], Output]:
+                acc_grads, acc_loss, key = carry
+                key, step_key = jax.random.split(key)
                 grads, loss, output = compute_grads_and_loss(model_arr, batch, step_key)
                 acc_grads = jax.tree.map(jnp.add, acc_grads, grads)
                 acc_loss = acc_loss + loss
-                return (acc_grads, acc_loss), output
+                return (acc_grads, acc_loss, key), output
 
             # Accumulate gradients over micro-batches using scan
-            accum_keys = jax.random.split(key, num_accum_steps)
-            (acc_grads, acc_loss), outputs = jax.lax.scan(accum_fn, (init_grads, init_loss), (batches, accum_keys))
+            (acc_grads, acc_loss, key), outputs = jax.lax.scan(accum_fn, (init_grads, init_loss, key), batches)
 
             # Average gradients and loss
             if num_accum_steps > 1:
@@ -338,14 +337,17 @@ class SupervisedMixin(
                 Thread(target=self.log_state, daemon=True).start()
 
             mesh = self.get_mesh()
+            jax.set_mesh(mesh)
+
             data_sharding = self.get_data_sharding(mesh)
+            model_sharding = self.get_model_sharding(mesh)
 
             model_key, key = jax.random.split(key)
             init_params = InitParams(key=model_key)
             models, optimizers, opt_states, state = self.load_initial_state(
                 init_params,
                 load_optimizer=True,
-                model_sharding=None,
+                model_sharding=model_sharding,
             )
 
             logger.info("Model size: %s", f"{get_pytree_param_count(models):,}")
