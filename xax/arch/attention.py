@@ -9,7 +9,7 @@ Supports optional FP8 quantization for matrix multiplications when use_fp8=True.
 
 import math
 import warnings
-from typing import NotRequired, TypedDict
+from typing import Literal, NotRequired, TypedDict
 
 import chex
 import equinox as eqx
@@ -144,30 +144,41 @@ def _init_fp8_scales_cache(history_length: int) -> Fp8ScalesCache:
     }
 
 
+RotaryEmbeddingStyle = Literal["concatenated", "interleaved"]
+
+
 class RotaryEmbedding(eqx.Module):
     """Rotary Position Embedding (RoPE) for transformer attention.
 
     This implements the rotary position embedding as described in:
     "RoFormer: Enhanced Transformer with Rotary Position Embedding"
     https://arxiv.org/abs/2104.09864
+
+    Two styles are supported:
+    - "concatenated" (default): Used by LLaMA, Qwen, Mistral. Splits head_dim in half.
+    - "interleaved": Used by GPT-NeoX. Uses even/odd indices.
     """
 
     head_dim: int = eqx.field()
     base: float = eqx.field()
+    style: RotaryEmbeddingStyle = eqx.field(static=True)
 
     def __init__(
         self,
         head_dim: int,
         base: float = 10000.0,
+        style: RotaryEmbeddingStyle = "interleaved",
     ) -> None:
         """Initialize rotary embedding.
 
         Args:
             head_dim: Dimension of each attention head
             base: Base for the frequency computation
+            style: RoPE style - "interleaved" (default, GPT-NeoX) or "concatenated" (LLaMA/Qwen)
         """
         self.head_dim = head_dim
         self.base = base
+        self.style = style
 
     def _get_rotary_embeddings(self, positions: Array, dtype: jnp.dtype) -> tuple[Array, Array]:
         """Get rotary embeddings for a given sequence length.
@@ -200,38 +211,81 @@ class RotaryEmbedding(eqx.Module):
         """Apply rotary embeddings to input tensor.
 
         Args:
-            x: Input tensor of shape (seq_len, num_heads, head_dim)
-            positions: Optional position indices of shape (seq_len,)
+            x: Input tensor of shape (seq_len, num_heads, head_dim) or (batch, seq_len, num_heads, head_dim)
+            positions: Optional position indices of shape (seq_len,) or (batch, seq_len)
                 If None, uses sequential positions starting from 0
 
         Returns:
             Tensor with rotary embeddings applied, same shape as input
         """
-        seq_len, _, head_dim = x.shape
-        assert head_dim == self.head_dim, f"Expected head_dim {self.head_dim}, got {head_dim}"
+        # Handle both 3D and 4D inputs
+        if x.ndim == 4:
+            # (batch, seq_len, num_heads, head_dim) - batch first
+            bsz, seq_len, _, head_dim = x.shape
+            if positions is None:
+                positions = jnp.broadcast_to(jnp.arange(seq_len)[None, :], (bsz, seq_len))
+            return self._apply_rotary_4d(x, positions)
+        else:
+            # (seq_len, num_heads, head_dim)
+            seq_len, _, head_dim = x.shape
+            assert head_dim == self.head_dim, f"Expected head_dim {self.head_dim}, got {head_dim}"
 
-        # Get rotary embeddings
-        if positions is None:
-            positions = jnp.arange(seq_len, dtype=x.dtype)
-        cos_emb, sin_emb = self._get_rotary_embeddings(positions, x.dtype)
+            if positions is None:
+                positions = jnp.arange(seq_len, dtype=x.dtype)
 
-        # Reshape to (seq_len, 1, head_dim//2) for broadcasting
-        cos_emb = cos_emb[:, None, :]  # (seq_len, 1, head_dim//2)
-        sin_emb = sin_emb[:, None, :]  # (seq_len, 1, head_dim//2)
+            cos_emb, sin_emb = self._get_rotary_embeddings(positions, x.dtype)
+            cos_emb = cos_emb[:, None, :]  # (seq_len, 1, head_dim//2)
+            sin_emb = sin_emb[:, None, :]
 
-        # Split input into even and odd dimensions
-        x_even = x[..., ::2]  # (seq_len, num_heads, head_dim//2)
-        x_odd = x[..., 1::2]  # (seq_len, num_heads, head_dim//2)
+            match self.style:
+                case "concatenated":
+                    return self._apply_concatenated(x, cos_emb, sin_emb)
+                case "interleaved":
+                    return self._apply_interleaved(x, cos_emb, sin_emb)
+                case _:
+                    raise ValueError(f"Unknown RoPE style: {self.style}. Use 'concatenated' or 'interleaved'.")
 
-        # Apply rotation
+    def _apply_rotary_4d(self, x: Array, positions: Array) -> Array:
+        """Apply RoPE to 4D tensor (batch, seq, heads, head_dim)."""
+        bsz, seq_len, _, head_dim = x.shape
+        assert head_dim == self.head_dim
+
+        # Get embeddings for each position in the batch
+        # positions is (batch, seq_len), we need cos/sin for each
+        cos_emb, sin_emb = self._get_rotary_embeddings(positions.reshape(-1), x.dtype)
+        cos_emb = cos_emb.reshape(bsz, seq_len, 1, -1)  # (batch, seq, 1, head_dim//2)
+        sin_emb = sin_emb.reshape(bsz, seq_len, 1, -1)
+
+        if self.style == "concatenated":
+            x1 = x[..., : head_dim // 2]
+            x2 = x[..., head_dim // 2 :]
+            return jnp.concatenate([x1 * cos_emb - x2 * sin_emb, x2 * cos_emb + x1 * sin_emb], axis=-1)
+        else:
+            x_even = x[..., ::2]
+            x_odd = x[..., 1::2]
+            rotated_even = x_even * cos_emb - x_odd * sin_emb
+            rotated_odd = x_even * sin_emb + x_odd * cos_emb
+            result = jnp.zeros_like(x)
+            result = result.at[..., ::2].set(rotated_even)
+            result = result.at[..., 1::2].set(rotated_odd)
+            return result
+
+    def _apply_concatenated(self, x: Array, cos_emb: Array, sin_emb: Array) -> Array:
+        """LLaMA/Qwen style: split into first half and second half."""
+        head_dim = x.shape[-1]
+        x1 = x[..., : head_dim // 2]
+        x2 = x[..., head_dim // 2 :]
+        return jnp.concatenate([x1 * cos_emb - x2 * sin_emb, x2 * cos_emb + x1 * sin_emb], axis=-1)
+
+    def _apply_interleaved(self, x: Array, cos_emb: Array, sin_emb: Array) -> Array:
+        """GPT-NeoX style: use even/odd indices."""
+        x_even = x[..., ::2]
+        x_odd = x[..., 1::2]
         rotated_even = x_even * cos_emb - x_odd * sin_emb
         rotated_odd = x_even * sin_emb + x_odd * cos_emb
-
-        # Interleave back together
         result = jnp.zeros_like(x)
         result = result.at[..., ::2].set(rotated_even)
         result = result.at[..., 1::2].set(rotated_odd)
-
         return result
 
 

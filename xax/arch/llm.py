@@ -76,6 +76,8 @@ class MultiHeadAttention(eqx.Module):
     v_proj: eqx.nn.Linear
     o_proj: eqx.nn.Linear
     rotary: RotaryEmbedding
+    q_norm: "RMSNorm | None"  # QK-Norm for Qwen3
+    k_norm: "RMSNorm | None"  # QK-Norm for Qwen3
     q_heads: int
     kv_heads: int
     head_dim: int
@@ -93,6 +95,13 @@ class MultiHeadAttention(eqx.Module):
         q_bthd = _linear(x_btd, self.q_proj).reshape(bsz, tsz, self.q_heads, self.head_dim)
         k_bthd = _linear(x_btd, self.k_proj).reshape(bsz, tsz, self.kv_heads, self.head_dim)
         v_bthd = _linear(x_btd, self.v_proj).reshape(bsz, tsz, self.kv_heads, self.head_dim)
+
+        # Apply QK-Norm before RoPE (Qwen3 style)
+        if self.q_norm is not None:
+            # Apply RMSNorm per head: (bsz, tsz, heads, head_dim) -> normalize over head_dim
+            q_bthd = self.q_norm(q_bthd)
+        if self.k_norm is not None:
+            k_bthd = self.k_norm(k_bthd)
 
         positions_flat = positions_bt.reshape(-1)
         q_flat = q_bthd.reshape(-1, self.q_heads, self.head_dim)
@@ -190,7 +199,9 @@ class LLM(eqx.Module):
                 k_proj=eqx.nn.Linear(config.embed_dim, config.kv_heads * config.head_dim, key=k_attn),
                 v_proj=eqx.nn.Linear(config.embed_dim, config.kv_heads * config.head_dim, key=k_attn),
                 o_proj=eqx.nn.Linear(config.q_heads * config.head_dim, config.embed_dim, key=k_attn),
-                rotary=RotaryEmbedding(head_dim=config.head_dim, base=config.rope_theta),
+                rotary=RotaryEmbedding(head_dim=config.head_dim, base=config.rope_theta, style="concatenated"),
+                q_norm=None,  # QK-Norm only created if weights are present
+                k_norm=None,  # QK-Norm only created if weights are present
                 q_heads=config.q_heads,
                 kv_heads=config.kv_heads,
                 head_dim=config.head_dim,
@@ -476,15 +487,29 @@ def load_hf_weights_into_llm(model: LLM, repo_id: str, revision: str | None = No
             state,
         )
 
-        q_b = state.get(kname(idx, "q_proj.bias"))
-        k_b = state.get(kname(idx, "k_proj.bias"))
-        v_b = state.get(kname(idx, "v_proj.bias"))
-        o_b = state.get(kname(idx, "o_proj.bias"))
+        q_b = state.get(kname(idx, "q_proj.bias")) or state.get(f"model.layers.{idx}.self_attn.q_proj.bias")
+        k_b = state.get(kname(idx, "k_proj.bias")) or state.get(f"model.layers.{idx}.self_attn.k_proj.bias")
+        v_b = state.get(kname(idx, "v_proj.bias")) or state.get(f"model.layers.{idx}.self_attn.v_proj.bias")
+        o_b = state.get(kname(idx, "o_proj.bias")) or state.get(f"model.layers.{idx}.self_attn.o_proj.bias")
 
         block = eqx.tree_at(lambda b: b.attn.q_proj, block, map_linear(block.attn.q_proj, q_w, q_b))
         block = eqx.tree_at(lambda b: b.attn.k_proj, block, map_linear(block.attn.k_proj, k_w, k_b))
         block = eqx.tree_at(lambda b: b.attn.v_proj, block, map_linear(block.attn.v_proj, v_w, v_b))
         block = eqx.tree_at(lambda b: b.attn.o_proj, block, map_linear(block.attn.o_proj, o_w, o_b))
+
+        # QK-Norm (Qwen3 style) - only create if weights are present
+        q_norm_key = f"model.layers.{idx}.self_attn.q_norm.weight"
+        k_norm_key = f"model.layers.{idx}.self_attn.k_norm.weight"
+        q_norm_w = state.get(q_norm_key)
+        k_norm_w = state.get(k_norm_key)
+        if q_norm_w is not None:
+            q_norm = RMSNorm(q_norm_w.shape[-1], eps=derived_cfg.rms_eps)
+            q_norm = eqx.tree_at(lambda n: n.weight, q_norm, jnp.asarray(q_norm_w, dtype=jnp.float32))
+            block = eqx.tree_at(lambda b: b.attn.q_norm, block, q_norm)
+        if k_norm_w is not None:
+            k_norm = RMSNorm(k_norm_w.shape[-1], eps=derived_cfg.rms_eps)
+            k_norm = eqx.tree_at(lambda n: n.weight, k_norm, jnp.asarray(k_norm_w, dtype=jnp.float32))
+            block = eqx.tree_at(lambda b: b.attn.k_norm, block, k_norm)
 
         # Norms
         pre_gamma = (
