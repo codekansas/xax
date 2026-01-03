@@ -98,7 +98,8 @@ class MnistClassification(xax.SupervisedTask[Config]):
         key: PRNGKeyArray,
     ) -> Array:
         y, yhat = batch["label"], output
-        return xax.cross_entropy(y, yhat, axis=1)
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits=yhat, labels=y)
+        return loss.mean()
 
     def compute_metrics(
         self,
