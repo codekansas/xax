@@ -19,6 +19,7 @@ import warnings
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+import chex
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -63,9 +64,26 @@ class LLMConfig:
     mlp_mult: int = 4
     mlp_hidden_dim: int | None = None
     rms_eps: float = 1e-6
+    attention_bias: bool = False  # Whether attention projections have bias
+    mlp_bias: bool = False  # Whether MLP projections have bias
 
     def with_vocab(self, vocab_size: int) -> "LLMConfig":
         return replace(self, vocab_size=vocab_size)
+
+
+class RMSNorm(eqx.Module):
+    """RMSNorm over the last dimension (no bias), matching LLaMA/Qwen style."""
+
+    weight: Array
+    eps: float = 1e-6
+
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        self.weight = jnp.ones((dim,), dtype=jnp.float32)
+        self.eps = eps
+
+    def __call__(self, x_btd: Array) -> Array:
+        norm = jnp.sqrt(jnp.mean(jnp.square(x_btd), axis=-1, keepdims=True) + self.eps)
+        return (x_btd / norm) * self.weight
 
 
 class MultiHeadAttention(eqx.Module):
@@ -76,8 +94,8 @@ class MultiHeadAttention(eqx.Module):
     v_proj: eqx.nn.Linear
     o_proj: eqx.nn.Linear
     rotary: RotaryEmbedding
-    q_norm: "RMSNorm | None"  # QK-Norm for Qwen3
-    k_norm: "RMSNorm | None"  # QK-Norm for Qwen3
+    q_norm: RMSNorm | None  # QK-Norm for Qwen3
+    k_norm: RMSNorm | None  # QK-Norm for Qwen3
     q_heads: int
     kv_heads: int
     head_dim: int
@@ -91,7 +109,10 @@ class MultiHeadAttention(eqx.Module):
         key: jax.Array | None = None,
         inference: bool = True,
     ) -> Array:
+        chex.assert_rank(x_btd, 3)
+        chex.assert_rank(positions_bt, 2)
         bsz, tsz, _ = x_btd.shape
+        chex.assert_shape(positions_bt, (bsz, tsz))
         q_bthd = _linear(x_btd, self.q_proj).reshape(bsz, tsz, self.q_heads, self.head_dim)
         k_bthd = _linear(x_btd, self.k_proj).reshape(bsz, tsz, self.kv_heads, self.head_dim)
         v_bthd = _linear(x_btd, self.v_proj).reshape(bsz, tsz, self.kv_heads, self.head_dim)
@@ -136,29 +157,15 @@ class FeedForward(eqx.Module):
     down: eqx.nn.Linear
 
     def __call__(self, x_btd: Array) -> Array:
+        chex.assert_rank(x_btd, {2, 3})  # (tsz, dim) or (bsz, tsz, dim)
         gated_btd = jax.nn.silu(_linear(x_btd, self.gate)) * _linear(x_btd, self.up)
         return _linear(gated_btd, self.down)
 
 
-class RMSNorm(eqx.Module):
-    """RMSNorm over the last dimension (no bias), matching LLaMA/Qwen style."""
-
-    weight: Array
-    eps: float = 1e-6
-
-    def __init__(self, dim: int, eps: float = 1e-6) -> None:
-        self.weight = jnp.ones((dim,), dtype=jnp.float32)
-        self.eps = eps
-
-    def __call__(self, x_btd: Array) -> Array:
-        norm = jnp.sqrt(jnp.mean(jnp.square(x_btd), axis=-1, keepdims=True) + self.eps)
-        return (x_btd / norm) * self.weight
-
-
 class TransformerBlock(eqx.Module):
     attn: MultiHeadAttention
-    attn_norm: "RMSNorm"
-    mlp_norm: "RMSNorm"
+    attn_norm: RMSNorm
+    mlp_norm: RMSNorm
     mlp: FeedForward
 
     def __call__(
@@ -192,14 +199,18 @@ class LLM(eqx.Module):
         embed = eqx.nn.Embedding(config.vocab_size, config.embed_dim, key=k_emb)
         blocks = []
         mlp_width = config.mlp_hidden_dim or (config.embed_dim * config.mlp_mult)
+        attn_bias = config.attention_bias
+        mlp_bias = config.mlp_bias
         for i in range(config.num_layers):
             k_attn, k_mlp = jax.random.split(block_keys[i], 2)
+            q_dim = config.q_heads * config.head_dim
+            kv_dim = config.kv_heads * config.head_dim
             attn = MultiHeadAttention(
-                q_proj=eqx.nn.Linear(config.embed_dim, config.q_heads * config.head_dim, key=k_attn),
-                k_proj=eqx.nn.Linear(config.embed_dim, config.kv_heads * config.head_dim, key=k_attn),
-                v_proj=eqx.nn.Linear(config.embed_dim, config.kv_heads * config.head_dim, key=k_attn),
-                o_proj=eqx.nn.Linear(config.q_heads * config.head_dim, config.embed_dim, key=k_attn),
-                rotary=RotaryEmbedding(head_dim=config.head_dim, base=config.rope_theta, style="concatenated"),
+                q_proj=eqx.nn.Linear(config.embed_dim, q_dim, use_bias=attn_bias, key=k_attn),
+                k_proj=eqx.nn.Linear(config.embed_dim, kv_dim, use_bias=attn_bias, key=k_attn),
+                v_proj=eqx.nn.Linear(config.embed_dim, kv_dim, use_bias=attn_bias, key=k_attn),
+                o_proj=eqx.nn.Linear(q_dim, config.embed_dim, use_bias=attn_bias, key=k_attn),
+                rotary=RotaryEmbedding(config.head_dim, base=config.rope_theta, style="concatenated"),
                 q_norm=None,  # QK-Norm only created if weights are present
                 k_norm=None,  # QK-Norm only created if weights are present
                 q_heads=config.q_heads,
@@ -208,9 +219,9 @@ class LLM(eqx.Module):
                 dropout_rate=config.dropout_rate,
             )
             mlp = FeedForward(
-                gate=eqx.nn.Linear(config.embed_dim, mlp_width, key=k_mlp),
-                up=eqx.nn.Linear(config.embed_dim, mlp_width, key=k_mlp),
-                down=eqx.nn.Linear(mlp_width, config.embed_dim, key=k_mlp),
+                gate=eqx.nn.Linear(config.embed_dim, mlp_width, use_bias=mlp_bias, key=k_mlp),
+                up=eqx.nn.Linear(config.embed_dim, mlp_width, use_bias=mlp_bias, key=k_mlp),
+                down=eqx.nn.Linear(mlp_width, config.embed_dim, use_bias=mlp_bias, key=k_mlp),
             )
             blocks.append(
                 TransformerBlock(
@@ -221,7 +232,7 @@ class LLM(eqx.Module):
                 )
             )
         norm = RMSNorm(config.embed_dim, eps=config.rms_eps)
-        lm_head = eqx.nn.Linear(config.embed_dim, config.vocab_size, key=k_head)
+        lm_head = eqx.nn.Linear(config.embed_dim, config.vocab_size, use_bias=False, key=k_head)
         return cls(embed=embed, blocks=tuple(blocks), norm=norm, lm_head=lm_head, config=config)
 
     def __call__(
@@ -232,6 +243,7 @@ class LLM(eqx.Module):
         inference: bool = True,
     ) -> Array:
         """Returns logits shaped (bsz, tsz, vocab_size)."""
+        chex.assert_rank(tokens_bt, 2)
         bsz, tsz = tokens_bt.shape
         positions_bt = jnp.broadcast_to(jnp.arange(tsz)[None, :], (bsz, tsz))
 
@@ -342,6 +354,22 @@ def _maybe_get(key_sub: str, state: dict[str, jnp.ndarray]) -> jnp.ndarray:
     return state[matches[0]]
 
 
+def _get_weight(state: dict[str, jnp.ndarray], *keys: str) -> jnp.ndarray:
+    """Get weight from state, trying each key in order."""
+    for key in keys:
+        if any(key in k for k in state):
+            return _maybe_get(key, state)
+    raise KeyError(f"Missing parameter for keys: {keys}")
+
+
+def _get_bias(state: dict[str, jnp.ndarray], *keys: str) -> jnp.ndarray | None:
+    """Get optional bias from state, trying each key in order."""
+    for key in keys:
+        if key in state:
+            return state[key]
+    return None
+
+
 class HFConfig(BaseModel):
     """Subset of HuggingFace config fields needed for LLMConfig derivation."""
 
@@ -379,6 +407,14 @@ class HFConfig(BaseModel):
         default=None,
         validation_alias=AliasChoices("rms_norm_eps", "layer_norm_epsilon"),
     )
+    attention_bias: bool | None = PydanticField(
+        default=None,
+        validation_alias=AliasChoices("attention_bias"),
+    )
+    mlp_bias: bool | None = PydanticField(
+        default=None,
+        validation_alias=AliasChoices("mlp_bias"),
+    )
 
 
 def hf_config_to_llm_config(cfg: dict[str, object], base: LLMConfig | None = None) -> LLMConfig:
@@ -395,6 +431,9 @@ def hf_config_to_llm_config(cfg: dict[str, object], base: LLMConfig | None = Non
     mlp_mult = max(1, mlp_hidden_dim // embed_dim)
     rope_theta = parsed.rope_theta or base.rope_theta
     rms_eps = parsed.rms_norm_eps or base.rms_eps
+    # Default to False for biases if not specified (most LLaMA-style models don't have biases)
+    attention_bias = parsed.attention_bias if parsed.attention_bias is not None else base.attention_bias
+    mlp_bias = parsed.mlp_bias if parsed.mlp_bias is not None else base.mlp_bias
     return LLMConfig(
         vocab_size=vocab_size,
         embed_dim=embed_dim,
@@ -408,6 +447,8 @@ def hf_config_to_llm_config(cfg: dict[str, object], base: LLMConfig | None = Non
         mlp_mult=mlp_mult,
         mlp_hidden_dim=mlp_hidden_dim,
         rms_eps=rms_eps,
+        attention_bias=attention_bias,
+        mlp_bias=mlp_bias,
     )
 
 
@@ -429,122 +470,96 @@ def load_hf_weights_into_llm(model: LLM, repo_id: str, revision: str | None = No
     if derived_cfg.embed_dim != model.config.embed_dim:
         raise ValueError(f"HF hidden_size {derived_cfg.embed_dim} != model.embed_dim {model.config.embed_dim}")
 
+    def to_f32(arr: jnp.ndarray) -> jnp.ndarray:
+        return jnp.asarray(arr, dtype=jnp.float32)
+
     def map_linear(eq_lin: eqx.nn.Linear, w: jnp.ndarray, b: jnp.ndarray | None) -> eqx.nn.Linear:
-        if w.shape == eq_lin.weight.shape:
-            w_mapped = w
-        elif w.shape[::-1] == eq_lin.weight.shape:
-            w_mapped = w.T
-        else:
-            raise ValueError(f"Shape mismatch for linear: expected {eq_lin.weight.shape}, got {w.shape}")
-        eq_lin = eqx.tree_at(lambda lin: lin.weight, eq_lin, jnp.asarray(w_mapped, dtype=jnp.float32))
-        if eq_lin.bias is not None and b is not None:
-            if b.shape != eq_lin.bias.shape:
-                raise ValueError(f"Shape mismatch for bias: expected {eq_lin.bias.shape}, got {b.shape}")
-            eq_lin = eqx.tree_at(lambda lin: lin.bias, eq_lin, jnp.asarray(b, dtype=jnp.float32))
+        w_mapped = w if w.shape == eq_lin.weight.shape else w.T
+        chex.assert_shape(w_mapped, eq_lin.weight.shape)
+        eq_lin = eqx.tree_at(lambda lin: lin.weight, eq_lin, to_f32(w_mapped))
+        if b is not None:
+            # If weights have bias, we need to add it even if model didn't have one
+            if eq_lin.bias is not None:
+                chex.assert_shape(b, eq_lin.bias.shape)
+                eq_lin = eqx.tree_at(lambda lin: lin.bias, eq_lin, to_f32(b))
+            else:
+                # Create new Linear with bias
+                eq_lin = eqx.tree_at(lambda lin: lin.bias, eq_lin, to_f32(b), is_leaf=lambda x: x is None)
         return eq_lin
 
     # Embedding + LM head
-    embed_w = (
-        _maybe_get("embed_tokens.weight", state)
-        if any("embed_tokens.weight" in k for k in state)
-        else _maybe_get("wte.weight", state)
-    )
-    model = eqx.tree_at(lambda m: m.embed.weight, model, jnp.asarray(embed_w, dtype=jnp.float32))
-    lm_head_w = _maybe_get("lm_head.weight", state) if any("lm_head.weight" in k for k in state) else embed_w
-    if model.lm_head.weight.shape == embed_w.shape:
-        model = eqx.tree_at(lambda m: m.lm_head.weight, model, jnp.asarray(lm_head_w, dtype=jnp.float32))
-        # Tie if shapes match to stay faithful to HF tying
+    embed_w = _get_weight(state, "embed_tokens.weight", "wte.weight")
+    model = eqx.tree_at(lambda m: m.embed.weight, model, to_f32(embed_w))
+
+    # Check if model has separate lm_head weights (not tied to embeddings)
+    has_separate_lm_head = any("lm_head.weight" in k for k in state)
+    if has_separate_lm_head:
+        lm_head_w = _get_weight(state, "lm_head.weight")
+        model = eqx.tree_at(lambda m: m.lm_head.weight, model, to_f32(lm_head_w))
+    elif model.lm_head.weight.shape == embed_w.shape:
+        # Tie embedding and lm_head only if no separate lm_head exists
         model = tie_embedding_and_head(model)
 
     # Per-layer mappings
     for idx, block in enumerate(model.blocks):
-        # Attention projections
-        def kname(layer_idx: int, suffix: str) -> str:
-            return f"layers.{layer_idx}.self_attn.{suffix}"
+        pfx = f"layers.{idx}.self_attn"
+        pfx_alt = f"model.layers.{idx}.self_attn"
+        mlp_pfx = f"layers.{idx}.mlp"
 
-        q_w = _maybe_get(
-            kname(idx, "q_proj.weight")
-            if any(kname(idx, "q_proj.weight") in k for k in state)
-            else f"model.layers.{idx}.self_attn.q_proj.weight",
-            state,
-        )
-        k_w = _maybe_get(
-            kname(idx, "k_proj.weight")
-            if any(kname(idx, "k_proj.weight") in k for k in state)
-            else f"model.layers.{idx}.self_attn.k_proj.weight",
-            state,
-        )
-        v_w = _maybe_get(
-            kname(idx, "v_proj.weight")
-            if any(kname(idx, "v_proj.weight") in k for k in state)
-            else f"model.layers.{idx}.self_attn.v_proj.weight",
-            state,
-        )
-        o_w = _maybe_get(
-            kname(idx, "o_proj.weight")
-            if any(kname(idx, "o_proj.weight") in k for k in state)
-            else f"model.layers.{idx}.self_attn.o_proj.weight",
-            state,
-        )
-
-        q_b = state.get(kname(idx, "q_proj.bias")) or state.get(f"model.layers.{idx}.self_attn.q_proj.bias")
-        k_b = state.get(kname(idx, "k_proj.bias")) or state.get(f"model.layers.{idx}.self_attn.k_proj.bias")
-        v_b = state.get(kname(idx, "v_proj.bias")) or state.get(f"model.layers.{idx}.self_attn.v_proj.bias")
-        o_b = state.get(kname(idx, "o_proj.bias")) or state.get(f"model.layers.{idx}.self_attn.o_proj.bias")
-
+        # Attention projections (q, k, v, o)
+        q_w = _get_weight(state, f"{pfx}.q_proj.weight", f"{pfx_alt}.q_proj.weight")
+        k_w = _get_weight(state, f"{pfx}.k_proj.weight", f"{pfx_alt}.k_proj.weight")
+        v_w = _get_weight(state, f"{pfx}.v_proj.weight", f"{pfx_alt}.v_proj.weight")
+        o_w = _get_weight(state, f"{pfx}.o_proj.weight", f"{pfx_alt}.o_proj.weight")
+        q_b = _get_bias(state, f"{pfx}.q_proj.bias", f"{pfx_alt}.q_proj.bias")
+        k_b = _get_bias(state, f"{pfx}.k_proj.bias", f"{pfx_alt}.k_proj.bias")
+        v_b = _get_bias(state, f"{pfx}.v_proj.bias", f"{pfx_alt}.v_proj.bias")
+        o_b = _get_bias(state, f"{pfx}.o_proj.bias", f"{pfx_alt}.o_proj.bias")
         block = eqx.tree_at(lambda b: b.attn.q_proj, block, map_linear(block.attn.q_proj, q_w, q_b))
         block = eqx.tree_at(lambda b: b.attn.k_proj, block, map_linear(block.attn.k_proj, k_w, k_b))
         block = eqx.tree_at(lambda b: b.attn.v_proj, block, map_linear(block.attn.v_proj, v_w, v_b))
         block = eqx.tree_at(lambda b: b.attn.o_proj, block, map_linear(block.attn.o_proj, o_w, o_b))
 
         # QK-Norm (Qwen3 style) - only create if weights are present
-        q_norm_key = f"model.layers.{idx}.self_attn.q_norm.weight"
-        k_norm_key = f"model.layers.{idx}.self_attn.k_norm.weight"
-        q_norm_w = state.get(q_norm_key)
-        k_norm_w = state.get(k_norm_key)
+        q_norm_w = state.get(f"{pfx_alt}.q_norm.weight")
+        k_norm_w = state.get(f"{pfx_alt}.k_norm.weight")
         if q_norm_w is not None:
             q_norm = RMSNorm(q_norm_w.shape[-1], eps=derived_cfg.rms_eps)
-            q_norm = eqx.tree_at(lambda n: n.weight, q_norm, jnp.asarray(q_norm_w, dtype=jnp.float32))
+            q_norm = eqx.tree_at(lambda n: n.weight, q_norm, to_f32(q_norm_w))
             block = eqx.tree_at(lambda b: b.attn.q_norm, block, q_norm)
         if k_norm_w is not None:
             k_norm = RMSNorm(k_norm_w.shape[-1], eps=derived_cfg.rms_eps)
-            k_norm = eqx.tree_at(lambda n: n.weight, k_norm, jnp.asarray(k_norm_w, dtype=jnp.float32))
+            k_norm = eqx.tree_at(lambda n: n.weight, k_norm, to_f32(k_norm_w))
             block = eqx.tree_at(lambda b: b.attn.k_norm, block, k_norm)
 
-        # Norms
-        pre_gamma = (
-            _maybe_get(kname(idx, "input_layernorm.weight"), state)
-            if any(kname(idx, "input_layernorm.weight") in k for k in state)
-            else _maybe_get(f"layers.{idx}.input_layernorm.weight", state)
+        # Layer norms (at block level, not under self_attn)
+        blk_pfx = f"layers.{idx}"
+        blk_pfx_alt = f"model.layers.{idx}"
+        pre_gamma = _get_weight(state, f"{blk_pfx}.input_layernorm.weight", f"{blk_pfx_alt}.input_layernorm.weight")
+        post_gamma = _get_weight(
+            state, f"{blk_pfx}.post_attention_layernorm.weight", f"{blk_pfx_alt}.post_attention_layernorm.weight"
         )
-        post_gamma = (
-            _maybe_get(kname(idx, "post_attention_layernorm.weight"), state)
-            if any(kname(idx, "post_attention_layernorm.weight") in k for k in state)
-            else _maybe_get(f"layers.{idx}.post_attention_layernorm.weight", state)
-        )
-        block = eqx.tree_at(lambda b: b.attn_norm.weight, block, jnp.asarray(pre_gamma, dtype=jnp.float32))
-        block = eqx.tree_at(lambda b: b.mlp_norm.weight, block, jnp.asarray(post_gamma, dtype=jnp.float32))
+        block = eqx.tree_at(lambda b: b.attn_norm.weight, block, to_f32(pre_gamma))
+        block = eqx.tree_at(lambda b: b.mlp_norm.weight, block, to_f32(post_gamma))
 
-        # MLP
-        gate_w = _maybe_get(f"layers.{idx}.mlp.gate_proj.weight", state)
-        up_w = _maybe_get(f"layers.{idx}.mlp.up_proj.weight", state)
-        down_w = _maybe_get(f"layers.{idx}.mlp.down_proj.weight", state)
-        gate_b = state.get(f"layers.{idx}.mlp.gate_proj.bias")
-        up_b = state.get(f"layers.{idx}.mlp.up_proj.bias")
-        down_b = state.get(f"layers.{idx}.mlp.down_proj.bias")
-
+        # MLP projections (gate, up, down)
+        mlp_pfx_alt = f"model.layers.{idx}.mlp"
+        gate_w = _get_weight(state, f"{mlp_pfx}.gate_proj.weight", f"{mlp_pfx_alt}.gate_proj.weight")
+        up_w = _get_weight(state, f"{mlp_pfx}.up_proj.weight", f"{mlp_pfx_alt}.up_proj.weight")
+        down_w = _get_weight(state, f"{mlp_pfx}.down_proj.weight", f"{mlp_pfx_alt}.down_proj.weight")
+        gate_b = _get_bias(state, f"{mlp_pfx}.gate_proj.bias", f"{mlp_pfx_alt}.gate_proj.bias")
+        up_b = _get_bias(state, f"{mlp_pfx}.up_proj.bias", f"{mlp_pfx_alt}.up_proj.bias")
+        down_b = _get_bias(state, f"{mlp_pfx}.down_proj.bias", f"{mlp_pfx_alt}.down_proj.bias")
         block = eqx.tree_at(lambda b: b.mlp.gate, block, map_linear(block.mlp.gate, gate_w, gate_b))
         block = eqx.tree_at(lambda b: b.mlp.up, block, map_linear(block.mlp.up, up_w, up_b))
         block = eqx.tree_at(lambda b: b.mlp.down, block, map_linear(block.mlp.down, down_w, down_b))
 
-        model = eqx.tree_at(lambda mod, layer_idx=idx: mod.blocks[layer_idx], model, block)
+        model = eqx.tree_at(lambda mod, i=idx: mod.blocks[i], model, block)
 
     # Final norm
-    final_gamma = (
-        _maybe_get("norm.weight", state) if any("norm.weight" in k for k in state) else state.get("ln_f.weight")
-    )
+    final_gamma = _get_bias(state, "norm.weight", "model.norm.weight", "ln_f.weight")
     if final_gamma is not None:
-        model = eqx.tree_at(lambda m: m.norm.weight, model, jnp.asarray(final_gamma, dtype=jnp.float32))
+        model = eqx.tree_at(lambda m: m.norm.weight, model, to_f32(final_gamma))
 
     return model
 
