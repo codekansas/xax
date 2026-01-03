@@ -185,30 +185,28 @@ class SupervisedMixin(
                 grads = jax.tree.map(lambda g: g.astype(grad_dtype) if eqx.is_inexact_array(g) else g, grads)
                 return grads, loss, output
 
-            # Initialize accumulators
+            # Initialize accumulators.
             first_leaf = jax.tree.leaves(batches)[0]
             init_grads = jax.tree.map(lambda x: jnp.zeros_like(x, dtype=grad_dtype), model_arr)
             init_loss = jnp.zeros_like(first_leaf, shape=(), dtype=jnp.float32)
-            n = jnp.ones_like(first_leaf, shape=(), dtype=jnp.float32)
-
-            def acc_sum(x: Array, y: Array, n: Array) -> Array:
-                # Compute the running average of x and y.
-                return x * ((n - 1) / n) + y / n
 
             def accum_fn(
-                carry: tuple[PyTree, Array, Array, PRNGKeyArray],
+                carry: tuple[PyTree, Array, PRNGKeyArray],
                 batch: Batch,
             ) -> tuple[tuple[PyTree, Array, PRNGKeyArray], Output]:
-                acc_grads, acc_loss, n, key = carry
+                acc_grads, acc_loss, key = carry
                 key, step_key = jax.random.split(key)
                 grads, loss, output = compute_grads_and_loss(model_arr, batch, step_key)
-                acc_grads = jax.tree.map(lambda x, y: acc_sum(x, y, n), acc_grads, grads)
-                acc_loss = acc_sum(acc_loss, loss, n)
-                return (acc_grads, acc_loss, n + 1, key), output
+                acc_grads = jax.tree.map(jnp.add, acc_grads, grads)
+                acc_loss = acc_loss + loss
+                return (acc_grads, acc_loss, key), output
 
-            # Accumulate gradients over micro-batches using scan
-            # Note: acc_sum already computes the running average, so no additional division is needed
-            (acc_grads, acc_loss, _, key), outputs = jax.lax.scan(accum_fn, (init_grads, init_loss, n, key), batches)
+            # Accumulate gradients over micro-batches using scan.
+            (acc_grads, acc_loss, key), outputs = jax.lax.scan(accum_fn, (init_grads, init_loss, key), batches)
+
+            # Average gradients and loss over micro-batches.
+            acc_grads = jax.tree.map(lambda g: g / num_accum_steps, acc_grads)
+            acc_loss = acc_loss / num_accum_steps
 
             # Clip gradients if configured
             grad_norm = cast(Array, optax.global_norm(acc_grads))

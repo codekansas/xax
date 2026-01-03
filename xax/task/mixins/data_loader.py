@@ -192,15 +192,17 @@ class InMemoryBatchIterator(Iterator[Batch]):
         first_leaf = jax.tree.leaves(batched_data)[0]
         self._num_batches = first_leaf.shape[0]
 
-        # For minibatches, since we're indexing along the `batch_size` axis
-        # and putting the stacked minibatches along axis 0, we need the output
-        # sharding to have axis 0 sharding as None.
-        sharding = first_leaf.sharding
-        self._out_sharding = jax.sharding.NamedSharding(
-            mesh=sharding.mesh,
-            spec=P(None, *sharding.spec),
-            memory_kind=sharding.memory_kind,
+        # Storage has shape (num_batches, batch_size, ...) with sharding P(None, 'batch', ...).
+        # When extracting batches, we need different shardings:
+        # - Single batch (scalar index): output is (batch_size, ...) -> use P('batch', ...)
+        # - Stacked batches (array index): output is (n, batch_size, ...) -> use same as storage
+        storage_sharding = first_leaf.sharding
+        self._single_batch_sharding = NamedSharding(
+            mesh=storage_sharding.mesh,
+            spec=P(*storage_sharding.spec[1:]),
+            memory_kind=storage_sharding.memory_kind,
         )
+        self._stacked_batch_sharding = storage_sharding
 
         # Initialize shuffled batch order
         self._key, subkey = jax.random.split(self._key)
@@ -220,7 +222,7 @@ class InMemoryBatchIterator(Iterator[Batch]):
         # Use Python int for indexing to avoid traced array overhead
         batch_idx = int(self._batch_order[self._current_idx])
         # Simple slice - data is already on device
-        batch = jax.tree.map(lambda x: x.at[batch_idx].get(out_sharding=self._out_sharding), self._data)
+        batch = jax.tree.map(lambda x: x.at[batch_idx].get(out_sharding=self._single_batch_sharding), self._data)
         self._current_idx += 1
 
         return batch
@@ -248,7 +250,7 @@ class InMemoryBatchIterator(Iterator[Batch]):
         self._current_idx += n
 
         # Single gather operation for all batches
-        stacked = jax.tree.map(lambda x: x.at[indices].get(out_sharding=self._out_sharding), self._data)
+        stacked = jax.tree.map(lambda x: x.at[indices].get(out_sharding=self._stacked_batch_sharding), self._data)
 
         return stacked
 
@@ -312,7 +314,15 @@ def load_dataset_in_memory(
             for key, arr in batched_data.items()
         }
 
-    batched_data = jax.device_put(batched_data, sharding)
+    # The data has shape (num_batches, batch_size, ...). The incoming sharding
+    # is for the batch dimension (e.g., P('batch')), so we need to prepend None
+    # to shard along axis 1 (batch_size) rather than axis 0 (num_batches).
+    storage_sharding = NamedSharding(
+        mesh=sharding.mesh,
+        spec=P(None, *sharding.spec),
+        memory_kind=sharding.memory_kind,
+    )
+    batched_data = jax.device_put(batched_data, storage_sharding)
 
     logger.info(
         "Loaded dataset into memory: %d samples -> %d batches of %d",
