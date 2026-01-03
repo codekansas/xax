@@ -28,9 +28,9 @@ class Config(xax.SupervisedConfig):
     learning_rate: float = xax.field(1e-3, help="The learning rate")
     hidden_dim: int = xax.field(128, help="Hidden layer dimension")
     dim_scales: list[int] = xax.field([1, 2, 4, 8], help="List of dimension scales for UNet")
-    num_timesteps: int = xax.field(500, help="Number of diffusion timesteps")
+    num_timesteps: int = xax.field(250, help="Number of diffusion timesteps")
     pred_mode: str = xax.field("pred_v", help="Prediction mode: pred_x_0, pred_eps, or pred_v")
-    beta_schedule: str = xax.field("linear", help="Beta schedule type")
+    beta_schedule: str = xax.field("cosine", help="Beta schedule type")
     warmup_steps: int = xax.field(100, help="Number of warmup steps")
     sampling_timesteps: int | None = xax.field(50, help="Number of timesteps for sampling")
 

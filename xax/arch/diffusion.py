@@ -201,12 +201,14 @@ def _warmup_beta_schedule(
 def _cosine_beta_schedule(
     num_timesteps: int,
     offset: float = 0.008,
+    min_beta: float = 0.0001,
 ) -> Array:
-    rng = jnp.arange(num_timesteps, dtype=jnp.float32)
-    f_t = jnp.cos((rng / (num_timesteps - 1) + offset) / (1 + offset) * jnp.pi / 2) ** 2
+    # Use num_timesteps + 1 points so beta[0] is properly defined
+    rng = jnp.arange(num_timesteps + 1, dtype=jnp.float32)
+    f_t = jnp.cos((rng / num_timesteps + offset) / (1 + offset) * jnp.pi / 2) ** 2
     bar_alpha = f_t / f_t[0]
-    beta = jnp.zeros_like(bar_alpha)
-    beta = beta.at[1:].set((1 - (bar_alpha[1:] / bar_alpha[:-1])).clip(0, 0.999))
+    # Compute betas from bar_alpha ratios, clipping to [min_beta, 0.999]
+    beta = (1 - (bar_alpha[1:] / bar_alpha[:-1])).clip(min_beta, 0.999)
     return beta
 
 
