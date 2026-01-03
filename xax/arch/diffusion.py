@@ -15,8 +15,6 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, PRNGKeyArray
 
-from xax.utils.jax import jit as xax_jit
-
 ODESolverType = Literal["euler", "heun", "rk4"]
 DiffusionLossFn = Literal["mse", "l1", "pseudo-huber"]
 DiffusionPredMode = Literal["pred_x_0", "pred_eps", "pred_v"]
@@ -349,13 +347,12 @@ class GaussianDiffusion(eqx.Module):
         """
         bsz = x.shape[0]
         t_key, eps_key = jax.random.split(key)
+
         # Sample timesteps from [0, num_timesteps]
-        # Note: bar_alpha has shape (num_beta_steps,) = (num_timesteps + 1,)
-        # So we can index with [0, num_timesteps], but t=0 means no noise
-        # We sample from [0, num_timesteps] to include all valid timesteps
+        breakpoint()
         t_sample = jax.random.randint(t_key, (bsz,), 0, self.num_timesteps + 1)
-        eps = self.get_noise(eps_key, x)
-        bar_alpha = self._get_bar_alpha(t_sample, x)
+        eps = jax.random.normal(eps_key, x.shape, dtype=x.dtype)
+        bar_alpha = self._get_bar_alpha(t_sample, x.ndim)
         x_t = jnp.sqrt(bar_alpha) * x + jnp.sqrt(1 - bar_alpha) * eps
         pred_target = model(x_t, t_sample)
         match self.pred_mode:
@@ -369,7 +366,6 @@ class GaussianDiffusion(eqx.Module):
                 raise NotImplementedError(f"Unknown pred_mode: {self.pred_mode}")
         return pred_target, gt_target
 
-    @xax_jit(static_argnames=["self", "model", "loss", "loss_dim", "loss_factor"])
     def loss(
         self,
         key: PRNGKeyArray,
@@ -427,7 +423,7 @@ class GaussianDiffusion(eqx.Module):
         scalar_t_start = num_timesteps
         noise_key, sample_key = jax.random.split(key)
         noise = self.get_noise(noise_key, reference_sample)
-        bar_alpha = self._get_bar_alpha(scalar_t_start, noise)
+        bar_alpha = self._get_bar_alpha(scalar_t_start, noise.ndim)
         x = jnp.sqrt(bar_alpha) * reference_sample + jnp.sqrt(1 - bar_alpha) * noise
         return self._sample_common(
             key=sample_key,
@@ -471,15 +467,24 @@ class GaussianDiffusion(eqx.Module):
     def _get_t_tensor(self, t: Array, x: Array) -> Array:
         return jnp.full((x.shape[0],), t, dtype=jnp.int32)
 
-    def _get_bar_alpha(self, t: float | int | Array, x: Array) -> Array:
+    def _get_bar_alpha(self, t: float | int | Array, ndim: int = 1) -> Array:
+        """Get bar_alpha values for given timesteps.
+
+        Args:
+            t: Timesteps, can be scalar or array.
+            ndim: Number of dimensions to expand result to (for broadcasting).
+
+        Returns:
+            bar_alpha values with shape suitable for broadcasting.
+        """
         # When using non-integer timesteps, like when using the RK4 ODE solver,
         # we interpolate the `bar_alpha` values. Since `bar_alpha` is a
         # cumulative product we need to do a weighted geometric mean rather than
-        # a linear mean. Side note: This code works for both the case where
-        # `t_max - t_min` is 1 and where it is 0.
+        # a linear mean.
         bar_alpha = jnp.array(self.bar_alpha)
         if isinstance(t, (float, int)):
             t = jnp.array(t)
+
         if t.dtype in (jnp.float32, jnp.float64):
             t_min = jnp.floor(t).astype(jnp.int32)
             t_max = jnp.ceil(t).astype(jnp.int32)
@@ -490,7 +495,7 @@ class GaussianDiffusion(eqx.Module):
             bar_alpha = jnp.power(factor, w_min) * bar_alpha_min
         else:
             bar_alpha = bar_alpha[t]
-        return append_dims(bar_alpha, x.ndim - bar_alpha.ndim)
+        return append_dims(bar_alpha, ndim - bar_alpha.ndim)
 
     def _run_model(self, model: Callable[[Array, Array], Array], x: Array, t: Array, bar_alpha: Array) -> Array:
         # Use model to predict x_0.
@@ -517,10 +522,10 @@ class GaussianDiffusion(eqx.Module):
         scalar_t_end: Array,
     ) -> Array:
         t = self._get_t_tensor(scalar_t_start, x)
-        bar_alpha = self._get_bar_alpha(t, x)
+        bar_alpha = self._get_bar_alpha(t, x.ndim)
         pred_x_0 = self._run_model(model, x, t, bar_alpha)
         next_t = self._get_t_tensor(scalar_t_end, x)
-        bar_alpha_next = self._get_bar_alpha(next_t, x)
+        bar_alpha_next = self._get_bar_alpha(next_t, x.ndim)
         sqrt_bar_alpha = jnp.sqrt(jnp.clip(bar_alpha, EPS, 1.0 - EPS))
         sqrt_one_minus_bar_alpha = jnp.sqrt(jnp.clip(1.0 - bar_alpha, EPS, 1.0))
         predicted_eps = (x - sqrt_bar_alpha * pred_x_0) / sqrt_one_minus_bar_alpha

@@ -34,7 +34,7 @@ class ParallelMixin(BaseTask[Config], Generic[Config], ABC):
         return jax.sharding.Mesh(
             devices=devices,
             axis_names=("batch",),
-            axis_types=(jax.sharding.AxisType.Explicit,),
+            axis_types=(jax.sharding.AxisType.Auto,),
         )
 
     def get_data_sharding(self, mesh: jax.sharding.Mesh) -> jax.sharding.NamedSharding:

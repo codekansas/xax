@@ -74,23 +74,22 @@ class UNet(eqx.Module):
         )
 
     def __call__(self, x_hw: Array, t: Array, c: Array) -> Array:
+        """Forward pass for a single sample."""
         dtype = self.class_embs.weight.dtype
 
-        # Embed class.
+        # Embed class
         c_n = self.class_embs(c)
 
-        # Embed time.
+        # Embed time
         t_n = self.fourier_emb(t).astype(dtype)
         t_n = self.time_proj_1(t_n)
         t_n = xax.get_activation("silu")(t_n)
         t_n = self.time_proj_2(t_n)
 
-        # Combine embeddings.
+        # Combine embeddings
         e_n = c_n + t_n
 
-        o_hw = self.unet(x_hw[None].astype(dtype), e_n)[0]
-
-        return o_hw
+        return self.unet(x_hw[None].astype(dtype), e_n)[0]
 
 
 class MnistDiffusion(xax.SupervisedTask[Config]):
@@ -152,7 +151,7 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
         labels_b = batch["label"]
 
         def model_fn(x_bhw: Array, t_b: Array) -> Array:
-            return xax.vmap(model)(x_bhw, t_b, labels_b)
+            return jax.vmap(model)(x_bhw, t_b, labels_b)
 
         loss = self.diffusion.loss(key, model_fn, images_bhw)
         return loss.mean()
@@ -180,6 +179,7 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
 
         images = (batch["image"].astype(np.float32) / 255.0) - 0.5
         class_id = batch["label"]
+        batch_size = class_id.shape[0]
         metrics["real"] = xax.LabeledImages(
             images,
             class_id,
@@ -194,7 +194,7 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
         gen = self.diffusion.sample(
             key,
             vanilla_func,
-            shape=(len(class_id), 32, 32),
+            shape=(batch_size, 32, 32),
             sampling_timesteps=num_sample,
         )
 

@@ -196,13 +196,20 @@ class InMemoryBatchIterator(Iterator[Batch]):
         # When extracting batches, we need different shardings:
         # - Single batch (scalar index): output is (batch_size, ...) -> use P('batch', ...)
         # - Stacked batches (array index): output is (n, batch_size, ...) -> use same as storage
+        # Note: out_sharding is only needed for Explicit axis types; Auto handles it automatically.
         storage_sharding = first_leaf.sharding
-        self._single_batch_sharding = NamedSharding(
-            mesh=storage_sharding.mesh,
-            spec=P(*storage_sharding.spec[1:]),
-            memory_kind=storage_sharding.memory_kind,
-        )
-        self._stacked_batch_sharding = storage_sharding
+        mesh = storage_sharding.mesh
+        uses_explicit_sharding = any(axis_type == jax.sharding.AxisType.Explicit for axis_type in mesh.axis_types)
+        if uses_explicit_sharding:
+            self._single_batch_sharding: NamedSharding | None = NamedSharding(
+                mesh=mesh,
+                spec=P(*storage_sharding.spec[1:]),
+                memory_kind=storage_sharding.memory_kind,
+            )
+            self._stacked_batch_sharding: NamedSharding | None = storage_sharding
+        else:
+            self._single_batch_sharding = None
+            self._stacked_batch_sharding = None
 
         # Initialize shuffled batch order
         self._key, subkey = jax.random.split(self._key)
@@ -221,8 +228,12 @@ class InMemoryBatchIterator(Iterator[Batch]):
 
         # Use Python int for indexing to avoid traced array overhead
         batch_idx = int(self._batch_order[self._current_idx])
+
         # Simple slice - data is already on device
-        batch = jax.tree.map(lambda x: x.at[batch_idx].get(out_sharding=self._single_batch_sharding), self._data)
+        if self._single_batch_sharding is not None:
+            batch = jax.tree.map(lambda x: x.at[batch_idx].get(out_sharding=self._single_batch_sharding), self._data)
+        else:
+            batch = jax.tree.map(lambda x: x[batch_idx], self._data)
         self._current_idx += 1
 
         return batch
@@ -250,7 +261,10 @@ class InMemoryBatchIterator(Iterator[Batch]):
         self._current_idx += n
 
         # Single gather operation for all batches
-        stacked = jax.tree.map(lambda x: x.at[indices].get(out_sharding=self._stacked_batch_sharding), self._data)
+        if self._stacked_batch_sharding is not None:
+            stacked = jax.tree.map(lambda x: x.at[indices].get(out_sharding=self._stacked_batch_sharding), self._data)
+        else:
+            stacked = jax.tree.map(lambda x: x[indices], self._data)
 
         return stacked
 

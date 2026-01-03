@@ -207,14 +207,23 @@ def vmap(
     fun: Callable[P, R],
     in_axes: int | Sequence[int | None] = 0,
     jit_level: int | None = None,
+    spmd_axis_name: AxisName | None = None,
 ) -> Callable[P, R]:
     """A wrapper around jax.lax.vmap that allows for more flexible tracing.
 
     If the provided JIT level is below the environment JIT level, we manually
     unroll the scan function as a for loop.
+
+    Args:
+        fun: The function to vectorize.
+        in_axes: Specifies which input array axes to map over.
+        jit_level: If set and below environment JIT level, manually unrolls.
+        spmd_axis_name: If set, enables SPMD vmap for mesh-sharded inputs.
+            This should match the mesh axis name used for sharding the
+            batch dimension (e.g., 'batch').
     """
     if not should_disable_jit(jit_level):
-        return jax.vmap(fun, in_axes=in_axes)
+        return jax.vmap(fun, in_axes=in_axes, spmd_axis_name=spmd_axis_name)
 
     @functools.wraps(fun)
     def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
