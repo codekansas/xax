@@ -259,13 +259,17 @@ class TensorboardLogger(LoggerImpl):
         pass
 
     def write_error(self, error: LogError) -> None:
-        pass
+        writer = self.get_writer(False)
+        writer.add_text("error.txt", error.message_with_location)
 
     def write_error_summary(self, error_summary: LogErrorSummary) -> None:
-        pass
+        writer = self.get_writer(False)
+        writer.add_text("error_summary.txt", error_summary.message)
 
     def write_ping(self, ping: LogPing) -> None:
-        pass
+        writer = self.get_writer(False)
+        writer.add_text("ping.txt", ping.message)
 
     def write_status(self, status: LogStatus) -> None:
-        pass
+        writer = self.get_writer(False)
+        writer.add_text("status.txt", status.message)
