@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import (
     Any,
+    Callable,
     Generic,
     Literal,
     Mapping,
@@ -509,3 +510,17 @@ class TrainMixin(
 
     def model_partition_fn(self, item: Any) -> bool:  # noqa: ANN401
         return eqx.is_inexact_array(item)
+
+    def get_model_filter_spec(self, model: PyTree) -> PyTree | Callable[[Any], bool]:
+        """Returns a filter spec for partitioning the model into trainable/frozen parts.
+
+        Override this method to customize which parameters are trainable.
+        For LoRA fine-tuning, return a pytree filter spec marking only LoRA params.
+
+        Args:
+            model: The model to partition.
+
+        Returns:
+            Either a callable (applied to each leaf) or a pytree of booleans.
+        """
+        return self.model_partition_fn

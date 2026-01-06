@@ -31,7 +31,7 @@ from xax.task.logger import Metric, Scalar
 from xax.task.mixins.data_loader import InMemoryBatchIterator
 from xax.task.mixins.train import InitParams, Optimizer, TrainConfig, TrainMixin
 from xax.utils.experiments import ContextTimer
-from xax.utils.logging import LOG_PING
+from xax.utils.logging import LOG_PING, LOG_STATUS
 from xax.utils.pytree import get_pytree_param_count
 from xax.utils.text import show_info
 from xax.utils.types.frozen_dict import FrozenDict
@@ -243,7 +243,7 @@ class SupervisedMixin(
 
             return new_model_arr, new_opt_state, new_state, metrics
 
-        return jax.jit(train_step)
+        return eqx.filter_jit(train_step)
 
     def train_loop(
         self,
@@ -260,7 +260,8 @@ class SupervisedMixin(
                 f"Found {len(models)} models, {len(optimizers)} optimizers and {len(opt_states)} optimizer states."
             )
 
-        model_arr, model_static = eqx.partition(models[0], self.model_partition_fn)
+        filter_spec = self.get_model_filter_spec(models[0])
+        model_arr, model_static = eqx.partition(models[0], filter_spec)
         optimizer = optimizers[0]
         opt_state = opt_states[0]
 
@@ -279,7 +280,9 @@ class SupervisedMixin(
 
         self.add_signal_handler(save_checkpoint, signal.SIGUSR1, signal.SIGTERM)
 
-        while not self.is_training_over(state):
+        while True:
+            is_done = self.is_training_over(state)
+
             with ContextTimer() as timer:
                 self.on_step_start()
 
@@ -292,9 +295,10 @@ class SupervisedMixin(
 
                 step_key, key = jax.random.split(key)
 
-                # Get log mode (heavy flag) and update state.
+                # Get log mode (heavy flag) and update state. Always do heavy
+                # logging on the last step.
                 state, heavy_arr = self.get_log_mode(state)
-                heavy = heavy_arr.item()
+                heavy = heavy_arr.item() or is_done
 
                 # Execute training step
                 train_step_fn = heavy_train_step_fn if heavy else light_train_step_fn
@@ -316,6 +320,9 @@ class SupervisedMixin(
 
             if self.should_checkpoint(state):
                 save_checkpoint()
+
+            if is_done:
+                break
 
         save_checkpoint()
         return state
@@ -349,8 +356,12 @@ class SupervisedMixin(
                 model_sharding=model_sharding,
             )
 
-            logger.info("Model size: %s", f"{get_pytree_param_count(models):,}")
-            logger.info("Optimizer size: %s", f"{get_pytree_param_count(opt_states):,}")
+            # Log the model and optimizer sizes.
+            model_dtype_size = jnp.dtype(self.config.precision.param_jax_dtype).itemsize
+            optimizer_dtype_size = jnp.dtype(self.config.precision.grad_jax_dtype).itemsize
+            model_bytes = get_pytree_param_count(models) * model_dtype_size
+            optimizer_bytes = get_pytree_param_count(opt_states) * optimizer_dtype_size
+            logger.log(LOG_STATUS, "Model: %,d bytes, Optimizer: %,d bytes", model_bytes, optimizer_bytes)
 
             self.on_training_start()
 

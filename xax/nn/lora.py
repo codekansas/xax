@@ -1,12 +1,14 @@
 """LoRA utilities for Equinox modules."""
 
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jrandom
 from jaxtyping import Array, PRNGKeyArray
+
+Tmodule = TypeVar("Tmodule", bound=eqx.Module)
 
 
 class LoRALinear(eqx.Module):
@@ -88,14 +90,14 @@ def loraize_linear(
 
 
 def loraize(
-    module: eqx.Module,
+    module: Tmodule,
     rank: int,
     *,
     alpha: float | None = None,
     dropout_rate: float = 0.0,
     predicate: Callable[[eqx.nn.Linear], bool] | None = None,
     key: PRNGKeyArray | None = None,
-) -> eqx.Module:
+) -> Tmodule:
     """Recursively replace ``eqx.nn.Linear`` layers with ``LoRALinear``."""
     if predicate is None:
 
@@ -116,48 +118,103 @@ def loraize(
     return jax.tree_util.tree_map(convert, module, is_leaf=lambda node: isinstance(node, eqx.nn.Linear))
 
 
-def lora_filter_spec(module: eqx.Module) -> eqx.Module:
-    """Build a filter spec marking only LoRA parameters as trainable."""
+def loraize_by_path(
+    module: Tmodule,
+    rank: int,
+    *,
+    include_patterns: list[str] | None = None,
+    exclude_patterns: list[str] | None = None,
+    alpha: float | None = None,
+    dropout_rate: float = 0.0,
+    key: PRNGKeyArray | None = None,
+) -> Tmodule:
+    """Recursively replace ``eqx.nn.Linear`` layers matching path patterns.
 
-    def _mark(model_node: Any, spec_node: Any) -> Any:  # noqa: ANN001, ANN401
-        if isinstance(model_node, LoRALinear):
+    This function applies LoRA selectively based on the path names in the model tree.
+    For example, to only apply LoRA to query and value projections in an LLM:
 
-            def get_lora_a_ir(linear: LoRALinear) -> Array:
-                return linear.lora_a_ir
+        loraize_by_path(model, rank=16, include_patterns=["q_proj", "v_proj"])
 
-            def get_lora_b_ro(linear: LoRALinear) -> Array:
-                return linear.lora_b_ro
+    To apply to all attention projections but not MLP:
 
-            spec_node = eqx.tree_at(get_lora_a_ir, spec_node, True)
-            spec_node = eqx.tree_at(get_lora_b_ro, spec_node, True)
-            return spec_node
-        if hasattr(model_node, "__dataclass_fields__"):
-            for fname in model_node.__dataclass_fields__:
-                child_model = getattr(model_node, fname)
-                child_spec = getattr(spec_node, fname)
-                updated_child = _mark(child_model, child_spec)
+        loraize_by_path(model, rank=16, include_patterns=["attn"], exclude_patterns=["mlp"])
 
-                def make_get_field(field_name: str) -> Callable[[Any], Any]:  # noqa: ANN401
-                    def get_field(m: Any) -> Any:  # noqa: ANN001, ANN401
-                        return getattr(m, field_name)
+    Args:
+        module: The module to transform.
+        rank: LoRA rank for the low-rank decomposition.
+        include_patterns: List of substrings that must appear in the layer path.
+            If None, all Linear layers are candidates.
+        exclude_patterns: List of substrings that exclude a layer if present in path.
+        alpha: LoRA scaling factor (defaults to rank).
+        dropout_rate: Dropout rate for LoRA layers.
+        key: PRNG key for initialization.
 
-                    return get_field
+    Returns:
+        Module with selected Linear layers replaced by LoRALinear.
+    """
+    # Initialize key if not provided
+    current_key: PRNGKeyArray = jrandom.key(0) if key is None else key
 
-                spec_node = eqx.tree_at(make_get_field(fname), spec_node, updated_child)
-            return spec_node
-        if isinstance(model_node, list):
-            return [_mark(m, s) for m, s in zip(model_node, spec_node, strict=False)]
-        if isinstance(model_node, tuple):
-            return tuple(_mark(m, s) for m, s in zip(model_node, spec_node, strict=False))
-        if isinstance(model_node, dict):
-            return {k: _mark(model_node[k], spec_node[k]) for k in model_node}
-        return spec_node
+    def should_loraize(path: str) -> bool:
+        should_include = include_patterns is None or any(p in path for p in include_patterns)
+        should_exclude = exclude_patterns is not None and any(p in path for p in exclude_patterns)
+        return should_include and not should_exclude
 
-    spec = jax.tree_util.tree_map(lambda _: False, module)
-    return _mark(module, spec)
+    def convert_with_path(path: tuple[Any, ...], node: Any) -> Any:  # noqa: ANN401
+        nonlocal current_key
+        if isinstance(node, eqx.nn.Linear):
+            # Build path string from JAX key path
+            path_str = ".".join(str(k.key) if hasattr(k, "key") else str(k) for k in path)
+            if should_loraize(path_str):
+                current_key, init_key = jrandom.split(current_key)
+                return loraize_linear(node, rank, alpha=alpha, dropout_rate=dropout_rate, key=init_key)
+        return node
+
+    # Use tree_map_with_path to get paths during traversal
+    return jax.tree_util.tree_map_with_path(
+        convert_with_path,
+        module,
+        is_leaf=lambda node: isinstance(node, eqx.nn.Linear),
+    )
 
 
-def merge_lora(module: eqx.Module) -> eqx.Module:
+def lora_filter_spec(module: Tmodule) -> Tmodule:
+    """Build a filter spec marking only LoRA parameters as trainable.
+
+    Returns a pytree with the same structure as the module, where:
+    - LoRA parameters (lora_a_ir, lora_b_ro) are marked True
+    - All other leaves are marked False
+
+    Use with eqx.partition or eqx.filter:
+
+        filter_spec = lora_filter_spec(model)
+        trainable, frozen = eqx.partition(model, filter_spec)
+
+    Or use for gradient masking:
+
+        grads = jax.tree.map(
+            lambda g, f: g if f else None,
+            raw_grads,
+            filter_spec,
+        )
+    """
+
+    def make_spec(node: Any) -> Any:  # noqa: ANN401
+        if isinstance(node, LoRALinear):
+            # Create a spec tree matching LoRALinear structure with all False
+            base_spec = jax.tree.map(lambda _: False, node)
+            # Mark LoRA params as trainable using eqx.tree_at
+            base_spec = eqx.tree_at(lambda x: x.lora_a_ir, base_spec, True)
+            base_spec = eqx.tree_at(lambda x: x.lora_b_ro, base_spec, True)
+            return base_spec
+        # For regular leaves (arrays, scalars), return False
+        return False
+
+    # Treat LoRALinear as a leaf so we can create its spec structure
+    return jax.tree.map(make_spec, module, is_leaf=lambda x: isinstance(x, LoRALinear))
+
+
+def merge_lora(module: Tmodule) -> Tmodule:
     """Merge LoRA weights back into standard ``eqx.nn.Linear`` layers."""
 
     def convert(node: Any) -> Any:  # noqa: ANN001, ANN401

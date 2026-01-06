@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from functools import partial
 from typing import TypedDict
 
+import jax
 import jax.numpy as jnp
 import optax
 from datasets import Dataset, load_dataset
@@ -13,15 +14,6 @@ from transformers import AutoTokenizer
 from transformers.models.qwen2.tokenization_qwen2_fast import Qwen2TokenizerFast
 
 import xax
-from xax.arch.llm import (
-    LLM,
-    QWEN3_SMALL,
-    build_qwen3_model,
-    hf_config_to_llm_config,
-    load_hf_config,
-    load_hf_weights_into_llm,
-)
-from xax.nn.lora import loraize
 
 
 class Batch(TypedDict):
@@ -38,6 +30,10 @@ class Config(xax.SupervisedConfig):
     lora_rank: int = xax.field(16, help="Rank of LoRA decomposition")
     lora_alpha: float = xax.field(32.0, help="LoRA scaling factor")
     lora_dropout: float = xax.field(0.0, help="Dropout rate for LoRA layers")
+    lora_targets: tuple[str, ...] | None = xax.field(
+        ("q_proj", "v_proj"),
+        help="Layer name patterns to apply LoRA to (e.g., q_proj, v_proj, k_proj, o_proj, mlp)",
+    )
 
     # Training settings
     learning_rate: float = xax.field(1e-4, help="Peak learning rate")
@@ -51,34 +47,43 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
         super().__init__(config)
 
         self.tokenizer: Qwen2TokenizerFast = AutoTokenizer.from_pretrained(config.model_repo)
-        self._llm_config = hf_config_to_llm_config(
-            load_hf_config(config.model_repo),
-            base=QWEN3_SMALL,
+        self._llm_config = xax.hf_config_to_llm_config(
+            xax.load_hf_config(config.model_repo),
+            base=xax.QWEN3_SMALL,
+        )
+
+        # Pre-encode the generation prompt for use in compute_metrics
+        prompt = "To be or not to be"
+        self._generation_prompt_tokens = jnp.array(
+            self.tokenizer.encode(prompt, add_special_tokens=False),
+            dtype=jnp.int32,
         )
 
     @property
     def vocab_size(self) -> int:
         return self._llm_config.vocab_size
 
-    def get_model(self, params: xax.InitParams) -> LLM:
+    def get_model(self, params: xax.InitParams) -> xax.LLM:
         # Build model with correct config
-        model = build_qwen3_model(self._llm_config, key=params.key)
+        model = xax.build_qwen3_model(self._llm_config, key=params.key)
 
         # Load pre-trained weights
-        model = load_hf_weights_into_llm(model, self.config.model_repo)
+        model = xax.load_hf_weights_into_llm(model, self.config.model_repo)
 
-        # Apply LoRA to all linear layers (attention and MLP projections)
-        # Type assertion: loraize preserves the model structure
-        model = loraize(
+        # Apply LoRA selectively to specified layers (e.g., q_proj, v_proj)
+        return xax.loraize_by_path(
             model,
             rank=self.config.lora_rank,
+            include_patterns=list(self.config.lora_targets) if self.config.lora_targets else None,
             alpha=self.config.lora_alpha,
             dropout_rate=self.config.lora_dropout,
             key=params.key,
         )
-        assert isinstance(model, LLM)
 
-        return model
+    def get_model_filter_spec(self, model: xax.LLM) -> xax.LLM:
+        # Only train LoRA parameters (lora_a and lora_b matrices)
+        # Base model weights are frozen
+        return xax.lora_filter_spec(model)
 
     def get_optimizer(self) -> xax.Optimizer:
         # Create learning rate schedule with warmup and cosine decay
@@ -105,7 +110,7 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
             weight_decay=0.01,
         )
 
-    def get_output(self, model: LLM, batch: Batch, state: xax.State, key: PRNGKeyArray) -> Array:
+    def get_output(self, model: xax.LLM, batch: Batch, state: xax.State, key: PRNGKeyArray) -> Array:
         # LLM takes (batch, seq_len) and returns (batch, seq_len, vocab_size)
         # Use all but last token as input
         input_ids_bt = batch["input_ids"][:, :-1]
@@ -114,7 +119,7 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
 
     def compute_loss(
         self,
-        model: LLM,
+        model: xax.LLM,
         batch: Batch,
         output: Array,
         state: xax.State,
@@ -123,13 +128,14 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
         # Targets are shifted by 1 (next-token prediction)
         targets_bt = batch["input_ids"][:, 1:]
         mask_bt = batch["attention_mask"][:, 1:] == 1
-
         loss_bt = optax.softmax_cross_entropy_with_integer_labels(logits=output, labels=targets_bt)
-        return jnp.where(mask_bt, loss_bt, 0.0).sum() / mask_bt.sum()
+        masked_loss = jnp.where(mask_bt, loss_bt, 0.0)
+        loss = masked_loss.sum() / mask_bt.sum()
+        return loss
 
     def compute_metrics(
         self,
-        model: LLM,
+        model: xax.LLM,
         batch: Batch,
         output: Array,
         state: xax.State,
@@ -144,9 +150,22 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
         correct = (preds_bt == targets_bt) & mask_bt
         metrics["acc"] = xax.Scalar(correct.sum() / mask_bt.sum())
 
-        # Note: llm_generate uses Python control flow (int(), break) which can't be
-        # traced by JAX, so text generation is not supported inside compute_metrics.
-        # For text generation during training, use a callback outside the JIT context.
+        if heavy:
+            # Generate text using JIT-compilable generation
+            # Use a fixed prompt encoded at class initialization time
+            prompt_tokens = self._generation_prompt_tokens
+            eos_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else -1
+            gen_key, key = jax.random.split(key)
+            generated = xax.llm_generate_jit(
+                model,
+                prompt_tokens,
+                eos_id,
+                max_new_tokens=64,
+                temperature=0.8,
+                top_p=0.9,
+                key=gen_key,
+            )
+            metrics["generated"] = xax.Tokens(generated)
 
         return metrics
 

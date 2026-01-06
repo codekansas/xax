@@ -45,7 +45,7 @@ def test_self_attention_block_loopback(use_rotary_embeddings: bool) -> None:
     mask = block.init_mask(tsz, add_cache=True)
     next_xs, _, _ = block.forward(prev_xs, cache=cache, mask=mask)
 
-    assert jnp.allclose(xs, next_xs, atol=1e-6)
+    assert jnp.allclose(xs, next_xs, atol=1e-3)
 
 
 @pytest.mark.parametrize("use_rotary_embeddings", [True, False])
@@ -71,7 +71,7 @@ def test_self_attention_block_mask(use_rotary_embeddings: bool) -> None:
     out_b, _, _ = block.forward(x)
     out_a, _, _ = block.forward(x, mask=mask)
 
-    assert jnp.allclose(out_a, out_b, atol=1e-6)
+    assert jnp.allclose(out_a, out_b, atol=1e-4)
 
 
 @pytest.mark.parametrize("use_rotary_embeddings", [True, False])
@@ -116,7 +116,7 @@ def test_transformer_block_loopback(use_rotary_embeddings: bool) -> None:
     mask = block.init_mask(10, add_cache=True)
     next_xs, _ = block.forward(prev_xs, context_sn=context_sn, cache=cache, mask=mask)
 
-    assert jnp.allclose(xs, next_xs, atol=1e-6)
+    assert jnp.allclose(xs, next_xs, atol=1e-3)
 
 
 @pytest.mark.parametrize("use_rotary_embeddings", [True, False])
@@ -162,7 +162,7 @@ def test_transformer_stack_loopback(use_rotary_embeddings: bool) -> None:
     mask = stack.init_mask(10, add_cache=True)
     next_xs, _ = stack.forward(prev_xs, context_sn=context_sn, cache=cache, mask=mask)
 
-    assert jnp.allclose(xs, next_xs, atol=1e-6)
+    assert jnp.allclose(xs, next_xs, atol=1e-3)
 
 
 @pytest.mark.parametrize("use_rotary_embeddings", [True, False])

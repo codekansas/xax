@@ -25,10 +25,6 @@ class StdoutLogger(LoggerImpl):
         self,
         write_fp: TextIO = sys.stdout,
         precision: int = 8,
-        log_timers: bool = True,
-        log_perf: bool = False,
-        log_optim: bool = False,
-        log_fp: bool = False,
         log_interval_seconds: float = 1.0,
         remove_temporary_after: datetime.timedelta = datetime.timedelta(seconds=10),
     ) -> None:
@@ -37,10 +33,6 @@ class StdoutLogger(LoggerImpl):
         Args:
             write_fp: The file to write logs to.
             precision: The integer precision to use when logging scalars.
-            log_timers: Whether to log timers.
-            log_perf: Whether to log performance metrics.
-            log_optim: Whether to log optimizer parameters.
-            log_fp: Whether to log floating point parameters.
             log_interval_seconds: The interval between successive log lines.
             remove_temporary_after: The time after which temporary toasts
                 are removed.
@@ -48,10 +40,6 @@ class StdoutLogger(LoggerImpl):
         super().__init__(log_interval_seconds)
 
         self.write_fp = write_fp
-        self.log_timers = log_timers
-        self.log_perf = log_perf
-        self.log_fp = log_fp
-        self.log_optim = log_optim
         self.precision = precision
         self.remove_temporary_after = remove_temporary_after
         self.logger = logging.getLogger("stdout")

@@ -1,5 +1,6 @@
 """Defines some useful Jax debugging utilities."""
 
+import socket
 from collections import deque
 from collections.abc import Iterable, Mapping
 from typing import Any, Callable, Deque
@@ -7,6 +8,32 @@ from typing import Any, Callable, Deque
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array
+
+
+def get_local_ip() -> str | None:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # Doesn't actually connect or send data
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        return ip
+    except Exception:
+        return None
+    finally:
+        s.close()
+
+
+def get_ip_addrs() -> list[str]:
+    hostname = socket.gethostname()
+    ips: list[str] = []
+    for info in socket.getaddrinfo(hostname, None):
+        sockaddr = info[4]
+        ip = sockaddr[0]
+        if isinstance(ip, str):
+            ips.append(ip)
+    if (local_ip := get_local_ip()) is not None:
+        ips.append(local_ip)
+    return sorted(set(ips))
 
 
 def get_named_leaves(

@@ -22,6 +22,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import NamedSharding, PartitionSpec as P
 from jaxtyping import Array
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field as PydanticField
 
@@ -244,7 +245,8 @@ class TransformerBlock(eqx.Module):
         attn_key = None
         if key is not None:
             attn_key, _ = jax.random.split(key, 2)
-        y_btd = x_btd + self.attn(self.attn_norm(x_btd), positions_bt, key=attn_key, inference=inference)
+        normed = self.attn_norm(x_btd)
+        y_btd = x_btd + self.attn(normed, positions_bt, key=attn_key, inference=inference)
         y_btd = y_btd + self.mlp(self.mlp_norm(y_btd))
         return y_btd
 
@@ -390,7 +392,11 @@ def load_hf_config(repo_id: str, revision: str | None = None) -> dict[str, objec
 
 
 def _fetch_state_dict(repo_id: str, revision: str | None = None) -> tuple[dict[str, object], dict[str, np.ndarray]]:
-    """Fetch safetensors state dict from HuggingFace repository."""
+    """Fetch safetensors state dict from HuggingFace repository.
+
+    Loads weights as numpy arrays to avoid unnecessary device transfers.
+    The final conversion to JAX arrays with proper sharding happens in load_hf_weights_into_llm.
+    """
     snapshot_path = download_repo(repo_id, revision=revision)
     safes = [str(snapshot_path / f) for f in snapshot_path.iterdir() if f.suffix == ".safetensors"]
     if not safes:
@@ -398,10 +404,10 @@ def _fetch_state_dict(repo_id: str, revision: str | None = None) -> tuple[dict[s
 
     state: dict[str, np.ndarray] = {}
     for sf in safes:
-        # Load directly with JAX framework for proper dtype handling
-        with safe_open(sf, framework="jax") as f:
+        # Load directly as numpy - more efficient than jax->numpy conversion
+        with safe_open(sf, framework="numpy") as f:
             for k in f.keys():
-                state[k] = np.array(f.get_tensor(k))
+                state[k] = f.get_tensor(k)
 
     with open(snapshot_path / "config.json", "r", encoding="utf-8") as f:
         config = json.load(f)
@@ -610,11 +616,35 @@ def load_hf_weights_into_llm(
     if derived_cfg.embed_dim != model.config.embed_dim:
         raise ValueError(f"HF hidden_size {derived_cfg.embed_dim} != model.embed_dim {model.config.embed_dim}")
 
-    def to_dtype(arr: np.ndarray | jnp.ndarray) -> jnp.ndarray:
-        return jnp.asarray(arr, dtype=dtype)
+    mesh = jax.sharding.get_mesh()
+    if mesh is None:
+        raise ValueError("Mesh is not set. Please set the mesh via jax.set_mesh() before loading weights.")
+
+    if mesh.devices.size > 1:
+        # Replicate weights across all devices (no partitioning)
+        sharding = NamedSharding(mesh, P())
+
+        def to_dtype(arr: np.ndarray | jnp.ndarray) -> jnp.ndarray:
+            # Create JAX array with proper sharding in one step
+            # Using jax.make_array_from_callback ensures proper replication
+            shape = arr.shape
+            arr_np = np.asarray(arr, dtype=dtype)
+
+            def callback(idx: tuple[slice, ...] | None) -> np.ndarray:
+                # Each device gets the full array (replicated)
+                return arr_np
+
+            return jax.make_array_from_callback(shape, sharding, callback)
+
+    else:
+
+        def to_dtype(arr: np.ndarray | jnp.ndarray) -> jnp.ndarray:
+            return jnp.asarray(arr, dtype=dtype)
 
     def map_linear(
-        eq_lin: eqx.nn.Linear, w: np.ndarray | jnp.ndarray, b: np.ndarray | jnp.ndarray | None
+        eq_lin: eqx.nn.Linear,
+        w: np.ndarray | jnp.ndarray,
+        b: np.ndarray | jnp.ndarray | None,
     ) -> eqx.nn.Linear:
         """Map weight/bias to linear layer, handling shape transposition if needed."""
         w_mapped = w if w.shape == eq_lin.weight.shape else w.T
@@ -715,34 +745,96 @@ def llm_generate(
     temperature: float = 0.7,
     top_p: float = 0.9,
 ) -> list[int]:
-    """Sampling-based decoding for quick sanity checks."""
-    tokens_bt = jnp.array(tokens, dtype=jnp.int32)[None, :]
-    key = jax.random.key(0)
+    """Sampling-based decoding for quick sanity checks (non-JIT version)."""
+    tokens_arr = llm_generate_jit(
+        model,
+        jnp.array(tokens, dtype=jnp.int32),
+        eos_id if eos_id is not None else -1,
+        max_new_tokens,
+        temperature,
+        top_p,
+        jax.random.key(0),
+    )
+    return tokens_arr.tolist()
 
-    for _ in range(max_new_tokens):
+
+def llm_generate_jit(
+    model: LLM,
+    tokens_t: Array,
+    eos_id: int,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    key: Array,
+) -> Array:
+    """JIT-compilable sampling-based decoding.
+
+    Args:
+        model: The LLM model.
+        tokens_t: Initial token sequence, shape (seq_len,).
+        eos_id: End-of-sequence token ID (-1 to disable).
+        max_new_tokens: Maximum number of new tokens to generate.
+        temperature: Sampling temperature (>0).
+        top_p: Top-p (nucleus) sampling probability.
+        key: PRNG key for sampling.
+
+    Returns:
+        Generated token sequence including input tokens, shape (seq_len + max_new_tokens,).
+    """
+    # Pad tokens to max possible length
+    initial_len = tokens_t.shape[0]
+    max_len = initial_len + max_new_tokens
+    padded_tokens = jnp.zeros(max_len, dtype=jnp.int32)
+    padded_tokens = padded_tokens.at[:initial_len].set(tokens_t)
+
+    # State: (tokens, current_position, key, done)
+    # current_position is where we're generating the next token
+    init_state = (padded_tokens, jnp.int32(initial_len), key, jnp.bool_(False))
+
+    def cond_fn(state: tuple[Array, Array, Array, Array]) -> Array:
+        _, cur_pos, _, done = state
+        return (cur_pos < max_len) & ~done
+
+    def body_fn(state: tuple[Array, Array, Array, Array]) -> tuple[Array, Array, Array, Array]:
+        tokens, cur_pos, key, _ = state
+
+        # Forward pass on full buffer - model handles padding implicitly
+        # We pass all tokens and read logits at position (cur_pos - 1)
+        tokens_bt = tokens[None, :]  # Shape: (1, max_len)
         logits_btv = model(tokens_bt, key=key, inference=True)
-        logits = logits_btv[:, -1, :].astype(jnp.float32)  # Cast for numerical stability
-        if temperature > 0:
-            logits = logits / temperature
+
+        # Get logits at the last valid position (cur_pos - 1)
+        # Use dynamic indexing which is JIT-compatible
+        logits = logits_btv[0, cur_pos - 1, :].astype(jnp.float32)
+
+        # Temperature scaling
+        logits = jnp.where(temperature > 0, logits / temperature, logits)
 
         # Top-p nucleus sampling
-        sort_idx = jnp.argsort(logits, axis=-1)[:, ::-1]
-        sort_logits = jnp.take_along_axis(logits, sort_idx, axis=-1)
-        sort_probs = jax.nn.softmax(sort_logits, axis=-1)
-        cum_probs = jnp.cumsum(sort_probs, axis=-1)
+        sort_idx = jnp.argsort(logits)[::-1]
+        sort_logits = logits[sort_idx]
+        sort_probs = jax.nn.softmax(sort_logits)
+        cum_probs = jnp.cumsum(sort_probs)
         mask = cum_probs > top_p
-        mask = mask.at[:, 0].set(False)
+        mask = mask.at[0].set(False)
         masked_logits = jnp.where(mask, -jnp.inf, sort_logits)
 
         key, subkey = jax.random.split(key)
-        sampled_idx = jax.random.categorical(subkey, masked_logits, axis=-1)
-        next_token = jnp.take_along_axis(sort_idx, sampled_idx[:, None], axis=-1)
-        tokens_bt = jnp.concatenate([tokens_bt, next_token], axis=1)
+        sampled_idx = jax.random.categorical(subkey, masked_logits)
+        next_token = sort_idx[sampled_idx]
 
-        if eos_id is not None and int(next_token[0, 0]) == eos_id:
-            break
+        # Update tokens at current position
+        new_tokens = tokens.at[cur_pos].set(next_token)
 
-    return jnp.array(tokens_bt[0]).tolist()
+        # Check for EOS (use -1 to disable)
+        done = jnp.bool_((eos_id >= 0) & (next_token == eos_id))
+
+        return (new_tokens, cur_pos + 1, key, done)
+
+    final_tokens, _, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_state)
+
+    # Return all tokens (caller can trim if needed)
+    return final_tokens
 
 
 # --------------------------------------------------------------------------- #
