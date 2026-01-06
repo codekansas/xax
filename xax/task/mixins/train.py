@@ -245,10 +245,14 @@ class TrainMixin(
                 return x.astype(grad_dtype)
             return x
 
-        return [
-            opt.init(jax.tree.map(cast_to_grad_dtype, eqx.filter(model, eqx.is_array)))
-            for model, opt in zip(models, optimizers, strict=True)
-        ]
+        opt_states = []
+        for model, opt in zip(models, optimizers, strict=True):
+            # Use filter spec to only create optimizer state for trainable params
+            filter_spec = self.get_model_filter_spec(model)
+            trainable, _ = eqx.partition(model, filter_spec)
+            trainable_casted = jax.tree.map(cast_to_grad_dtype, trainable)
+            opt_states.append(opt.init(trainable_casted))
+        return opt_states
 
     @overload
     def load_initial_state(

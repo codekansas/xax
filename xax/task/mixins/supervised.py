@@ -357,11 +357,9 @@ class SupervisedMixin(
             )
 
             # Log the model and optimizer sizes.
-            model_dtype_size = jnp.dtype(self.config.precision.param_jax_dtype).itemsize
-            optimizer_dtype_size = jnp.dtype(self.config.precision.grad_jax_dtype).itemsize
-            model_bytes = get_pytree_param_count(models) * model_dtype_size
-            optimizer_bytes = get_pytree_param_count(opt_states) * optimizer_dtype_size
-            logger.log(LOG_STATUS, "Model: %,d bytes, Optimizer: %,d bytes", model_bytes, optimizer_bytes)
+            m_params = get_pytree_param_count(models)
+            o_params = get_pytree_param_count(opt_states)
+            logger.log(LOG_STATUS, "Model: %s params, Optimizer: %s params", f"{m_params:,}", f"{o_params:,}")
 
             self.on_training_start()
 
