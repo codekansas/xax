@@ -97,7 +97,12 @@ class StreamingBatchIterator(Iterator[Batch]):
         return result
 
     def _worker(self) -> None:
-        """Background worker that loads and prepares batches."""
+        """Background worker that loads and prepares batches.
+
+        Note: We keep numpy arrays in the queue rather than JAX arrays.
+        The device_put happens in __next__ on the main thread to ensure
+        proper mesh context for multi-device sharding.
+        """
         try:
             epoch = 0
 
@@ -117,8 +122,7 @@ class StreamingBatchIterator(Iterator[Batch]):
                     # Cast to target dtype if specified
                     batch = self._cast_batch(batch)
 
-                    # Transfer to device
-                    batch = jax.device_put(batch, self._sharding)
+                    # Put numpy batch in queue - device_put happens in main thread
                     self._queue.put(batch)
 
                 epoch += 1
@@ -146,7 +150,8 @@ class StreamingBatchIterator(Iterator[Batch]):
             self._error = item
             raise item
 
-        return item
+        # Transfer to device in main thread to ensure proper mesh context
+        return jax.device_put(item, self._sharding)
 
     def close(self) -> None:
         """Stop the background thread and clean up resources."""
