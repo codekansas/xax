@@ -1,9 +1,9 @@
 """Defines a mixin for running the training loop."""
 
+import datetime
 import functools
 import itertools
 import logging
-import time
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
@@ -51,6 +51,7 @@ from xax.utils.experiments import (
 )
 from xax.utils.jax import jit as xax_jit
 from xax.utils.logging import LOG_PING, LOG_STATUS
+from xax.utils.text import format_datetime, format_timedelta
 from xax.utils.types.training import Optimizer, PrecisionConfig, as_shape_dtype
 
 logger = logging.getLogger(__name__)
@@ -475,8 +476,10 @@ class TrainMixin(
             return
         self._last_printed_remaining_time = state.elapsed_time_s.item()
         remaining_seconds = remaining_percent * state.elapsed_time_s.item() / (1 - remaining_percent)
-        termination_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + remaining_seconds))
-        logger.log(LOG_PING, "Estimated finish time: %s", termination_time)
+        remaining_td = datetime.timedelta(seconds=remaining_seconds)
+        termination_time = format_datetime(datetime.datetime.now() + remaining_td)
+        remaining_time = format_timedelta(remaining_td)
+        logger.log(LOG_PING, "Estimated finish time: %s (%s remaining)", termination_time, remaining_time)
 
     def get_remaining_percent(self, state: State) -> float | None:
         if self.config.max_steps is None:

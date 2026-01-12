@@ -36,6 +36,7 @@ from omegaconf import MISSING, DictConfig, ListConfig, OmegaConf
 
 from xax.core.conf import get_data_dir, get_pretrained_models_dir, load_user_config
 from xax.core.state import State
+from xax.utils.jax import to_scalar
 from xax.utils.text import colored
 
 logger = logging.getLogger(__name__)
@@ -111,8 +112,8 @@ class StateTimer:
 
     def step(self, state: State) -> None:
         cur_time = time.time()
-        num_steps = int(state.num_steps.item())
-        num_samples = int(state.num_samples.item())
+        num_steps = int(to_scalar(state.num_steps))
+        num_samples = int(to_scalar(state.num_samples))
         self.step_timer.step(num_steps, cur_time)
         self.sample_timer.step(num_samples, cur_time)
         self.iter_timer.step(cur_time)

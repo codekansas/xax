@@ -1,12 +1,13 @@
 #!/usr/bin/env -S uv run --no-project --script
 """LoRA fine-tuning of a pre-trained LLM on Shakespeare text."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import TypedDict
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 from datasets import Dataset, load_dataset
 from jaxtyping import Array, PRNGKeyArray
@@ -40,6 +41,7 @@ class Config(xax.SupervisedConfig):
     min_learning_rate: float = xax.field(1e-5, help="Minimum learning rate for cosine decay")
     warmup_steps: int = xax.field(100, help="Number of warmup steps")
     sequence_length: int = xax.field(256, help="Maximum sequence length")
+    use_gradient_checkpointing: bool = xax.field(True, help="Recompute activations to save memory")
 
 
 class ShakespeareLora(xax.SupervisedTask[Config]):
@@ -47,10 +49,12 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
         super().__init__(config)
 
         self.tokenizer: Qwen2TokenizerFast = AutoTokenizer.from_pretrained(config.model_repo)
-        self._llm_config = xax.hf_config_to_llm_config(
+        llm_config = xax.hf_config_to_llm_config(
             xax.load_hf_config(config.model_repo),
             base=xax.QWEN3_SMALL,
         )
+        # Enable gradient checkpointing if configured
+        self._llm_config = replace(llm_config, use_remat=config.use_gradient_checkpointing)
 
         # Pre-encode the generation prompt for use in compute_metrics
         prompt = "To be or not to be"
@@ -169,8 +173,10 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
 
         return metrics
 
-    def decode_tokens(self, tokens: Array) -> str:
-        return self.tokenizer.decode(tokens.tolist(), skip_special_tokens=True)
+    def decode_tokens(self, tokens: Array | np.ndarray) -> str:
+        # Convert to list for tokenizer compatibility
+        token_list: list[int] = tokens.tolist()
+        return self.tokenizer.decode(token_list, skip_special_tokens=True)
 
     def get_dataset(self) -> Dataset:
         ds = load_dataset("Trelis/tiny-shakespeare", split="train")
@@ -201,9 +207,9 @@ def _tokenize_with_tokenizer(
 if __name__ == "__main__":
     ShakespeareLora.launch(
         Config(
-            batch_size=4,
-            gradient_accumulation_steps=4,
+            batch_size=64,
+            gradient_accumulation_steps=1,
             log_heavy_every_n_seconds=120,
-            max_steps=1000,
+            max_steps=50_000,
         ),
     )

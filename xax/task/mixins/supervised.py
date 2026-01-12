@@ -21,7 +21,9 @@ from typing import (
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
+from jax.sharding import NamedSharding, PartitionSpec
 from jaxtyping import Array, PRNGKeyArray, PyTree
 
 from xax.core.conf import field
@@ -118,7 +120,7 @@ class SupervisedMixin(
         """
         return {}
 
-    def decode_tokens(self, tokens: Array) -> str:
+    def decode_tokens(self, tokens: Array | np.ndarray) -> str:
         raise NotImplementedError(
             "When using a Tokens metric you must implement the `decode_tokens` method "
             "to convert to a string which can be logged."
@@ -230,6 +232,14 @@ class SupervisedMixin(
                 num_steps=state.num_steps + 1,
                 num_samples=state.num_samples + total_samples,
             )
+            # Ensure state arrays have replicated sharding for multi-GPU
+            mesh = jax.sharding.get_abstract_mesh()
+            if mesh is not None and mesh.shape_tuple:
+                replicated = NamedSharding(mesh, PartitionSpec())
+                # Apply sharding constraint to underlying state arrays
+                new_int32_arr = jax.lax.with_sharding_constraint(new_state._int32_arr, replicated)
+                new_float32_arr = jax.lax.with_sharding_constraint(new_state._float32_arr, replicated)
+                new_state = State(_int32_arr=new_int32_arr, _float32_arr=new_float32_arr)
 
             # Extract batch for metrics computation
             batch = jax.tree.map(lambda x: x[-1], batches)
@@ -310,6 +320,31 @@ class SupervisedMixin(
                     step_key,
                 )
 
+                # Handle arrays with unspecified sharding from multi-GPU JIT
+                # by extracting data from addressable shards and replicating across mesh
+                mesh = jax.sharding.get_mesh()
+                if mesh is not None and mesh.devices.size > 1:
+                    replicated_sharding = NamedSharding(mesh, PartitionSpec())
+
+                    def _fix_unspecified_sharding(
+                        arr: Array,
+                        sharding: NamedSharding = replicated_sharding,
+                    ) -> Array:
+                        if hasattr(arr, "sharding") and not hasattr(arr.sharding, "is_fully_replicated"):
+                            # Array has unspecified sharding - get data from first shard
+                            if hasattr(arr, "addressable_shards") and arr.addressable_shards:
+                                data = np.asarray(arr.addressable_shards[0].data)
+                                return jax.device_put(data, sharding)
+                        return arr
+
+                    # Fix model_arr and opt_state so they can be passed back into JIT
+                    model_arr = jax.tree.map(_fix_unspecified_sharding, model_arr)
+                    opt_state = jax.tree.map(_fix_unspecified_sharding, opt_state)
+
+                    state = State(
+                        _int32_arr=_fix_unspecified_sharding(state._int32_arr),
+                        _float32_arr=_fix_unspecified_sharding(state._float32_arr),
+                    )
                 self.log_step(FrozenDict(metrics), state, heavy)
                 self.on_step_end()
 

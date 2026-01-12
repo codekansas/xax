@@ -10,6 +10,7 @@ from jaxtyping import Array
 from omegaconf import OmegaConf
 
 from xax.core.conf import load_user_config
+from xax.utils.jax import to_scalar
 from xax.utils.text import Color, color_parts, colored
 
 # Logging level to show on all ranks.
@@ -36,7 +37,7 @@ def as_str(value: Any, precision: int = 4) -> str:  # noqa: ANN401
     if isinstance(value, str):
         return f'"{value}"'
     if isinstance(value, Array):
-        value = value.item()
+        value = to_scalar(value)
     if isinstance(value, (int, float)):
         return format_number(value, precision)
     raise TypeError(f"Unexpected log type: {type(value)}")

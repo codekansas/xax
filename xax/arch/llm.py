@@ -24,9 +24,11 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 from jaxtyping import Array
+from omegaconf import MISSING
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field as PydanticField
 
 from xax.arch.attention import RotaryEmbedding
+from xax.core.conf import field
 from xax.nn.lora import LoRALinear
 
 try:
@@ -77,30 +79,28 @@ def _linear(x_btd: Array, linear: eqx.nn.Linear) -> Array:
 class LLMConfig:
     """Model hyperparameters for decoder-only LLMs."""
 
-    vocab_size: int
-    embed_dim: int
-    q_heads: int
-    kv_heads: int
-    head_dim: int
-    num_layers: int
-    max_tsz: int
-    rope_theta: float = 10_000.0
-    dropout_rate: float = 0.0
-    mlp_mult: int = 4
-    mlp_hidden_dim: int | None = None
-    rms_eps: float = 1e-6
-    attention_bias: bool = False  # Whether attention projections have bias
-    mlp_bias: bool = False  # Whether MLP projections have bias
-    # YaRN RoPE scaling parameters
-    rope_factor: float = 1.0  # Scaling factor (1.0 = no scaling)
-    rope_original_max_position_embeddings: int | None = None  # Original training context length
-    rope_beta_slow: float = 1.0  # Slow dimension interpolation weight
-    rope_beta_fast: float = 32.0  # Fast dimension interpolation weight
-    # Sliding window attention
-    sliding_window_size: int | None = None  # None = full attention, int = window size
-    layer_attention_types: tuple[str, ...] | None = None  # Per-layer attention type ("sliding" or "full")
-    # Attention sinks for numerical stability
-    use_attention_sinks: bool = False  # Whether to use learnable attention sinks
+    vocab_size: int = field(MISSING, help="Vocabulary size for token embeddings")
+    embed_dim: int = field(MISSING, help="Model embedding dimension")
+    q_heads: int = field(MISSING, help="Number of query attention heads")
+    kv_heads: int = field(MISSING, help="Number of key/value attention heads (for GQA)")
+    head_dim: int = field(MISSING, help="Dimension per attention head")
+    num_layers: int = field(MISSING, help="Number of transformer layers")
+    max_tsz: int = field(MISSING, help="Maximum sequence length")
+    rope_theta: float = field(10_000.0, help="RoPE theta base frequency")
+    dropout_rate: float = field(0.0, help="Dropout rate")
+    mlp_mult: int = field(4, help="MLP hidden dimension multiplier")
+    mlp_hidden_dim: int | None = field(None, help="Explicit MLP hidden dimension (overrides mlp_mult)")
+    rms_eps: float = field(1e-6, help="RMSNorm epsilon for numerical stability")
+    attention_bias: bool = field(False, help="Whether attention projections have bias")
+    mlp_bias: bool = field(False, help="Whether MLP projections have bias")
+    rope_factor: float = field(1.0, help="RoPE scaling factor (1.0 = no scaling)")
+    rope_original_max_position_embeddings: int | None = field(None, help="Original training context length for YaRN")
+    rope_beta_slow: float = field(1.0, help="YaRN slow dimension interpolation weight")
+    rope_beta_fast: float = field(32.0, help="YaRN fast dimension interpolation weight")
+    sliding_window_size: int | None = field(None, help="Sliding window size (None = full attention)")
+    layer_attention_types: tuple[str, ...] | None = field(None, help="Per-layer attention type ('sliding' or 'full')")
+    use_attention_sinks: bool = field(False, help="Use learnable attention sinks for stability")
+    use_remat: bool = field(False, help="Recompute activations during backward to save memory")
 
     def with_vocab(self, vocab_size: int) -> "LLMConfig":
         return replace(self, vocab_size=vocab_size)
@@ -342,7 +342,28 @@ class LLM(eqx.Module):
         x_btd = jnp.take(self.embed.weight, tokens_bt, axis=0)
         for i, block in enumerate(self.blocks):
             block_key = None if key_seq is None else key_seq[i]
-            x_btd = block(x_btd, positions_bt, key=block_key, inference=inference)
+            if self.config.use_remat:
+                # Gradient checkpointing: recompute block activations during backward pass
+                # This reduces memory usage at the cost of extra compute
+                # Split block into arrays (traced for gradients) and static parts (not traced)
+                block_arrays, block_static = eqx.partition(block, eqx.is_array)
+
+                @jax.checkpoint
+                def remat_block(
+                    arrays: TransformerBlock,
+                    x: Array,
+                    pos: Array,
+                    k: jax.Array | None,
+                    inf: bool,
+                    *,
+                    static: TransformerBlock = block_static,
+                ) -> Array:
+                    b: TransformerBlock = eqx.combine(arrays, static)
+                    return b(x, pos, key=k, inference=inf)
+
+                x_btd = remat_block(block_arrays, x_btd, positions_bt, block_key, inference)
+            else:
+                x_btd = block(x_btd, positions_bt, key=block_key, inference=inference)
         x_btd = self.norm(x_btd)
         logits_btv = _linear(x_btd, self.lm_head)
         return logits_btv
@@ -527,7 +548,12 @@ def _parse_rope_scaling(cfg: dict[str, object]) -> tuple[float, int | None, floa
     return factor, original_max_pos, beta_slow, beta_fast
 
 
-def hf_config_to_llm_config(cfg: dict[str, object], base: LLMConfig | None = None) -> LLMConfig:
+def hf_config_to_llm_config(
+    cfg: dict[str, object],
+    base: LLMConfig | None = None,
+    *,
+    use_remat: bool = False,
+) -> LLMConfig:
     """Derive an LLMConfig from an HF config dict."""
     base = base or QWEN3_SMALL
     parsed = HFConfig.model_validate(cfg)
@@ -575,6 +601,7 @@ def hf_config_to_llm_config(cfg: dict[str, object], base: LLMConfig | None = Non
         sliding_window_size=sliding_window_size,
         layer_attention_types=layer_attention_types,
         use_attention_sinks=use_attention_sinks,
+        use_remat=use_remat,
     )
 
 

@@ -50,11 +50,48 @@ def should_disable_jit(jit_level: int | None) -> bool:
     return jit_level is not None and jit_level < disable_jit_level()
 
 
+def to_numpy(arr: jnp.ndarray | np.ndarray) -> np.ndarray:
+    """Convert a JAX or numpy array to a numpy array.
+
+    Handles arrays with unspecified sharding from multi-GPU JIT by extracting
+    data from the first addressable shard.
+
+    Args:
+        arr: A JAX or numpy array.
+
+    Returns:
+        A numpy array with the same data.
+    """
+    if isinstance(arr, np.ndarray):
+        return arr
+    try:
+        return np.asarray(arr)
+    except AttributeError:
+        # Array has unspecified sharding from multi-GPU JIT
+        if hasattr(arr, "addressable_shards") and arr.addressable_shards:
+            return np.asarray(arr.addressable_shards[0].data)
+        raise
+
+
+def to_scalar(arr: jnp.ndarray | np.ndarray) -> int | float:
+    """Convert a scalar JAX or numpy array to a Python scalar.
+
+    Handles arrays with unspecified sharding from multi-GPU JIT.
+
+    Args:
+        arr: A scalar JAX or numpy array.
+
+    Returns:
+        A Python int or float.
+    """
+    return to_numpy(arr).item()
+
+
 def as_float(value: int | float | np.ndarray | jnp.ndarray) -> float:
     if isinstance(value, (int, float)):
         return float(value)
     if isinstance(value, (np.ndarray, jnp.ndarray)):
-        return float(value.item())
+        return float(to_scalar(value))
     raise TypeError(f"Unexpected type: {type(value)}")
 
 

@@ -695,7 +695,7 @@ if IMPORT_ALL or TYPE_CHECKING:
         stage_environment,
         to_markdown_table,
     )
-    from xax.utils.jax import grad, jit, scan, vmap
+    from xax.utils.jax import grad, jit, scan, to_numpy, to_scalar, vmap
     from xax.utils.jaxpr import save_jaxpr_dot
     from xax.utils.logging import (
         LOG_ERROR_SUMMARY,

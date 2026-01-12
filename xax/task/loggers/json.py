@@ -17,11 +17,12 @@ from xax.task.logger import (
     LogStatus,
     LogString,
 )
+from xax.utils.jax import to_scalar
 
 
 def get_json_value(value: Any) -> Any:  # noqa: ANN401
     if isinstance(value, Array):
-        value = value.item()
+        value = to_scalar(value)
     return value
 
 
