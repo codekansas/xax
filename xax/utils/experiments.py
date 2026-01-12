@@ -3,7 +3,6 @@
 import contextlib
 import datetime
 import enum
-import functools
 import hashlib
 import importlib.metadata
 import inspect
@@ -24,6 +23,7 @@ import urllib.error
 import urllib.request
 import warnings
 from abc import ABC, abstractmethod
+from collections import deque
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Iterator, Mapping, Self, Sequence, TypeVar, cast
@@ -36,6 +36,7 @@ from omegaconf import MISSING, DictConfig, ListConfig, OmegaConf
 
 from xax.core.conf import get_data_dir, get_pretrained_models_dir, load_user_config
 from xax.core.state import State
+from xax.utils.jax import to_scalar
 from xax.utils.text import colored
 
 logger = logging.getLogger(__name__)
@@ -49,24 +50,35 @@ T = TypeVar("T")
 
 
 class CumulativeTimer:
-    """Defines a simple timer to track an average value."""
+    """Tracks rate using a sliding window of recent data.
 
-    def __init__(self) -> None:
-        self.steps = 0
-        self.elapsed_time = 0.0
+    This timer only considers data from the last `window_seconds` to compute
+    rates, allowing it to "forget" periods like JIT compilation where no
+    progress was made.
+    """
 
-    @functools.cached_property
-    def start_time(self) -> float:
-        return time.time()
+    def __init__(self, window_seconds: float = 60.0) -> None:
+        self.window_seconds = window_seconds
+        self._history: deque[tuple[float, int]] = deque()  # (timestamp, step_count)
 
     def step(self, steps: int, cur_time: float) -> None:
-        if steps != self.steps:
-            self.steps = steps
-            self.elapsed_time = cur_time - self.start_time
+        self._history.append((cur_time, steps))
+
+        # Remove old data points outside the window (O(1) per removal with deque)
+        cutoff = cur_time - self.window_seconds
+        while self._history and self._history[0][0] < cutoff:
+            self._history.popleft()
 
     @property
     def steps_per_second(self) -> float:
-        return 0.0 if self.elapsed_time < 1e-4 else self.steps / self.elapsed_time
+        if len(self._history) < 2:
+            return 0.0
+        oldest_time, oldest_steps = self._history[0]
+        newest_time, newest_steps = self._history[-1]
+        elapsed = newest_time - oldest_time
+        if elapsed < 1e-4:
+            return 0.0
+        return (newest_steps - oldest_steps) / elapsed
 
     @property
     def steps_per_hour(self) -> float:
@@ -74,7 +86,8 @@ class CumulativeTimer:
 
     @property
     def seconds_per_step(self) -> float:
-        return 0.0 if self.steps <= 0 else self.elapsed_time / self.steps
+        sps = self.steps_per_second
+        return 0.0 if sps < 1e-8 else 1.0 / sps
 
     @property
     def hours_per_step(self) -> float:
@@ -111,8 +124,8 @@ class StateTimer:
 
     def step(self, state: State) -> None:
         cur_time = time.time()
-        num_steps = int(state.num_steps.item())
-        num_samples = int(state.num_samples.item())
+        num_steps = int(to_scalar(state.num_steps))
+        num_samples = int(to_scalar(state.num_samples))
         self.step_timer.step(num_steps, cur_time)
         self.sample_timer.step(num_samples, cur_time)
         self.iter_timer.step(cur_time)

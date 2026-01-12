@@ -17,11 +17,12 @@ from xax.task.logger import (
     LogStatus,
     LogString,
 )
+from xax.utils.jax import to_scalar
 
 
 def get_json_value(value: Any) -> Any:  # noqa: ANN401
     if isinstance(value, Array):
-        value = value.item()
+        value = to_scalar(value)
     return value
 
 
@@ -63,8 +64,8 @@ class JsonLogger(LoggerImpl):
         num_digits = len(str(world_size))
         rank_str = f"{rank:0{num_digits}d}" if world_size > 1 else ""
         self.run_directory.mkdir(parents=True, exist_ok=True)
-        self._log_fp = (self.run_directory / f"log{rank_str}.json").open(open_mode, encoding="utf-8")
-        self._err_fp = (self.run_directory / f"error{rank_str}.txt").open(open_mode, encoding="utf-8")
+        self._log_fp = (self.run_directory / f"log{rank_str}.jsonl").open(open_mode, encoding="utf-8")
+        self._err_fp = (self.run_directory / f"error{rank_str}.jsonl").open(open_mode, encoding="utf-8")
 
     def start(self) -> None:
         pass

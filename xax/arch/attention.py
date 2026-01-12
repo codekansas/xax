@@ -9,7 +9,7 @@ Supports optional FP8 quantization for matrix multiplications when use_fp8=True.
 
 import math
 import warnings
-from typing import NotRequired, TypedDict
+from typing import Literal, NotRequired, TypedDict
 
 import chex
 import equinox as eqx
@@ -144,30 +144,66 @@ def _init_fp8_scales_cache(history_length: int) -> Fp8ScalesCache:
     }
 
 
+RotaryEmbeddingStyle = Literal["concatenated", "interleaved"]
+
+
 class RotaryEmbedding(eqx.Module):
     """Rotary Position Embedding (RoPE) for transformer attention.
 
     This implements the rotary position embedding as described in:
     "RoFormer: Enhanced Transformer with Rotary Position Embedding"
     https://arxiv.org/abs/2104.09864
+
+    Supports YaRN (Yet another RoPE extensioN) for extended context:
+    "YaRN: Efficient Context Window Extension of Large Language Models"
+    https://arxiv.org/abs/2309.00071
+
+    Two styles are supported:
+    - "concatenated" (default): Used by LLaMA, Qwen, Mistral. Splits head_dim in half.
+    - "interleaved": Used by GPT-NeoX. Uses even/odd indices.
     """
 
     head_dim: int = eqx.field()
     base: float = eqx.field()
+    style: RotaryEmbeddingStyle = eqx.field(static=True)
+    # YaRN parameters
+    factor: float = eqx.field()
+    original_max_position_embeddings: int | None = eqx.field()
+    beta_slow: float = eqx.field()
+    beta_fast: float = eqx.field()
 
     def __init__(
         self,
         head_dim: int,
         base: float = 10000.0,
+        style: RotaryEmbeddingStyle = "interleaved",
+        factor: float = 1.0,
+        original_max_position_embeddings: int | None = None,
+        beta_slow: float = 1.0,
+        beta_fast: float = 32.0,
     ) -> None:
         """Initialize rotary embedding.
 
         Args:
             head_dim: Dimension of each attention head
             base: Base for the frequency computation
+            style: RoPE style - "interleaved" (default, GPT-NeoX) or "concatenated" (LLaMA/Qwen)
+            factor: YaRN scaling factor (1.0 = no scaling)
+            original_max_position_embeddings: Original context length for YaRN
+            beta_slow: YaRN slow dimension weight
+            beta_fast: YaRN fast dimension weight
         """
         self.head_dim = head_dim
         self.base = base
+        self.style = style
+        self.factor = factor
+        self.original_max_position_embeddings = original_max_position_embeddings
+        self.beta_slow = beta_slow
+        self.beta_fast = beta_fast
+
+    @property
+    def uses_yarn(self) -> bool:
+        return self.factor > 1.0 and self.original_max_position_embeddings is not None
 
     def _get_rotary_embeddings(self, positions: Array, dtype: jnp.dtype) -> tuple[Array, Array]:
         """Get rotary embeddings for a given sequence length.
@@ -179,8 +215,12 @@ class RotaryEmbedding(eqx.Module):
         Returns:
             Tuple of (cos_embeddings, sin_embeddings) of shape (seq_len, head_dim//2)
         """
-        # Create frequency bands
         dim = self.head_dim // 2
+
+        if self.uses_yarn:
+            return self._get_yarn_embeddings(positions, dtype, dim)
+
+        # Standard RoPE: Create frequency bands
         freqs = jnp.exp(-jnp.arange(0, dim, dtype=dtype) * jnp.log(self.base) / dim)
 
         # Compute angles
@@ -192,6 +232,48 @@ class RotaryEmbedding(eqx.Module):
 
         return cos_embeddings, sin_embeddings
 
+    def _get_yarn_embeddings(self, positions: Array, dtype: jnp.dtype, dim: int) -> tuple[Array, Array]:
+        """Get YaRN RoPE embeddings for extended context.
+
+        YaRN interpolates between original and scaled frequencies based on dimension,
+        preserving high-frequency components for short-range dependencies while
+        extending low-frequency components for longer context.
+        """
+        features = self.head_dim
+        original_max_pos = self.original_max_position_embeddings
+        assert original_max_pos is not None
+
+        # Compute low/high thresholds for interpolation
+        low = (features * math.log(original_max_pos / (self.beta_fast * 2 * math.pi))) / (2 * math.log(self.base))
+        high = (features * math.log(original_max_pos / (self.beta_slow * 2 * math.pi))) / (2 * math.log(self.base))
+        low, high = max(low, 0), min(high, features - 1)
+
+        # Compute original and scaled frequencies
+        timescale = self.base ** (jnp.arange(0, features, 2, dtype=jnp.float32) / features)
+        rot_freq_extra = 1.0 / timescale  # Original frequencies
+        rot_freq_inter = 1.0 / (self.factor * timescale)  # Scaled frequencies
+
+        # Compute interpolation factor per dimension
+        high = high if low != high else (high + 0.001)
+        dim_indices = jnp.arange(dim, dtype=jnp.float32)
+        interp_factor = 1 - jnp.clip((dim_indices - low) / (high - low), 0.0, 1.0)
+
+        # Interpolate between scaled and original frequencies
+        rotational_frequency = rot_freq_inter * (1 - interp_factor) + rot_freq_extra * interp_factor
+
+        # Compute angles with high precision (important for YaRN)
+        angles = positions[:, None].astype(jnp.float32) * rotational_frequency[None, :]
+
+        # Compute attention scaling factor
+        m_scale = 1.0
+        attention_scaling = 0.1 * m_scale * math.log(self.factor) + 1.0
+
+        # Compute cos and sin with scaling
+        cos_embeddings = (jnp.cos(angles) * attention_scaling).astype(dtype)
+        sin_embeddings = (jnp.sin(angles) * attention_scaling).astype(dtype)
+
+        return cos_embeddings, sin_embeddings
+
     def apply_rotary_embeddings(
         self,
         x: Array,
@@ -200,38 +282,81 @@ class RotaryEmbedding(eqx.Module):
         """Apply rotary embeddings to input tensor.
 
         Args:
-            x: Input tensor of shape (seq_len, num_heads, head_dim)
-            positions: Optional position indices of shape (seq_len,)
+            x: Input tensor of shape (seq_len, num_heads, head_dim) or (batch, seq_len, num_heads, head_dim)
+            positions: Optional position indices of shape (seq_len,) or (batch, seq_len)
                 If None, uses sequential positions starting from 0
 
         Returns:
             Tensor with rotary embeddings applied, same shape as input
         """
-        seq_len, _, head_dim = x.shape
-        assert head_dim == self.head_dim, f"Expected head_dim {self.head_dim}, got {head_dim}"
+        # Handle both 3D and 4D inputs
+        if x.ndim == 4:
+            # (batch, seq_len, num_heads, head_dim) - batch first
+            bsz, seq_len, _, head_dim = x.shape
+            if positions is None:
+                positions = jnp.broadcast_to(jnp.arange(seq_len)[None, :], (bsz, seq_len))
+            return self._apply_rotary_4d(x, positions)
+        else:
+            # (seq_len, num_heads, head_dim)
+            seq_len, _, head_dim = x.shape
+            assert head_dim == self.head_dim, f"Expected head_dim {self.head_dim}, got {head_dim}"
 
-        # Get rotary embeddings
-        if positions is None:
-            positions = jnp.arange(seq_len, dtype=x.dtype)
-        cos_emb, sin_emb = self._get_rotary_embeddings(positions, x.dtype)
+            if positions is None:
+                positions = jnp.arange(seq_len, dtype=x.dtype)
 
-        # Reshape to (seq_len, 1, head_dim//2) for broadcasting
-        cos_emb = cos_emb[:, None, :]  # (seq_len, 1, head_dim//2)
-        sin_emb = sin_emb[:, None, :]  # (seq_len, 1, head_dim//2)
+            cos_emb, sin_emb = self._get_rotary_embeddings(positions, x.dtype)
+            cos_emb = cos_emb[:, None, :]  # (seq_len, 1, head_dim//2)
+            sin_emb = sin_emb[:, None, :]
 
-        # Split input into even and odd dimensions
-        x_even = x[..., ::2]  # (seq_len, num_heads, head_dim//2)
-        x_odd = x[..., 1::2]  # (seq_len, num_heads, head_dim//2)
+            match self.style:
+                case "concatenated":
+                    return self._apply_concatenated(x, cos_emb, sin_emb)
+                case "interleaved":
+                    return self._apply_interleaved(x, cos_emb, sin_emb)
+                case _:
+                    raise ValueError(f"Unknown RoPE style: {self.style}. Use 'concatenated' or 'interleaved'.")
 
-        # Apply rotation
+    def _apply_rotary_4d(self, x: Array, positions: Array) -> Array:
+        """Apply RoPE to 4D tensor (batch, seq, heads, head_dim)."""
+        bsz, seq_len, _, head_dim = x.shape
+        assert head_dim == self.head_dim
+
+        # Get embeddings for each position in the batch
+        # positions is (batch, seq_len), we need cos/sin for each
+        cos_emb, sin_emb = self._get_rotary_embeddings(positions.reshape(-1), x.dtype)
+        cos_emb = cos_emb.reshape(bsz, seq_len, 1, -1)  # (batch, seq, 1, head_dim//2)
+        sin_emb = sin_emb.reshape(bsz, seq_len, 1, -1)
+
+        if self.style == "concatenated":
+            x1 = x[..., : head_dim // 2]
+            x2 = x[..., head_dim // 2 :]
+            return jnp.concatenate([x1 * cos_emb - x2 * sin_emb, x2 * cos_emb + x1 * sin_emb], axis=-1)
+        else:
+            x_even = x[..., ::2]
+            x_odd = x[..., 1::2]
+            rotated_even = x_even * cos_emb - x_odd * sin_emb
+            rotated_odd = x_even * sin_emb + x_odd * cos_emb
+            result = jnp.zeros_like(x)
+            result = result.at[..., ::2].set(rotated_even)
+            result = result.at[..., 1::2].set(rotated_odd)
+            return result
+
+    def _apply_concatenated(self, x: Array, cos_emb: Array, sin_emb: Array) -> Array:
+        """LLaMA/Qwen style: split into first half and second half."""
+        head_dim = x.shape[-1]
+        x1 = x[..., : head_dim // 2]
+        x2 = x[..., head_dim // 2 :]
+        return jnp.concatenate([x1 * cos_emb - x2 * sin_emb, x2 * cos_emb + x1 * sin_emb], axis=-1)
+
+    def _apply_interleaved(self, x: Array, cos_emb: Array, sin_emb: Array) -> Array:
+        """GPT-NeoX style: use even/odd indices."""
+        x_even = x[..., ::2]
+        x_odd = x[..., 1::2]
         rotated_even = x_even * cos_emb - x_odd * sin_emb
         rotated_odd = x_even * sin_emb + x_odd * cos_emb
-
-        # Interleave back together
         result = jnp.zeros_like(x)
         result = result.at[..., ::2].set(rotated_even)
         result = result.at[..., 1::2].set(rotated_odd)
-
         return result
 
 

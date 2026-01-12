@@ -61,6 +61,11 @@ wandb = [
     "wandb[media]",
 ]
 
+llm = [
+    "huggingface_hub",
+    "safetensors",
+]
+
 examples = [
     # Huggingface.
     "tokenizers",
@@ -76,6 +81,8 @@ all = [
     "types-psutil",
     "types-requests",
     "wandb[media]",
+    "huggingface_hub",
+    "safetensors",
     "tokenizers",
     "transformers",
 ]

@@ -9,9 +9,11 @@ import threading
 import time
 from pathlib import Path
 from typing import TypeVar
+from urllib.parse import urlparse
 
 from xax.nn.parallel import is_master
 from xax.task.logger import LogError, LogErrorSummary, LoggerImpl, LogLine, LogPing, LogStatus
+from xax.utils.debugging import get_ip_addrs
 from xax.utils.jax import as_float
 from xax.utils.logging import LOG_STATUS, port_is_busy
 from xax.utils.tensorboard import TensorboardWriter, TensorboardWriters
@@ -92,7 +94,18 @@ class TensorboardLogger(LoggerImpl):
             m = re.search(r" (http\S+?) ", s)
             if m is None:
                 return s
-            return f"Tensorboard: {m.group(1)}"
+            url = m.group(1)
+
+            # Sometimes Tensorboard gives a weird URL, so we should show the
+            # versions with IP addressses instead.
+            ip_roots = get_ip_addrs()
+            url_port = urlparse(url).port
+            tbd_str = f"Tensorboard: {url}"
+            if url_port is not None and len(ip_roots) > 0:
+                ip_str = ", ".join(f"http://{ip}:{url_port}" for ip in ip_roots)
+                tbd_str += f" ({ip_str})"
+
+            return tbd_str
 
         command: list[str] = [
             "python",
@@ -246,13 +259,17 @@ class TensorboardLogger(LoggerImpl):
         pass
 
     def write_error(self, error: LogError) -> None:
-        pass
+        writer = self.get_writer(False)
+        writer.add_text("error.txt", error.message_with_location)
 
     def write_error_summary(self, error_summary: LogErrorSummary) -> None:
-        pass
+        writer = self.get_writer(False)
+        writer.add_text("error_summary.txt", error_summary.message)
 
     def write_ping(self, ping: LogPing) -> None:
-        pass
+        writer = self.get_writer(False)
+        writer.add_text("ping.txt", ping.message)
 
     def write_status(self, status: LogStatus) -> None:
-        pass
+        writer = self.get_writer(False)
+        writer.add_text("status.txt", status.message)

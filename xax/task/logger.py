@@ -41,6 +41,7 @@ from PIL.Image import Image as PILImageType
 from xax.core.conf import field
 from xax.core.state import State
 from xax.utils.experiments import ContextTimer, IntervalTicker
+from xax.utils.jax import to_numpy
 from xax.utils.logging import LOG_ERROR_SUMMARY, LOG_PING, LOG_STATUS, format_number
 
 logger = logging.getLogger(__name__)
@@ -766,7 +767,7 @@ class Logger:
         value: Metric,
         *,
         namespace: str | None = None,
-        decode_tokens: Callable[[Array], str] | None = None,
+        decode_tokens: Callable[[Array | np.ndarray], str] | None = None,
     ) -> None:
         if not self.active:
             raise RuntimeError("The logger is not active")
@@ -781,7 +782,8 @@ class Logger:
         elif isinstance(value, Tokens):
             if decode_tokens is None:
                 raise ValueError("decode_tokens must be provided when logging Tokens")
-            value_str = decode_tokens(value.value)
+            tokens_np = to_numpy(value.value)
+            value_str = decode_tokens(tokens_np)
             self.log_string(key, value_str, namespace=namespace, secondary=value.secondary)
         elif isinstance(value, Image):
             self.log_image(key, value.image, namespace=namespace, target_resolution=value.target_resolution)

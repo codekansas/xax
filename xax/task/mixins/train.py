@@ -1,14 +1,15 @@
 """Defines a mixin for running the training loop."""
 
+import datetime
 import functools
 import itertools
 import logging
-import time
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import (
     Any,
+    Callable,
     Generic,
     Literal,
     Mapping,
@@ -50,6 +51,7 @@ from xax.utils.experiments import (
 )
 from xax.utils.jax import jit as xax_jit
 from xax.utils.logging import LOG_PING, LOG_STATUS
+from xax.utils.text import format_datetime, format_timedelta
 from xax.utils.types.training import Optimizer, PrecisionConfig, as_shape_dtype
 
 logger = logging.getLogger(__name__)
@@ -244,10 +246,14 @@ class TrainMixin(
                 return x.astype(grad_dtype)
             return x
 
-        return [
-            opt.init(jax.tree.map(cast_to_grad_dtype, eqx.filter(model, eqx.is_array)))
-            for model, opt in zip(models, optimizers, strict=True)
-        ]
+        opt_states = []
+        for model, opt in zip(models, optimizers, strict=True):
+            # Use filter spec to only create optimizer state for trainable params
+            filter_spec = self.get_model_filter_spec(model)
+            trainable, _ = eqx.partition(model, filter_spec)
+            trainable_casted = jax.tree.map(cast_to_grad_dtype, trainable)
+            opt_states.append(opt.init(trainable_casted))
+        return opt_states
 
     @overload
     def load_initial_state(
@@ -470,8 +476,10 @@ class TrainMixin(
             return
         self._last_printed_remaining_time = state.elapsed_time_s.item()
         remaining_seconds = remaining_percent * state.elapsed_time_s.item() / (1 - remaining_percent)
-        termination_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + remaining_seconds))
-        logger.log(LOG_PING, "Estimated finish time: %s", termination_time)
+        remaining_td = datetime.timedelta(seconds=remaining_seconds)
+        termination_time = format_datetime(datetime.datetime.now() + remaining_td)
+        remaining_time = format_timedelta(remaining_td)
+        logger.log(LOG_PING, "Estimated finish time: %s (%s remaining)", termination_time, remaining_time)
 
     def get_remaining_percent(self, state: State) -> float | None:
         if self.config.max_steps is None:
@@ -509,3 +517,17 @@ class TrainMixin(
 
     def model_partition_fn(self, item: Any) -> bool:  # noqa: ANN401
         return eqx.is_inexact_array(item)
+
+    def get_model_filter_spec(self, model: PyTree) -> PyTree | Callable[[Any], bool]:
+        """Returns a filter spec for partitioning the model into trainable/frozen parts.
+
+        Override this method to customize which parameters are trainable.
+        For LoRA fine-tuning, return a pytree filter spec marking only LoRA params.
+
+        Args:
+            model: The model to partition.
+
+        Returns:
+            Either a callable (applied to each leaf) or a pytree of booleans.
+        """
+        return self.model_partition_fn
