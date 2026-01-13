@@ -13,7 +13,7 @@ def test_self_attention_block_loopback(use_rotary_embeddings: bool) -> None:
     key = jax.random.key(0)
     key, subkey = jax.random.split(key)
 
-    block = xax.SelfAttentionBlock(
+    block = xax.SelfAttentionBlock.build(
         embed_dim=32,
         num_heads=2,
         key=subkey,
@@ -53,7 +53,7 @@ def test_self_attention_block_mask(use_rotary_embeddings: bool) -> None:
     key = jax.random.key(0)
     key, subkey = jax.random.split(key)
 
-    block = xax.SelfAttentionBlock(
+    block = xax.SelfAttentionBlock.build(
         embed_dim=32,
         num_heads=2,
         key=subkey,
@@ -79,7 +79,7 @@ def test_transformer_block_loopback(use_rotary_embeddings: bool) -> None:
     key = jax.random.key(0)
     key, subkey = jax.random.split(key)
 
-    block = xax.TransformerBlock(
+    block = xax.TransformerBlock.build(
         embed_dim=32,
         num_heads=2,
         ff_dim=64,
@@ -124,7 +124,7 @@ def test_transformer_stack_loopback(use_rotary_embeddings: bool) -> None:
     key = jax.random.key(0)
     key, subkey = jax.random.split(key)
 
-    stack = xax.TransformerStack(
+    stack = xax.TransformerStack.build(
         embed_dim=32,
         num_heads=2,
         ff_dim=64,
@@ -170,7 +170,7 @@ def test_transformer_loopback(use_rotary_embeddings: bool) -> None:
     key = jax.random.key(0)
     key, subkey = jax.random.split(key)
 
-    transformer = xax.Transformer(
+    transformer = xax.Transformer.build(
         vocab_size=1000,
         embed_dim=32,
         num_heads=2,

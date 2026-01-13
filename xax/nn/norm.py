@@ -44,17 +44,21 @@ class RMSNorm(eqx.Module):
     """Defines root-mean-square normalization."""
 
     weight: jax.Array
-    eps: float
+    eps: float = eqx.field(static=True, default=1e-6)
 
-    def __init__(self, dim: int, eps: float = 1e-6) -> None:
-        """Initialize RMSNorm.
+    @classmethod
+    def build(cls, dim: int, eps: float = 1e-6) -> "RMSNorm":
+        """Build RMSNorm from parameters.
 
         Args:
             dim: Dimension to normalize over
             eps: Epsilon value for numerical stability
+
+        Returns:
+            RMSNorm instance
         """
-        self.eps = eps
-        self.weight = jnp.ones(dim)
+        weight = jnp.ones(dim)
+        return cls(weight=weight, eps=eps)
 
     def _norm(self, x: Array) -> Array:
         """Apply RMS normalization.
@@ -412,6 +416,6 @@ def get_norm_linear(
         case "rms":
             if dim is None:
                 raise ValueError("`dim` is required for RMS norm")
-            return RMSNorm(dim, eps=eps)
+            return RMSNorm.build(dim, eps=eps)
         case _:
             raise NotImplementedError(f"Invalid linear norm type: {norm}")

@@ -17,12 +17,11 @@ from omegaconf import MISSING
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field as PydanticField
 
 from xax.arch.attention import (
-    LLMAttention,
-    LLMBlock,
-    LLMFeedForward,
     RMSNorm,
-    RotaryEmbedding,
-    llm_linear,
+    SelfAttentionBlock,
+    SwiGLU,
+    TransformerBlock,
+    apply_linear,
 )
 from xax.core.conf import field
 
@@ -82,7 +81,7 @@ class LLM(eqx.Module):
     """Minimal decoder-only LLM."""
 
     embed: eqx.nn.Embedding
-    blocks: tuple[LLMBlock, ...]
+    blocks: tuple[TransformerBlock, ...]
     norm: RMSNorm
     lm_head: eqx.nn.Linear
     config: LLMConfig
@@ -92,15 +91,13 @@ class LLM(eqx.Module):
         """Initialize LLM with random weights."""
         k_emb, *block_keys, k_head = jax.random.split(key, config.num_layers + 2)
         embed = eqx.nn.Embedding(config.vocab_size, config.embed_dim, key=k_emb)
-        blocks = []
+        blocks: list[TransformerBlock] = []
         mlp_width = config.mlp_hidden_dim or (config.embed_dim * config.mlp_mult)
         attn_bias = config.attention_bias
         mlp_bias = config.mlp_bias
 
         for i in range(config.num_layers):
             k_attn, k_mlp = jax.random.split(block_keys[i], 2)
-            q_dim = config.q_heads * config.head_dim
-            kv_dim = config.kv_heads * config.head_dim
 
             # Determine sliding window for this layer
             layer_window: int | None = None
@@ -108,45 +105,47 @@ class LLM(eqx.Module):
                 if "sliding" in config.layer_attention_types[i]:
                     layer_window = config.sliding_window_size
 
-            attn = LLMAttention(
-                q_proj=eqx.nn.Linear(config.embed_dim, q_dim, use_bias=attn_bias, key=k_attn),
-                k_proj=eqx.nn.Linear(config.embed_dim, kv_dim, use_bias=attn_bias, key=k_attn),
-                v_proj=eqx.nn.Linear(config.embed_dim, kv_dim, use_bias=attn_bias, key=k_attn),
-                o_proj=eqx.nn.Linear(q_dim, config.embed_dim, use_bias=attn_bias, key=k_attn),
-                rotary=RotaryEmbedding(
-                    config.head_dim,
-                    base=config.rope_theta,
-                    style="concatenated",
-                    factor=config.rope_factor,
-                    original_max_position_embeddings=config.rope_original_max_position_embeddings,
-                    beta_slow=config.rope_beta_slow,
-                    beta_fast=config.rope_beta_fast,
-                ),
-                q_norm=None,
-                k_norm=None,
-                q_heads=config.q_heads,
-                kv_heads=config.kv_heads,
+            # Create attention block with proper settings
+            self_attn = SelfAttentionBlock.build(
+                embed_dim=config.embed_dim,
+                num_heads=config.q_heads,
+                num_kv_heads=config.kv_heads,
                 head_dim=config.head_dim,
-                dropout_rate=config.dropout_rate,
-                sliding_window_size=layer_window,
+                key=k_attn,
+                use_bias=attn_bias,
+                causal=True,
+                context_length=layer_window + 1 if layer_window else None,
+                use_rotary_embeddings=True,
+                rotary_base=config.rope_theta,
+                rotary_style="concatenated",
+                rotary_factor=config.rope_factor,
+                rotary_original_max_position_embeddings=config.rope_original_max_position_embeddings,
+                rotary_beta_slow=config.rope_beta_slow,
+                rotary_beta_fast=config.rope_beta_fast,
+                use_qk_norm=False,  # Will be set via weight loading if present
+                use_attention_sinks=config.use_attention_sinks,
             )
 
-            mlp = LLMFeedForward(
-                gate=eqx.nn.Linear(config.embed_dim, mlp_width, use_bias=mlp_bias, key=k_mlp),
-                up=eqx.nn.Linear(config.embed_dim, mlp_width, use_bias=mlp_bias, key=k_mlp),
-                down=eqx.nn.Linear(mlp_width, config.embed_dim, use_bias=mlp_bias, key=k_mlp),
-            )
+            # Create feed-forward layer
+            mlp = SwiGLU.build(config.embed_dim, mlp_width, key=k_mlp, use_bias=mlp_bias)
 
             blocks.append(
-                LLMBlock(
-                    attn=attn,
-                    attn_norm=RMSNorm(config.embed_dim, eps=config.rms_eps),
-                    mlp_norm=RMSNorm(config.embed_dim, eps=config.rms_eps),
-                    mlp=mlp,
+                TransformerBlock(
+                    self_attn=self_attn,
+                    feed_forward=mlp,
+                    attn_norm=RMSNorm.build(config.embed_dim, eps=config.rms_eps),
+                    mlp_norm=RMSNorm.build(config.embed_dim, eps=config.rms_eps),
+                    num_heads=config.q_heads,
+                    head_dim=config.head_dim,
+                    causal=True,
+                    use_fp8=False,
+                    cross_attn=None,
+                    cross_attn_norm=None,
+                    context_length=layer_window + 1 if layer_window else None,
                 )
             )
 
-        norm = RMSNorm(config.embed_dim, eps=config.rms_eps)
+        norm = RMSNorm.build(config.embed_dim, eps=config.rms_eps)
         lm_head = eqx.nn.Linear(config.embed_dim, config.vocab_size, use_bias=False, key=k_head)
         return cls(embed=embed, blocks=tuple(blocks), norm=norm, lm_head=lm_head, config=config)
 
@@ -178,15 +177,15 @@ class LLM(eqx.Module):
 
                 @jax.checkpoint
                 def remat_block(
-                    arrays: LLMBlock,
+                    arrays: TransformerBlock,
                     x: Array,
                     pos: Array,
                     k: jax.Array | None,
                     inf: bool,
                     *,
-                    static: LLMBlock = block_static,
+                    static: TransformerBlock = block_static,
                 ) -> Array:
-                    b: LLMBlock = eqx.combine(arrays, static)
+                    b: TransformerBlock = eqx.combine(arrays, static)
                     return b(x, pos, key=k, inference=inf)
 
                 x_btd = remat_block(block_arrays, x_btd, positions_bt, block_key, inference)
@@ -203,7 +202,7 @@ class LLM(eqx.Module):
     ) -> Array:
         """Forward pass returning logits shaped (bsz, tsz, vocab_size)."""
         x_btd = self.forward_hidden(tokens_bt, key=key, inference=inference)
-        logits_btv = llm_linear(x_btd, self.lm_head)
+        logits_btv = apply_linear(x_btd, self.lm_head)
         return logits_btv
 
 
@@ -754,22 +753,20 @@ def load_hf_weights_into_llm(
         v_b = _get_bias(state, f"{pfx}.v_proj.bias", f"{pfx_alt}.v_proj.bias")
         o_b = _get_bias(state, f"{pfx}.o_proj.bias", f"{pfx_alt}.o_proj.bias")
 
-        block = eqx.tree_at(lambda b: b.attn.q_proj, block, map_linear(block.attn.q_proj, q_w, q_b))
-        block = eqx.tree_at(lambda b: b.attn.k_proj, block, map_linear(block.attn.k_proj, k_w, k_b))
-        block = eqx.tree_at(lambda b: b.attn.v_proj, block, map_linear(block.attn.v_proj, v_w, v_b))
-        block = eqx.tree_at(lambda b: b.attn.o_proj, block, map_linear(block.attn.o_proj, o_w, o_b))
+        block = eqx.tree_at(lambda b: b.self_attn.q_proj, block, map_linear(block.self_attn.q_proj, q_w, q_b))
+        block = eqx.tree_at(lambda b: b.self_attn.k_proj, block, map_linear(block.self_attn.k_proj, k_w, k_b))
+        block = eqx.tree_at(lambda b: b.self_attn.v_proj, block, map_linear(block.self_attn.v_proj, v_w, v_b))
+        block = eqx.tree_at(lambda b: b.self_attn.output_proj, block, map_linear(block.self_attn.output_proj, o_w, o_b))
 
         # QK-Norm (Qwen3 style) - only create if weights are present
         q_norm_w = state.get(f"{pfx_alt}.q_norm.weight")
         k_norm_w = state.get(f"{pfx_alt}.k_norm.weight")
         if q_norm_w is not None:
-            q_norm = RMSNorm(q_norm_w.shape[-1], eps=model.config.rms_eps)
-            q_norm = eqx.tree_at(lambda n: n.weight, q_norm, to_dtype(q_norm_w))
-            block = eqx.tree_at(lambda b: b.attn.q_norm, block, q_norm, is_leaf=lambda x: x is None)
+            q_norm = RMSNorm(weight=to_dtype(q_norm_w), eps=model.config.rms_eps)
+            block = eqx.tree_at(lambda b: b.self_attn.q_norm, block, q_norm, is_leaf=lambda x: x is None)
         if k_norm_w is not None:
-            k_norm = RMSNorm(k_norm_w.shape[-1], eps=model.config.rms_eps)
-            k_norm = eqx.tree_at(lambda n: n.weight, k_norm, to_dtype(k_norm_w))
-            block = eqx.tree_at(lambda b: b.attn.k_norm, block, k_norm, is_leaf=lambda x: x is None)
+            k_norm = RMSNorm(weight=to_dtype(k_norm_w), eps=model.config.rms_eps)
+            block = eqx.tree_at(lambda b: b.self_attn.k_norm, block, k_norm, is_leaf=lambda x: x is None)
 
         # Layer norms
         pre_gamma = _get_weight(state, f"{blk_pfx}.input_layernorm.weight", f"{blk_pfx_alt}.input_layernorm.weight")
@@ -779,7 +776,7 @@ def load_hf_weights_into_llm(
         block = eqx.tree_at(lambda b: b.attn_norm.weight, block, to_dtype(pre_gamma))
         block = eqx.tree_at(lambda b: b.mlp_norm.weight, block, to_dtype(post_gamma))
 
-        # MLP projections
+        # MLP projections (SwiGLU)
         gate_w = _get_weight(state, f"{mlp_pfx}.gate_proj.weight", f"{mlp_pfx_alt}.gate_proj.weight")
         up_w = _get_weight(state, f"{mlp_pfx}.up_proj.weight", f"{mlp_pfx_alt}.up_proj.weight")
         down_w = _get_weight(state, f"{mlp_pfx}.down_proj.weight", f"{mlp_pfx_alt}.down_proj.weight")
@@ -787,9 +784,9 @@ def load_hf_weights_into_llm(
         up_b = _get_bias(state, f"{mlp_pfx}.up_proj.bias", f"{mlp_pfx_alt}.up_proj.bias")
         down_b = _get_bias(state, f"{mlp_pfx}.down_proj.bias", f"{mlp_pfx_alt}.down_proj.bias")
 
-        block = eqx.tree_at(lambda b: b.mlp.gate, block, map_linear(block.mlp.gate, gate_w, gate_b))
-        block = eqx.tree_at(lambda b: b.mlp.up, block, map_linear(block.mlp.up, up_w, up_b))
-        block = eqx.tree_at(lambda b: b.mlp.down, block, map_linear(block.mlp.down, down_w, down_b))
+        block = eqx.tree_at(lambda b: b.feed_forward.gate, block, map_linear(block.feed_forward.gate, gate_w, gate_b))
+        block = eqx.tree_at(lambda b: b.feed_forward.up, block, map_linear(block.feed_forward.up, up_w, up_b))
+        block = eqx.tree_at(lambda b: b.feed_forward.down, block, map_linear(block.feed_forward.down, down_w, down_b))
 
         model = eqx.tree_at(lambda mod, i=idx: mod.blocks[i], model, block)
 
