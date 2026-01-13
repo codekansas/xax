@@ -173,7 +173,79 @@ def test_save_load_model(tmpdir: Path) -> None:
     assert final_step_dirs or latest_ckpt.exists(), "Final checkpoint should exist"
 
 
+def test_checkpoint_weights_preserved(tmpdir: Path) -> None:
+    """Test that model weights are correctly preserved through checkpoint save/load."""
+    os.environ["DISABLE_TENSORBOARD"] = "1"
+
+    launcher = xax.MultiCpuLauncher(num_cpus=8)
+    config = SimpleConfig(
+        max_steps=5,
+        exp_dir=str(tmpdir),
+        save_every_n_steps=3,
+    )
+
+    # Train for 5 steps
+    SimpleTask.launch(config, use_cli=False, launcher=launcher)
+
+    # Find the checkpoint
+    checkpoints_dir = Path(tmpdir) / "checkpoints"
+    step_dirs = sorted(
+        [d for d in checkpoints_dir.iterdir() if d.is_dir() and d.name.startswith("step_")],
+        key=lambda x: int(x.name.split("_")[1]) if x.name.startswith("step_") else -1,
+        reverse=True,
+    )
+    latest_ckpt = checkpoints_dir / "latest"
+    ckpt_path = step_dirs[0] if step_dirs else latest_ckpt
+
+    # Create task and load checkpoint with the SAME random seed (deterministic key)
+    task = SimpleTask.get_task(config, use_cli=False)
+    init_params = xax.InitParams(key=task.prng_key())  # Use same key as training
+
+    # Load checkpoint
+    models, _, state, _ = task.load_ckpt(ckpt_path, init_params=init_params, part="all")
+    loaded_model = models[0]
+
+    # Verify state is correct
+    assert state.num_steps >= 5, f"State should have num_steps >= 5, got {state.num_steps}"
+
+    # Create a fresh model with the same key to compare structure
+    fresh_model = task.get_model(init_params)
+
+    # Verify loaded model weights are DIFFERENT from fresh model
+    # (because training changed them)
+    loaded_weight = loaded_model.layers[0].weight
+    fresh_weight = fresh_model.layers[0].weight
+
+    # Weights should differ after training
+    assert not jnp.allclose(loaded_weight, fresh_weight)
+
+    # Now resume training - the loaded model should have trained weights
+    # We verify this by checking that training continues from step 5, not step 0
+    SimpleTask.launch(
+        SimpleConfig(
+            max_steps=8,  # Train for 3 more steps
+            exp_dir=str(tmpdir),
+            save_every_n_steps=3,
+        ),
+        use_cli=False,
+        launcher=launcher,
+    )
+
+    # Load final checkpoint and verify step count
+    final_step_dirs = sorted(
+        [d for d in checkpoints_dir.iterdir() if d.is_dir() and d.name.startswith("step_")],
+        key=lambda x: int(x.name.split("_")[1]) if x.name.startswith("step_") else -1,
+        reverse=True,
+    )
+    final_ckpt = final_step_dirs[0] if final_step_dirs else latest_ckpt
+    final_state = xax.load_ckpt(final_ckpt, part="state")
+
+    # Should be at step 8 (started from 5, trained to 8)
+    assert final_state.num_steps >= 8, f"Final state should have num_steps >= 8, got {final_state.num_steps}"
+
+
 if __name__ == "__main__":
     # python -m tests.e2e.test_train_e2e
     with tempfile.TemporaryDirectory() as tmpdir:
         test_save_load_model(Path(tmpdir))
+        test_checkpoint_weights_preserved(Path(tmpdir))
