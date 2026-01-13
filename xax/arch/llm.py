@@ -64,8 +64,8 @@ def _linear(x_btd: Array, linear: eqx.nn.Linear) -> Array:
         y_bto = jnp.einsum("...d,od->...o", x_btd, linear.weight_oi)
         if linear.bias_o is not None:
             y_bto = y_bto + linear.bias_o
-        # Add LoRA contribution: (x @ A) @ B * scaling
-        delta_bto = (x_btd @ linear.lora_a_ir) @ linear.lora_b_ro * linear.scaling
+        # Add LoRA contribution: (x @ A) @ B * alpha
+        delta_bto = (x_btd @ linear.lora_a_ir) @ linear.lora_b_ro * linear.alpha
         return y_bto + delta_bto
     else:
         # Standard eqx.nn.Linear

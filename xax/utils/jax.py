@@ -11,7 +11,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax._src import sharding_impls
 from jax._src.lib import xla_client as xc
-from jaxtyping import PyTree
+from jax.sharding import NamedSharding
+from jaxtyping import Array, PyTree
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,15 @@ def disable_jit_level() -> int:
 
 def should_disable_jit(jit_level: int | None) -> bool:
     return jit_level is not None and jit_level < disable_jit_level()
+
+
+def fix_unspecified_sharding(arr: Array, sharding: NamedSharding) -> Array:
+    if hasattr(arr, "sharding") and not hasattr(arr.sharding, "is_fully_replicated"):
+        # Array has unspecified sharding - get data from first shard
+        if hasattr(arr, "addressable_shards") and arr.addressable_shards:
+            data = np.asarray(arr.addressable_shards[0].data)
+            return jax.device_put(data, sharding)
+    return arr
 
 
 def to_numpy(arr: jnp.ndarray | np.ndarray) -> np.ndarray:

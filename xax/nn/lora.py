@@ -16,14 +16,16 @@ class LoRALinear(eqx.Module):
 
     The base weight and bias are treated as frozen parameters; only the low-rank
     matrices ``lora_a_ir`` and ``lora_b_ro`` are updated during fine-tuning.
-    Scaling follows the convention ``alpha / rank``.
+
+    The ``alpha`` parameter directly scales the LoRA contribution (default 1.0),
+    independent of rank. Use alpha > 1.0 to amplify LoRA updates.
     """
 
     weight_oi: Array
     bias_o: Array | None
     lora_a_ir: Array
     lora_b_ro: Array
-    scaling: float = eqx.field(static=True)
+    alpha: float = eqx.field(static=True)
     dropout_rate: float = eqx.field(static=True)
 
     @classmethod
@@ -32,15 +34,13 @@ class LoRALinear(eqx.Module):
         linear: eqx.nn.Linear,
         rank: int,
         *,
-        alpha: float | None = None,
+        alpha: float = 1.0,
         dropout_rate: float = 0.0,
         key: PRNGKeyArray | None = None,
     ) -> "LoRALinear":
         """Create a LoRA-augmented linear layer from an ``eqx.nn.Linear``."""
         if rank < 1:
             raise ValueError("rank must be at least 1")
-        if alpha is None:
-            alpha = float(rank)
         if key is None:
             key = jrandom.key(0)
 
@@ -56,7 +56,7 @@ class LoRALinear(eqx.Module):
             bias_o=None if linear.bias is None else jax.lax.stop_gradient(linear.bias),
             lora_a_ir=lora_a_ir,
             lora_b_ro=lora_b_ro,
-            scaling=alpha / float(rank),
+            alpha=alpha,
             dropout_rate=dropout_rate,
         )
 
@@ -74,14 +74,14 @@ class LoRALinear(eqx.Module):
             x_lora_bi = jnp.where(mask_bi, x_bi / keep_prob, 0.0)
 
         delta_bo = (x_lora_bi @ self.lora_a_ir) @ self.lora_b_ro
-        return y_bo + delta_bo * self.scaling
+        return y_bo + delta_bo * self.alpha
 
 
 def loraize_linear(
     linear: eqx.nn.Linear,
     rank: int,
     *,
-    alpha: float | None = None,
+    alpha: float = 1.0,
     dropout_rate: float = 0.0,
     key: PRNGKeyArray | None = None,
 ) -> LoRALinear:
@@ -93,7 +93,7 @@ def loraize(
     module: Tmodule,
     rank: int,
     *,
-    alpha: float | None = None,
+    alpha: float = 1.0,
     dropout_rate: float = 0.0,
     predicate: Callable[[eqx.nn.Linear], bool] | None = None,
     key: PRNGKeyArray | None = None,
@@ -122,30 +122,26 @@ def loraize_by_path(
     module: Tmodule,
     rank: int,
     *,
-    include_patterns: list[str] | None = None,
-    exclude_patterns: list[str] | None = None,
-    alpha: float | None = None,
+    include_suffixes: list[str] | None = None,
+    exclude_suffixes: list[str] | None = None,
+    alpha: float = 1.0,
     dropout_rate: float = 0.0,
     key: PRNGKeyArray | None = None,
 ) -> Tmodule:
-    """Recursively replace ``eqx.nn.Linear`` layers matching path patterns.
+    """Recursively replace ``eqx.nn.Linear`` layers matching path suffixes.
 
     This function applies LoRA selectively based on the path names in the model tree.
     For example, to only apply LoRA to query and value projections in an LLM:
 
-        loraize_by_path(model, rank=16, include_patterns=["q_proj", "v_proj"])
-
-    To apply to all attention projections but not MLP:
-
-        loraize_by_path(model, rank=16, include_patterns=["attn"], exclude_patterns=["mlp"])
+        loraize_by_path(model, rank=16, include_suffixes=["q_proj", "v_proj"])
 
     Args:
         module: The module to transform.
         rank: LoRA rank for the low-rank decomposition.
-        include_patterns: List of substrings that must appear in the layer path.
+        include_suffixes: List of suffixes to match against layer paths.
             If None, all Linear layers are candidates.
-        exclude_patterns: List of substrings that exclude a layer if present in path.
-        alpha: LoRA scaling factor (defaults to rank).
+        exclude_suffixes: List of suffixes that exclude a layer if matched.
+        alpha: LoRA scaling factor (default 1.0). Use > 1.0 to amplify updates.
         dropout_rate: Dropout rate for LoRA layers.
         key: PRNG key for initialization.
 
@@ -156,8 +152,8 @@ def loraize_by_path(
     current_key: PRNGKeyArray = jrandom.key(0) if key is None else key
 
     def should_loraize(path: str) -> bool:
-        should_include = include_patterns is None or any(p in path for p in include_patterns)
-        should_exclude = exclude_patterns is not None and any(p in path for p in exclude_patterns)
+        should_include = include_suffixes is None or any(path.endswith(s) for s in include_suffixes)
+        should_exclude = exclude_suffixes is not None and any(path.endswith(s) for s in exclude_suffixes)
         return should_include and not should_exclude
 
     def convert_with_path(path: tuple[Any, ...], node: Any) -> Any:  # noqa: ANN401
@@ -219,7 +215,7 @@ def merge_lora(module: Tmodule) -> Tmodule:
 
     def convert(node: Any) -> Any:  # noqa: ANN001, ANN401
         if isinstance(node, LoRALinear):
-            delta_oi = (node.lora_a_ir @ node.lora_b_ro).T * node.scaling
+            delta_oi = (node.lora_a_ir @ node.lora_b_ro).T * node.alpha
             merged_weight_oi = node.weight_oi + delta_oi
             merged = eqx.nn.Linear(
                 in_features=node.weight_oi.shape[1],

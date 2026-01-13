@@ -64,6 +64,12 @@ class TensorboardLogger(LoggerImpl):
         self.writers = TensorboardWriters(log_directory=self.log_directory, flush_seconds=flush_seconds)
         self._started = False
 
+        # For making log messages independent.
+        self.error_step = 0
+        self.error_summary_step = 0
+        self.status_step = 0
+        self.ping_step = 0
+
     def _start(self) -> None:
         if self._started:
             return
@@ -260,16 +266,20 @@ class TensorboardLogger(LoggerImpl):
 
     def write_error(self, error: LogError) -> None:
         writer = self.get_writer(False)
-        writer.add_text("error.txt", error.message_with_location)
+        writer.add_text("error.txt", error.message_with_location, global_step=self.error_step)
+        self.error_step += 1
 
     def write_error_summary(self, error_summary: LogErrorSummary) -> None:
         writer = self.get_writer(False)
-        writer.add_text("error_summary.txt", error_summary.message)
+        writer.add_text("error_summary.txt", error_summary.message, global_step=self.error_summary_step)
+        self.error_summary_step += 1
 
     def write_ping(self, ping: LogPing) -> None:
         writer = self.get_writer(False)
-        writer.add_text("ping.txt", ping.message)
+        writer.add_text("ping.txt", ping.message, global_step=self.ping_step)
+        self.ping_step += 1
 
     def write_status(self, status: LogStatus) -> None:
         writer = self.get_writer(False)
-        writer.add_text("status.txt", status.message)
+        writer.add_text("status.txt", status.message, global_step=self.status_step)
+        self.status_step += 1

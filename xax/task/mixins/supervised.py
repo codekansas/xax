@@ -1,5 +1,6 @@
 """Defines a mixin for running the supervised training loop."""
 
+import functools
 import itertools
 import logging
 import os
@@ -33,6 +34,7 @@ from xax.task.logger import Metric, Scalar
 from xax.task.mixins.data_loader import InMemoryBatchIterator
 from xax.task.mixins.train import InitParams, Optimizer, TrainConfig, TrainMixin
 from xax.utils.experiments import ContextTimer
+from xax.utils.jax import fix_unspecified_sharding
 from xax.utils.logging import LOG_PING, LOG_STATUS
 from xax.utils.pytree import get_pytree_param_count
 from xax.utils.text import show_info
@@ -275,6 +277,18 @@ class SupervisedMixin(
         optimizer = optimizers[0]
         opt_state = opt_states[0]
 
+        # Handle arrays with unspecified sharding from multi-GPU JIT
+        # by extracting data from addressable shards and replicating across mesh
+        mesh = jax.sharding.get_mesh()
+        if mesh is not None and mesh.devices.size > 1:
+            replicated_sharding = NamedSharding(mesh, PartitionSpec())
+            unspecified_sharding_fn = functools.partial(fix_unspecified_sharding, sharding=replicated_sharding)
+
+            # Make sure that all arrays have specified sharding.
+            model_arr = jax.tree.map(unspecified_sharding_fn, model_arr)
+            opt_state = jax.tree.map(unspecified_sharding_fn, opt_state)
+            state = jax.tree.map(unspecified_sharding_fn, state)
+
         # Create JIT-compiled train step
         light_train_step_fn = self.create_train_step_fn(model_static, optimizer, False)
         heavy_train_step_fn = self.create_train_step_fn(model_static, optimizer, True)
@@ -320,31 +334,6 @@ class SupervisedMixin(
                     step_key,
                 )
 
-                # Handle arrays with unspecified sharding from multi-GPU JIT
-                # by extracting data from addressable shards and replicating across mesh
-                mesh = jax.sharding.get_mesh()
-                if mesh is not None and mesh.devices.size > 1:
-                    replicated_sharding = NamedSharding(mesh, PartitionSpec())
-
-                    def _fix_unspecified_sharding(
-                        arr: Array,
-                        sharding: NamedSharding = replicated_sharding,
-                    ) -> Array:
-                        if hasattr(arr, "sharding") and not hasattr(arr.sharding, "is_fully_replicated"):
-                            # Array has unspecified sharding - get data from first shard
-                            if hasattr(arr, "addressable_shards") and arr.addressable_shards:
-                                data = np.asarray(arr.addressable_shards[0].data)
-                                return jax.device_put(data, sharding)
-                        return arr
-
-                    # Fix model_arr and opt_state so they can be passed back into JIT
-                    model_arr = jax.tree.map(_fix_unspecified_sharding, model_arr)
-                    opt_state = jax.tree.map(_fix_unspecified_sharding, opt_state)
-
-                    state = State(
-                        _int32_arr=_fix_unspecified_sharding(state._int32_arr),
-                        _float32_arr=_fix_unspecified_sharding(state._float32_arr),
-                    )
                 self.log_step(FrozenDict(metrics), state, heavy)
                 self.on_step_end()
 

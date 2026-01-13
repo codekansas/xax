@@ -29,7 +29,7 @@ class Config(xax.SupervisedConfig):
 
     # LoRA settings
     lora_rank: int = xax.field(16, help="Rank of LoRA decomposition")
-    lora_alpha: float = xax.field(32.0, help="LoRA scaling factor")
+    lora_alpha: float = xax.field(1.0, help="LoRA scaling factor (1.0 = no amplification)")
     lora_dropout: float = xax.field(0.0, help="Dropout rate for LoRA layers")
     lora_targets: tuple[str, ...] | None = xax.field(
         ("q_proj", "v_proj"),
@@ -78,7 +78,7 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
         return xax.loraize_by_path(
             model,
             rank=self.config.lora_rank,
-            include_patterns=list(self.config.lora_targets) if self.config.lora_targets else None,
+            include_suffixes=list(self.config.lora_targets) if self.config.lora_targets else None,
             alpha=self.config.lora_alpha,
             dropout_rate=self.config.lora_dropout,
             key=params.key,
@@ -134,7 +134,7 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
         mask_bt = batch["attention_mask"][:, 1:] == 1
         loss_bt = optax.softmax_cross_entropy_with_integer_labels(logits=output, labels=targets_bt)
         masked_loss = jnp.where(mask_bt, loss_bt, 0.0)
-        loss = masked_loss.sum() / mask_bt.sum()
+        loss = masked_loss.sum() / (mask_bt.sum() + 1e-8)
         return loss
 
     def compute_metrics(
@@ -208,6 +208,7 @@ if __name__ == "__main__":
     ShakespeareLora.launch(
         Config(
             batch_size=64,
+            max_grad_norm=1.0,
             gradient_accumulation_steps=1,
             log_heavy_every_n_seconds=120,
             max_steps=50_000,
