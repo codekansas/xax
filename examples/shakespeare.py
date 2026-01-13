@@ -43,6 +43,7 @@ class Config(xax.SupervisedConfig):
     warmup_steps: int = xax.field(100, help="Number of warmup steps")
     sequence_length: int = xax.field(1025, help="Maximum sequence length (N - 1 should be a multiple of 64 for cuDNN)")
     use_gradient_checkpointing: bool = xax.field(True, help="Recompute activations to save memory")
+    eval_prompt: str = xax.field("To be or not to be", help="Prompt to use for evaluation")
 
 
 class ShakespeareLora(xax.SupervisedTask[Config]):
@@ -52,9 +53,11 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
         self.tokenizer: Qwen2TokenizerFast = AutoTokenizer.from_pretrained(config.model_repo)
 
         # Pre-encode the generation prompt for use in compute_metrics
-        prompt = "To be or not to be"
         self._generation_prompt_tokens = jnp.array(
-            self.tokenizer.encode(prompt, add_special_tokens=False),
+            self.tokenizer.encode(
+                self.config.eval_prompt,
+                add_special_tokens=False,
+            ),
             dtype=jnp.int32,
         )
 
@@ -214,7 +217,7 @@ if __name__ == "__main__":
         Config(
             batch_size=16,
             max_grad_norm=1.0,
-            gradient_accumulation_steps=4,
+            gradient_accumulation_steps=1,
             log_heavy_every_n_seconds=120,
             max_steps=50_000,
         ),
