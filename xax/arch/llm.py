@@ -1,16 +1,4 @@
-"""Lightweight JAX LLM reference implementations (Qwen3, LLaMA, TinyLLaMA).
-
-These models are adapted from the `jax-ml/jax-llm-examples` reference
-implementations but simplified to match the `xax` style and dependency set.
-
-Key differences:
-
-* Uses Equinox modules and standard JAX primitives (no Pallas kernels).
-* Keeps grouped-query attention (separate q_heads/kv_heads) and rotary
-  embeddings to stay architecturally faithful while remaining lightweight.
-* Provides small default configs for CPU tests; full-size configs can be added
-  by users when loading real checkpoints.
-"""
+"""Lightweight JAX LLM reference implementations."""
 
 import functools
 import json
@@ -209,7 +197,7 @@ class MultiHeadAttention(eqx.Module):
             v_bthd,
             bias=bias,
             is_causal=True,
-            scale=1.0 / (self.head_dim ** 0.5),
+            scale=1.0 / (self.head_dim**0.5),
             local_window_size=(self.sliding_window_size, 0) if self.sliding_window_size else None,
             implementation=implementation,
         )
@@ -383,11 +371,6 @@ class LLM(eqx.Module):
         x_btd = self.forward_hidden(tokens_bt, key=key, inference=inference)
         logits_btv = _linear(x_btd, self.lm_head)
         return logits_btv
-
-
-# --------------------------------------------------------------------------- #
-# Default Configs                                                              #
-# --------------------------------------------------------------------------- #
 
 
 def build_qwen3_model(config: LLMConfig, *, key: jax.Array | None = None) -> LLM:
@@ -1004,7 +987,7 @@ def llm_generate(
         jax.random.key(0),
     )
     # Trim to actual generated length (excluding padding after EOS)
-    return tokens_arr[:int(final_len)].tolist()
+    return tokens_arr[: int(final_len)].tolist()
 
 
 def llm_generate_jit(
@@ -1086,11 +1069,6 @@ def llm_generate_jit(
 
     # Return tokens and the final valid length
     return final_tokens, final_pos
-
-
-# --------------------------------------------------------------------------- #
-# CLI Main                                                                     #
-# --------------------------------------------------------------------------- #
 
 
 def main() -> None:

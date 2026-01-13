@@ -41,7 +41,7 @@ class Config(xax.SupervisedConfig):
     learning_rate: float = xax.field(1e-4, help="Peak learning rate")
     min_learning_rate: float = xax.field(1e-5, help="Minimum learning rate for cosine decay")
     warmup_steps: int = xax.field(100, help="Number of warmup steps")
-    sequence_length: int = xax.field(513, help="Maximum sequence length (N - 1 should be a multiple of 64 for cuDNN)")
+    sequence_length: int = xax.field(1025, help="Maximum sequence length (N - 1 should be a multiple of 64 for cuDNN)")
     use_gradient_checkpointing: bool = xax.field(True, help="Recompute activations to save memory")
 
 
