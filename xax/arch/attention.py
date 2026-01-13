@@ -1,10 +1,15 @@
 """Attention mechanisms for transformer models.
 
-This module implements standard attention mechanisms for transformers, but
-supporting a fixed-size context window and caching that can be used to train
-transformers which can be unrolled with a fixed-length cache.
+This module implements standard attention mechanisms for transformers, supporting:
+- Self-attention and cross-attention
+- Grouped Query Attention (GQA) for efficient KV caching
+- Rotary Position Embeddings (RoPE) with YaRN extension
+- Sliding window attention
+- FP8 quantization for matrix multiplications
+- cuDNN flash attention acceleration
 
-Supports optional FP8 quantization for matrix multiplications when use_fp8=True.
+These are general-purpose building blocks that can be used for training
+transformers from scratch or fine-tuning pre-trained models (with LoRA, etc).
 """
 
 import math
@@ -18,7 +23,155 @@ import jax.numpy as jnp
 from jaxtyping import Array, PRNGKeyArray
 
 from xax.nn.fp8 import Fp8Linear, Fp8Scales, init_fp8_scales
+from xax.nn.lora import LoRALinear
 from xax.utils.jax import scan as xax_scan
+
+
+def apply_linear(x: Array, linear: eqx.nn.Linear | Fp8Linear | LoRALinear) -> Array:
+    """Apply linear layer with LoRA support.
+
+    This function applies a linear transformation using einsum for better performance.
+    It supports standard eqx.nn.Linear, Fp8Linear, and LoRALinear layers, enabling LoRA
+    fine-tuning without changing the calling code.
+
+    Args:
+        x: Input tensor of shape (..., in_features)
+        linear: Linear layer (eqx.nn.Linear, Fp8Linear, or LoRALinear)
+
+    Returns:
+        Output tensor of shape (..., out_features)
+    """
+    if isinstance(linear, LoRALinear):
+        # LoRALinear: use weight_oi and bias_o, plus LoRA delta
+        y = jnp.einsum("...d,od->...o", x, linear.weight_oi)
+        if linear.bias_o is not None:
+            y = y + linear.bias_o
+        # Add LoRA contribution: (x @ A) @ B * alpha
+        delta = (x @ linear.lora_a_ir) @ linear.lora_b_ro * linear.alpha
+        return y + delta
+    elif isinstance(linear, Fp8Linear):
+        # For Fp8Linear, call it directly (it handles FP8 internally)
+        # This simplified path doesn't track scales - use forward() for that
+        y = linear(x)
+        if isinstance(y, tuple):
+            return y[0]
+        return y
+    else:
+        # Standard eqx.nn.Linear
+        y = jnp.einsum("...d,od->...o", x, linear.weight)
+        if linear.bias is not None:
+            y = y + linear.bias
+        return y
+
+
+class RMSNorm(eqx.Module):
+    """RMSNorm over the last dimension (no bias), matching LLaMA/Qwen style.
+
+    RMS normalization is more efficient than LayerNorm and works well for LLMs.
+    It normalizes by the root mean square without centering (no mean subtraction).
+    """
+
+    weight: Array
+    eps: float = eqx.field(static=True, default=1e-6)
+
+    @classmethod
+    def build(cls, dim: int, eps: float = 1e-6) -> "RMSNorm":
+        """Build RMSNorm from parameters.
+
+        Args:
+            dim: Dimension of the input
+            eps: Small constant for numerical stability
+
+        Returns:
+            RMSNorm instance
+        """
+        weight = jnp.ones((dim,), dtype=jnp.float32)
+        return cls(weight=weight, eps=eps)
+
+    def __call__(self, x: Array) -> Array:
+        norm = jnp.sqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + self.eps)
+        return (x / norm) * self.weight
+
+
+class SwiGLU(eqx.Module):
+    """SwiGLU feed-forward layer (LLaMA/Qwen style).
+
+    Uses gated linear unit with SiLU activation:
+        output = down(silu(gate(x)) * up(x))
+
+    This is more expressive than standard FFN and commonly used in modern LLMs.
+    """
+
+    gate: eqx.nn.Linear
+    up: eqx.nn.Linear
+    down: eqx.nn.Linear
+
+    @classmethod
+    def build(
+        cls,
+        embed_dim: int,
+        hidden_dim: int | None = None,
+        *,
+        key: PRNGKeyArray,
+        use_bias: bool = False,
+    ) -> "SwiGLU":
+        """Build SwiGLU feed-forward layer from parameters.
+
+        Args:
+            embed_dim: Input/output embedding dimension
+            hidden_dim: Hidden dimension (defaults to 4 * embed_dim)
+            key: PRNG key for initialization
+            use_bias: Whether to use bias in linear layers
+
+        Returns:
+            SwiGLU instance
+        """
+        if hidden_dim is None:
+            hidden_dim = embed_dim * 4
+
+        k1, k2, k3 = jax.random.split(key, 3)
+        gate = eqx.nn.Linear(embed_dim, hidden_dim, use_bias=use_bias, key=k1)
+        up = eqx.nn.Linear(embed_dim, hidden_dim, use_bias=use_bias, key=k2)
+        down = eqx.nn.Linear(hidden_dim, embed_dim, use_bias=use_bias, key=k3)
+        return cls(gate=gate, up=up, down=down)
+
+    def __call__(self, x: Array) -> Array:
+        chex.assert_rank(x, {2, 3})
+        # Use apply_linear for LoRA support
+        hidden = jax.nn.silu(apply_linear(x, self.gate)) * apply_linear(x, self.up)
+        return apply_linear(hidden, self.down)
+
+
+def can_use_cudnn_attention(
+    dtype: jnp.dtype,
+    head_dim: int,
+    seq_len: int,
+    has_bias: bool = False,
+) -> bool:
+    """Check if cuDNN flash attention can be used.
+
+    cuDNN flash attention requirements:
+    - dtype: fp16, bf16, or fp8
+    - head_dim: <= 128 and multiple of 8
+    - sequence length: multiple of 64
+    - no custom attention bias (masks are OK)
+
+    Args:
+        dtype: Data type of Q/K/V tensors
+        head_dim: Dimension per attention head
+        seq_len: Sequence length
+        has_bias: Whether custom attention bias is used
+
+    Returns:
+        True if cuDNN can be used, False otherwise
+    """
+    return (
+        dtype in (jnp.float16, jnp.bfloat16)
+        and head_dim <= 128
+        and head_dim % 8 == 0
+        and seq_len % 64 == 0
+        and not has_bias
+    )
 
 
 class AttentionCache(TypedDict):
@@ -55,6 +208,7 @@ def _make_linear(
     in_features: int,
     out_features: int,
     key: PRNGKeyArray,
+    use_bias: bool = True,
     use_fp8: bool = False,
     compute_dtype: jnp.dtype = jnp.bfloat16,
 ) -> eqx.nn.Linear | Fp8Linear:
@@ -64,6 +218,7 @@ def _make_linear(
         in_features: Number of input features
         out_features: Number of output features
         key: PRNG key for initialization
+        use_bias: Whether to include a bias term
         use_fp8: Whether to use FP8 quantization
         compute_dtype: Compute dtype for FP8 mode
 
@@ -78,7 +233,7 @@ def _make_linear(
             use_fp8=True,
             compute_dtype=compute_dtype,
         )
-    return eqx.nn.Linear(in_features, out_features, key=key)
+    return eqx.nn.Linear(in_features, out_features, use_bias=use_bias, key=key)
 
 
 def _apply_linear_batched(
@@ -163,17 +318,18 @@ class RotaryEmbedding(eqx.Module):
     - "interleaved": Used by GPT-NeoX. Uses even/odd indices.
     """
 
-    head_dim: int = eqx.field()
-    base: float = eqx.field()
-    style: RotaryEmbeddingStyle = eqx.field(static=True)
+    head_dim: int = eqx.field(static=True)
+    base: float = eqx.field(static=True, default=10000.0)
+    style: RotaryEmbeddingStyle = eqx.field(static=True, default="interleaved")
     # YaRN parameters
-    factor: float = eqx.field()
-    original_max_position_embeddings: int | None = eqx.field()
-    beta_slow: float = eqx.field()
-    beta_fast: float = eqx.field()
+    factor: float = eqx.field(static=True, default=1.0)
+    original_max_position_embeddings: int | None = eqx.field(static=True, default=None)
+    beta_slow: float = eqx.field(static=True, default=1.0)
+    beta_fast: float = eqx.field(static=True, default=32.0)
 
-    def __init__(
-        self,
+    @classmethod
+    def build(
+        cls,
         head_dim: int,
         base: float = 10000.0,
         style: RotaryEmbeddingStyle = "interleaved",
@@ -181,8 +337,8 @@ class RotaryEmbedding(eqx.Module):
         original_max_position_embeddings: int | None = None,
         beta_slow: float = 1.0,
         beta_fast: float = 32.0,
-    ) -> None:
-        """Initialize rotary embedding.
+    ) -> "RotaryEmbedding":
+        """Build rotary embedding from parameters.
 
         Args:
             head_dim: Dimension of each attention head
@@ -192,14 +348,19 @@ class RotaryEmbedding(eqx.Module):
             original_max_position_embeddings: Original context length for YaRN
             beta_slow: YaRN slow dimension weight
             beta_fast: YaRN fast dimension weight
+
+        Returns:
+            RotaryEmbedding instance
         """
-        self.head_dim = head_dim
-        self.base = base
-        self.style = style
-        self.factor = factor
-        self.original_max_position_embeddings = original_max_position_embeddings
-        self.beta_slow = beta_slow
-        self.beta_fast = beta_fast
+        return cls(
+            head_dim=head_dim,
+            base=base,
+            style=style,
+            factor=factor,
+            original_max_position_embeddings=original_max_position_embeddings,
+            beta_slow=beta_slow,
+            beta_fast=beta_fast,
+        )
 
     @property
     def uses_yarn(self) -> bool:
@@ -361,76 +522,250 @@ class RotaryEmbedding(eqx.Module):
 
 
 class SelfAttentionBlock(eqx.Module):
-    """Self-attention block using jax.nn.dot_product_attention."""
+    """Self-attention block with Grouped Query Attention (GQA) support.
 
-    q_proj: eqx.nn.Linear | Fp8Linear = eqx.field()
-    k_proj: eqx.nn.Linear | Fp8Linear = eqx.field()
-    v_proj: eqx.nn.Linear | Fp8Linear = eqx.field()
-    output_proj: eqx.nn.Linear | Fp8Linear = eqx.field()
-    rotary_emb: RotaryEmbedding | None = eqx.field()
+    Supports:
+    - Standard multi-head attention (num_kv_heads == num_heads)
+    - Grouped Query Attention (num_kv_heads < num_heads) for efficient KV caching
+    - Rotary Position Embeddings (RoPE) with YaRN extension
+    - QK-Norm (Qwen3 style) for training stability
+    - Sliding window attention
+    - Attention sinks for improved generation quality
+    - cuDNN flash attention acceleration (when conditions are met)
+    - FP8 quantization
+    - LoRA support via apply_linear helper
+    """
+
+    q_proj: eqx.nn.Linear | Fp8Linear
+    k_proj: eqx.nn.Linear | Fp8Linear
+    v_proj: eqx.nn.Linear | Fp8Linear
+    output_proj: eqx.nn.Linear | Fp8Linear
+    rotary_emb: RotaryEmbedding | None
+    q_norm: RMSNorm | None
+    k_norm: RMSNorm | None
+    sinks: Array | None
     num_heads: int = eqx.field(static=True)
+    num_kv_heads: int = eqx.field(static=True)
     head_dim: int = eqx.field(static=True)
     causal: bool = eqx.field(static=True)
     local_window_size: int | None = eqx.field(static=True)
     use_fp8: bool = eqx.field(static=True)
 
-    def __init__(
-        self,
+    @classmethod
+    def build(
+        cls,
         embed_dim: int,
         num_heads: int,
         *,
         key: PRNGKeyArray,
+        num_kv_heads: int | None = None,
+        head_dim: int | None = None,
+        use_bias: bool = True,
         causal: bool = False,
         context_length: int | None = None,
         use_rotary_embeddings: bool = False,
         rotary_base: float = 10000.0,
+        rotary_style: RotaryEmbeddingStyle = "concatenated",
+        rotary_factor: float = 1.0,
+        rotary_original_max_position_embeddings: int | None = None,
+        rotary_beta_slow: float = 1.0,
+        rotary_beta_fast: float = 32.0,
+        use_qk_norm: bool = False,
+        qk_norm_eps: float = 1e-6,
+        use_attention_sinks: bool = False,
         use_fp8: bool = False,
         compute_dtype: jnp.dtype = jnp.bfloat16,
-    ) -> None:
+    ) -> "SelfAttentionBlock":
+        """Build a self-attention block from configuration parameters.
+
+        Args:
+            embed_dim: Model embedding dimension
+            num_heads: Number of query attention heads
+            key: PRNG key for initialization
+            num_kv_heads: Number of key/value heads for GQA (defaults to num_heads)
+            head_dim: Dimension per head (defaults to embed_dim // num_heads)
+            use_bias: Whether to include bias in projection layers
+            causal: Whether to use causal masking
+            context_length: Sliding window size (None = full attention)
+            use_rotary_embeddings: Whether to use RoPE
+            rotary_base: RoPE theta base frequency
+            rotary_style: RoPE style ("concatenated" for LLaMA/Qwen, "interleaved" for GPT-NeoX)
+            rotary_factor: YaRN scaling factor (1.0 = no scaling)
+            rotary_original_max_position_embeddings: Original context length for YaRN
+            rotary_beta_slow: YaRN slow dimension weight
+            rotary_beta_fast: YaRN fast dimension weight
+            use_qk_norm: Whether to apply QK-Norm (Qwen3 style)
+            qk_norm_eps: Epsilon for QK-Norm RMSNorm
+            use_attention_sinks: Whether to use learnable attention sinks
+            use_fp8: Whether to use FP8 quantization
+            compute_dtype: Compute dtype for FP8 mode
+
+        Returns:
+            A new SelfAttentionBlock instance
+        """
         if context_length is not None:
             assert context_length > 1, "context_length must be at least 2"
 
         keys = jax.random.split(key, 4)
 
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        self.use_fp8 = use_fp8
-        assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
+        actual_num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        actual_head_dim = head_dim if head_dim is not None else embed_dim // num_heads
 
-        self.q_proj = _make_linear(embed_dim, embed_dim, keys[0], use_fp8, compute_dtype)
-        self.k_proj = _make_linear(embed_dim, embed_dim, keys[1], use_fp8, compute_dtype)
-        self.v_proj = _make_linear(embed_dim, embed_dim, keys[2], use_fp8, compute_dtype)
-        self.output_proj = _make_linear(embed_dim, embed_dim, keys[3], use_fp8, compute_dtype)
+        # GQA: num_heads must be divisible by num_kv_heads
+        assert num_heads % actual_num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
+
+        q_dim = num_heads * actual_head_dim
+        kv_dim = actual_num_kv_heads * actual_head_dim
+
+        q_proj = _make_linear(embed_dim, q_dim, keys[0], use_bias, use_fp8, compute_dtype)
+        k_proj = _make_linear(embed_dim, kv_dim, keys[1], use_bias, use_fp8, compute_dtype)
+        v_proj = _make_linear(embed_dim, kv_dim, keys[2], use_bias, use_fp8, compute_dtype)
+        output_proj = _make_linear(q_dim, embed_dim, keys[3], use_bias, use_fp8, compute_dtype)
 
         # Initialize rotary embeddings if requested
         if use_rotary_embeddings:
-            self.rotary_emb = RotaryEmbedding(
-                head_dim=self.head_dim,
+            rotary_emb = RotaryEmbedding.build(
+                head_dim=actual_head_dim,
                 base=rotary_base,
+                style=rotary_style,
+                factor=rotary_factor,
+                original_max_position_embeddings=rotary_original_max_position_embeddings,
+                beta_slow=rotary_beta_slow,
+                beta_fast=rotary_beta_fast,
             )
         else:
-            self.rotary_emb = None
+            rotary_emb = None
+
+        # QK-Norm (Qwen3 style)
+        if use_qk_norm:
+            q_norm = RMSNorm.build(actual_head_dim, eps=qk_norm_eps)
+            k_norm = RMSNorm.build(actual_head_dim, eps=qk_norm_eps)
+        else:
+            q_norm = None
+            k_norm = None
+
+        # Attention sinks for softmax stability
+        if use_attention_sinks:
+            sinks = jnp.zeros((num_heads,), dtype=jnp.float32)
+        else:
+            sinks = None
 
         if context_length is not None and not causal:
             warnings.warn("context_length is set but causal is False; overriding causal to True", stacklevel=2)
             causal = True
 
-        self.causal = causal
-        self.local_window_size = None if context_length is None else context_length - 1
+        local_window_size = None if context_length is None else context_length - 1
+
+        return cls(
+            q_proj=q_proj,
+            k_proj=k_proj,
+            v_proj=v_proj,
+            output_proj=output_proj,
+            rotary_emb=rotary_emb,
+            q_norm=q_norm,
+            k_norm=k_norm,
+            sinks=sinks,
+            num_heads=num_heads,
+            num_kv_heads=actual_num_kv_heads,
+            head_dim=actual_head_dim,
+            causal=causal,
+            local_window_size=local_window_size,
+            use_fp8=use_fp8,
+        )
 
     @property
     def embed_dim(self) -> int:
         return self.head_dim * self.num_heads
 
-    def _reshape_for_multihead(self, x: Array) -> Array:
-        """Reshape from (seq_len, embed_dim) to (seq_len, num_heads, head_dim)."""
+    def _reshape_q(self, x: Array) -> Array:
+        """Reshape Q from (seq_len, q_dim) to (seq_len, num_heads, head_dim)."""
         seq_len, _ = x.shape
         return x.reshape(seq_len, self.num_heads, self.head_dim)
 
+    def _reshape_kv(self, x: Array) -> Array:
+        """Reshape K/V from (seq_len, kv_dim) to (seq_len, num_kv_heads, head_dim)."""
+        seq_len, _ = x.shape
+        return x.reshape(seq_len, self.num_kv_heads, self.head_dim)
+
     def _combine_heads(self, x: Array) -> Array:
-        """Reshape from (seq_len, num_heads, head_dim) to (seq_len, embed_dim)."""
-        _, n, h = x.shape
-        return x.reshape(-1, n * h)
+        """Reshape from (seq_len, num_heads, head_dim) to (seq_len, q_dim)."""
+        seq_len, _, _ = x.shape
+        return x.reshape(seq_len, -1)
+
+    def __call__(
+        self,
+        x_btd: Array,
+        positions_bt: Array | None = None,
+        *,
+        key: jax.Array | None = None,
+        inference: bool = True,
+    ) -> Array:
+        """Apply self-attention with batched input (for LLM training/inference).
+
+        This is a simplified interface for the common case of batched input
+        without FP8 or caching. For caching/FP8, use the `forward` method.
+
+        Args:
+            x_btd: Input tensor of shape (batch, seq_len, embed_dim)
+            positions_bt: Position indices for RoPE, shape (batch, seq_len).
+                If None, uses sequential positions starting from 0.
+            key: PRNG key (unused, for API compatibility)
+            inference: Whether in inference mode (unused, for API compatibility)
+
+        Returns:
+            Output tensor of shape (batch, seq_len, embed_dim)
+        """
+        chex.assert_rank(x_btd, 3)
+        bsz, tsz, _ = x_btd.shape
+
+        if positions_bt is None:
+            positions_bt = jnp.broadcast_to(jnp.arange(tsz)[None, :], (bsz, tsz))
+
+        # Project to Q, K, V using apply_linear for LoRA support
+        q_bthd = apply_linear(x_btd, self.q_proj).reshape(bsz, tsz, self.num_heads, self.head_dim)
+        k_bthd = apply_linear(x_btd, self.k_proj).reshape(bsz, tsz, self.num_kv_heads, self.head_dim)
+        v_bthd = apply_linear(x_btd, self.v_proj).reshape(bsz, tsz, self.num_kv_heads, self.head_dim)
+
+        # Apply QK-Norm before RoPE (Qwen3 style)
+        if self.q_norm is not None:
+            q_bthd = self.q_norm(q_bthd)
+        if self.k_norm is not None:
+            k_bthd = self.k_norm(k_bthd)
+
+        # Apply rotary embeddings
+        if self.rotary_emb is not None:
+            q_bthd = self.rotary_emb.apply_rotary_embeddings(q_bthd, positions=positions_bt)
+            k_bthd = self.rotary_emb.apply_rotary_embeddings(k_bthd, positions=positions_bt)
+
+        # Handle attention sinks via bias
+        bias = None
+        if self.sinks is not None:
+            bias = self.sinks[None, None, :, None]
+
+        # Check if cuDNN flash attention can be used
+        use_cudnn = can_use_cudnn_attention(
+            dtype=q_bthd.dtype,
+            head_dim=self.head_dim,
+            seq_len=tsz,
+            has_bias=bias is not None,
+        )
+        implementation = "cudnn" if use_cudnn else None
+
+        # Apply attention
+        ctx_bthd = jax.nn.dot_product_attention(
+            q_bthd,
+            k_bthd,
+            v_bthd,
+            bias=bias,
+            is_causal=self.causal,
+            scale=1.0 / (self.head_dim**0.5),
+            local_window_size=(self.local_window_size, 0) if self.local_window_size else None,
+            implementation=implementation,
+        )
+
+        # Combine heads and project output
+        ctx_btd = ctx_bthd.reshape(bsz, tsz, self.num_heads * self.head_dim)
+        return apply_linear(ctx_btd, self.output_proj)
 
     def init_cache(self, dtype: jnp.dtype | None = None) -> AttentionCache:
         """Initialize cache for the input.
@@ -444,9 +779,9 @@ class SelfAttentionBlock(eqx.Module):
         if self.local_window_size is None:
             raise ValueError("context_length must be set for caching")
 
-        # Create fixed-length cache
-        k_cache = jnp.zeros((self.local_window_size, self.num_heads, self.head_dim), dtype=dtype)
-        v_cache = jnp.zeros((self.local_window_size, self.num_heads, self.head_dim), dtype=dtype)
+        # Create fixed-length cache (uses num_kv_heads for GQA efficiency)
+        k_cache = jnp.zeros((self.local_window_size, self.num_kv_heads, self.head_dim), dtype=dtype)
+        v_cache = jnp.zeros((self.local_window_size, self.num_kv_heads, self.head_dim), dtype=dtype)
 
         return {"k": k_cache, "v": v_cache, "position": 0}
 
@@ -488,7 +823,7 @@ class SelfAttentionBlock(eqx.Module):
         cache: AttentionCache | None = None,
         fp8_scales: Fp8ScalesCache | None = None,
     ) -> tuple[Array, AttentionCache, Fp8ScalesCache | None]:
-        """Apply self-attention.
+        """Apply self-attention with optional GQA and cuDNN acceleration.
 
         Args:
             x_tn: Input tensor of shape (seq_len, embed_dim)
@@ -512,10 +847,16 @@ class SelfAttentionBlock(eqx.Module):
         k, new_k_scales = _apply_linear_batched(self.k_proj, x_tn, k_scales)
         v, new_v_scales = _apply_linear_batched(self.v_proj, x_tn, v_scales)
 
-        # Reshape to multihead format
-        q = self._reshape_for_multihead(q)
-        k = self._reshape_for_multihead(k)
-        v = self._reshape_for_multihead(v)
+        # Reshape to multihead format (Q has num_heads, K/V have num_kv_heads)
+        q = self._reshape_q(q)
+        k = self._reshape_kv(k)
+        v = self._reshape_kv(v)
+
+        # Apply QK-Norm before RoPE (Qwen3 style)
+        if self.q_norm is not None:
+            q = self.q_norm(q)
+        if self.k_norm is not None:
+            k = self.k_norm(k)
 
         seq_len = q.shape[0]
         if self.rotary_emb is not None:
@@ -539,11 +880,25 @@ class SelfAttentionBlock(eqx.Module):
         else:
             new_position = seq_len
 
+        # Handle attention sinks via bias
+        bias = None
+        if self.sinks is not None:
+            bias = self.sinks[None, :, None]  # (1, num_heads, 1) for unbatched
+
+        # Check if cuDNN can be used
+        use_cudnn = can_use_cudnn_attention(
+            dtype=q.dtype,
+            head_dim=self.head_dim,
+            seq_len=seq_len,
+            has_bias=bias is not None,
+        )
+        implementation = "cudnn" if use_cudnn else None
+
         if seq_len == 1:
-            attn_output = jax.nn.dot_product_attention(q, k, v)
+            attn_output = jax.nn.dot_product_attention(q, k, v, bias=bias, implementation=implementation)
 
         elif mask is not None:
-            attn_output = jax.nn.dot_product_attention(q, k, v, mask=mask)
+            attn_output = jax.nn.dot_product_attention(q, k, v, mask=mask, bias=bias, implementation=implementation)
 
         elif cache is not None:
             raise NotImplementedError("For training with a cache, provide a mask instead.")
@@ -553,8 +908,10 @@ class SelfAttentionBlock(eqx.Module):
                 q,
                 k,
                 v,
+                bias=bias,
                 is_causal=self.causal,
                 local_window_size=(self.local_window_size, 0) if self.local_window_size is not None else None,
+                implementation=implementation,
             )
 
         attn_output = self._combine_heads(attn_output)
@@ -588,13 +945,14 @@ class CrossAttentionBlock(eqx.Module):
     k_proj: eqx.nn.Linear | Fp8Linear
     v_proj: eqx.nn.Linear | Fp8Linear
     output_proj: eqx.nn.Linear | Fp8Linear
-    rotary_emb: RotaryEmbedding | None
     num_heads: int = eqx.field(static=True)
     head_dim: int = eqx.field(static=True)
     use_fp8: bool = eqx.field(static=True)
+    rotary_emb: RotaryEmbedding | None = eqx.field(default=None)
 
-    def __init__(
-        self,
+    @classmethod
+    def build(
+        cls,
         embed_dim: int,
         num_heads: int,
         *,
@@ -603,27 +961,46 @@ class CrossAttentionBlock(eqx.Module):
         rotary_base: float = 10000.0,
         use_fp8: bool = False,
         compute_dtype: jnp.dtype = jnp.bfloat16,
-    ) -> None:
+    ) -> "CrossAttentionBlock":
+        """Build cross-attention block from parameters.
+
+        Args:
+            embed_dim: Embedding dimension
+            num_heads: Number of attention heads
+            key: PRNG key for initialization
+            use_rotary_embeddings: Whether to use rotary position embeddings
+            rotary_base: Base for rotary position embeddings
+            use_fp8: Whether to use FP8 quantization
+            compute_dtype: Data type for computation
+
+        Returns:
+            CrossAttentionBlock instance
+        """
         keys = jax.random.split(key, 4)
 
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        self.use_fp8 = use_fp8
-        assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
+        head_dim = embed_dim // num_heads
+        assert head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
 
-        self.q_proj = _make_linear(embed_dim, embed_dim, keys[0], use_fp8, compute_dtype)
-        self.k_proj = _make_linear(embed_dim, embed_dim, keys[1], use_fp8, compute_dtype)
-        self.v_proj = _make_linear(embed_dim, embed_dim, keys[2], use_fp8, compute_dtype)
-        self.output_proj = _make_linear(embed_dim, embed_dim, keys[3], use_fp8, compute_dtype)
+        q_proj = _make_linear(embed_dim, embed_dim, keys[0], use_fp8=use_fp8, compute_dtype=compute_dtype)
+        k_proj = _make_linear(embed_dim, embed_dim, keys[1], use_fp8=use_fp8, compute_dtype=compute_dtype)
+        v_proj = _make_linear(embed_dim, embed_dim, keys[2], use_fp8=use_fp8, compute_dtype=compute_dtype)
+        output_proj = _make_linear(embed_dim, embed_dim, keys[3], use_fp8=use_fp8, compute_dtype=compute_dtype)
 
         # Initialize rotary embeddings if requested
+        rotary_emb: RotaryEmbedding | None = None
         if use_rotary_embeddings:
-            self.rotary_emb = RotaryEmbedding(
-                head_dim=self.head_dim,
-                base=rotary_base,
-            )
-        else:
-            self.rotary_emb = None
+            rotary_emb = RotaryEmbedding.build(head_dim=head_dim, base=rotary_base)
+
+        return cls(
+            q_proj=q_proj,
+            k_proj=k_proj,
+            v_proj=v_proj,
+            output_proj=output_proj,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            use_fp8=use_fp8,
+            rotary_emb=rotary_emb,
+        )
 
     def _reshape_for_multihead(self, x: Array) -> Array:
         """Reshape from (seq_len, embed_dim) to (seq_len, num_heads, head_dim)."""
@@ -767,52 +1144,128 @@ class CrossAttentionBlock(eqx.Module):
         return output, {"k": k, "v": v, "position": q_position + q_seq_len}, updated_fp8_scales
 
 
+NormLayer = eqx.nn.LayerNorm | RMSNorm
+FeedForwardLayer = eqx.nn.MLP | SwiGLU
+NormType = Literal["layernorm", "rmsnorm"]
+FeedForwardType = Literal["mlp", "swiglu"]
+
+
 class TransformerBlock(eqx.Module):
-    self_attn: SelfAttentionBlock
-    cross_attn: CrossAttentionBlock | None
-    feed_forward: eqx.nn.MLP
-    layer_norm1: eqx.nn.LayerNorm
-    layer_norm2: eqx.nn.LayerNorm
-    layer_norm3: eqx.nn.LayerNorm | None
+    """Transformer block supporting both standard and LLM configurations.
+
+    This block supports:
+    - Pre-norm architecture with LayerNorm or RMSNorm
+    - MLP or SwiGLU feed-forward networks
+    - Self-attention with GQA, RoPE, QK-Norm, sliding window, attention sinks
+    - Optional cross-attention
+    - FP8 quantization
+    - LoRA fine-tuning (via apply_linear in underlying modules)
+
+    Can be constructed either:
+    - Directly with pre-built components: TransformerBlock(self_attn=..., feed_forward=..., ...)
+    - From configuration parameters: TransformerBlock.build(embed_dim=..., num_heads=..., ...)
+    """
+
+    self_attn: SelfAttentionBlock = eqx.field()
+    feed_forward: FeedForwardLayer = eqx.field()
+    attn_norm: NormLayer = eqx.field()
+    mlp_norm: NormLayer = eqx.field()
     num_heads: int = eqx.field(static=True)
     head_dim: int = eqx.field(static=True)
     causal: bool = eqx.field(static=True)
-    context_length: int | None = eqx.field(static=True)
     use_fp8: bool = eqx.field(static=True)
+    cross_attn: CrossAttentionBlock | None = eqx.field(default=None)
+    cross_attn_norm: NormLayer | None = eqx.field(default=None)
+    context_length: int | None = eqx.field(static=True, default=None)
 
-    def __init__(
-        self,
+    @classmethod
+    def build(
+        cls,
         embed_dim: int,
         num_heads: int,
         ff_dim: int,
         *,
         key: PRNGKeyArray,
+        num_kv_heads: int | None = None,
+        head_dim: int | None = None,
         causal: bool = False,
         cross_attention: bool = False,
         context_length: int | None = None,
         use_rotary_embeddings: bool = False,
         rotary_base: float = 10000.0,
+        rotary_style: RotaryEmbeddingStyle = "concatenated",
+        rotary_factor: float = 1.0,
+        rotary_original_max_position_embeddings: int | None = None,
+        rotary_beta_slow: float = 1.0,
+        rotary_beta_fast: float = 32.0,
+        use_qk_norm: bool = False,
+        qk_norm_eps: float = 1e-6,
+        use_attention_sinks: bool = False,
+        norm_type: NormType = "layernorm",
+        norm_eps: float = 1e-6,
+        feedforward_type: FeedForwardType = "mlp",
         use_fp8: bool = False,
         compute_dtype: jnp.dtype = jnp.bfloat16,
-    ) -> None:
+    ) -> "TransformerBlock":
+        """Build a transformer block from configuration parameters.
+
+        Args:
+            embed_dim: Model embedding dimension
+            num_heads: Number of query attention heads
+            ff_dim: Feed-forward hidden dimension
+            key: PRNG key for initialization
+            num_kv_heads: Number of key/value heads for GQA (defaults to num_heads)
+            head_dim: Dimension per head (defaults to embed_dim // num_heads)
+            causal: Whether to use causal masking
+            cross_attention: Whether to include cross-attention
+            context_length: Sliding window size (None = full attention)
+            use_rotary_embeddings: Whether to use RoPE
+            rotary_base: RoPE theta base frequency
+            rotary_style: RoPE style ("concatenated" for LLaMA/Qwen, "interleaved" for GPT-NeoX)
+            rotary_factor: YaRN scaling factor (1.0 = no scaling)
+            rotary_original_max_position_embeddings: Original context length for YaRN
+            rotary_beta_slow: YaRN slow dimension weight
+            rotary_beta_fast: YaRN fast dimension weight
+            use_qk_norm: Whether to apply QK-Norm (Qwen3 style)
+            qk_norm_eps: Epsilon for QK-Norm RMSNorm
+            use_attention_sinks: Whether to use learnable attention sinks
+            norm_type: Normalization type ("layernorm" or "rmsnorm")
+            norm_eps: Epsilon for normalization layers
+            feedforward_type: Feed-forward type ("mlp" or "swiglu")
+            use_fp8: Whether to use FP8 quantization
+            compute_dtype: Compute dtype for FP8 mode
+
+        Returns:
+            A new TransformerBlock instance
+        """
         keys = jax.random.split(key, 3)
 
-        self.use_fp8 = use_fp8
+        actual_head_dim = head_dim if head_dim is not None else embed_dim // num_heads
 
-        self.self_attn = SelfAttentionBlock(
+        self_attn = SelfAttentionBlock.build(
             embed_dim=embed_dim,
             num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
             key=keys[0],
             causal=causal,
             context_length=context_length,
             use_rotary_embeddings=use_rotary_embeddings,
             rotary_base=rotary_base,
+            rotary_style=rotary_style,
+            rotary_factor=rotary_factor,
+            rotary_original_max_position_embeddings=rotary_original_max_position_embeddings,
+            rotary_beta_slow=rotary_beta_slow,
+            rotary_beta_fast=rotary_beta_fast,
+            use_qk_norm=use_qk_norm,
+            qk_norm_eps=qk_norm_eps,
+            use_attention_sinks=use_attention_sinks,
             use_fp8=use_fp8,
             compute_dtype=compute_dtype,
         )
 
         if cross_attention:
-            self.cross_attn = CrossAttentionBlock(
+            cross_attn = CrossAttentionBlock.build(
                 embed_dim=embed_dim,
                 num_heads=num_heads,
                 key=keys[1],
@@ -821,28 +1274,47 @@ class TransformerBlock(eqx.Module):
                 use_fp8=use_fp8,
                 compute_dtype=compute_dtype,
             )
-            self.layer_norm3 = eqx.nn.LayerNorm(embed_dim)
-
+            cross_attn_norm: NormLayer | None = (
+                RMSNorm.build(embed_dim, eps=norm_eps) if norm_type == "rmsnorm" else eqx.nn.LayerNorm(embed_dim)
+            )
         else:
-            self.cross_attn = None
-            self.layer_norm3 = None
+            cross_attn = None
+            cross_attn_norm = None
 
-        self.layer_norm1 = eqx.nn.LayerNorm(embed_dim)
-        self.layer_norm2 = eqx.nn.LayerNorm(embed_dim)
+        # Create normalization layers based on norm_type
+        if norm_type == "rmsnorm":
+            attn_norm: NormLayer = RMSNorm.build(embed_dim, eps=norm_eps)
+            mlp_norm: NormLayer = RMSNorm.build(embed_dim, eps=norm_eps)
+        else:
+            attn_norm = eqx.nn.LayerNorm(embed_dim)
+            mlp_norm = eqx.nn.LayerNorm(embed_dim)
 
-        self.feed_forward = eqx.nn.MLP(
-            in_size=embed_dim,
-            out_size=embed_dim,
-            width_size=ff_dim,
-            depth=1,
-            activation=jax.nn.gelu,
-            key=keys[2],
+        # Create feed-forward layer based on feedforward_type
+        if feedforward_type == "swiglu":
+            feed_forward: FeedForwardLayer = SwiGLU.build(embed_dim, ff_dim, key=keys[2])
+        else:
+            feed_forward = eqx.nn.MLP(
+                in_size=embed_dim,
+                out_size=embed_dim,
+                width_size=ff_dim,
+                depth=1,
+                activation=jax.nn.gelu,
+                key=keys[2],
+            )
+
+        return cls(
+            self_attn=self_attn,
+            feed_forward=feed_forward,
+            attn_norm=attn_norm,
+            mlp_norm=mlp_norm,
+            num_heads=num_heads,
+            head_dim=actual_head_dim,
+            causal=causal,
+            use_fp8=use_fp8,
+            cross_attn=cross_attn,
+            cross_attn_norm=cross_attn_norm,
+            context_length=context_length,
         )
-
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        self.causal = causal
-        self.context_length = context_length
 
     @property
     def embed_dim(self) -> int:
@@ -894,6 +1366,42 @@ class TransformerBlock(eqx.Module):
             batch_dim=batch_dim,
         )
 
+    def __call__(
+        self,
+        x_btd: Array,
+        positions_bt: Array | None = None,
+        *,
+        key: jax.Array | None = None,
+        inference: bool = True,
+    ) -> Array:
+        """Apply transformer block with batched input (for LLM training/inference).
+
+        This is a simplified interface for the common case of batched input
+        without FP8 or caching. For caching/FP8, use the `forward` method.
+
+        Args:
+            x_btd: Input tensor of shape (batch, seq_len, embed_dim)
+            positions_bt: Position indices for RoPE, shape (batch, seq_len).
+                If None, uses sequential positions starting from 0.
+            key: PRNG key for dropout (if applicable)
+            inference: Whether in inference mode
+
+        Returns:
+            Output tensor of shape (batch, seq_len, embed_dim)
+        """
+        attn_key = None
+        if key is not None:
+            attn_key, _ = jax.random.split(key, 2)
+
+        # Self-attention with pre-norm
+        normed = self.attn_norm(x_btd)
+        y_btd = x_btd + self.self_attn(normed, positions_bt, key=attn_key, inference=inference)
+
+        # Feed-forward with pre-norm
+        y_btd = y_btd + self.feed_forward(self.mlp_norm(y_btd))
+
+        return y_btd
+
     def forward(
         self,
         x_tn: Array,
@@ -902,7 +1410,7 @@ class TransformerBlock(eqx.Module):
         mask: Array | None = None,
         cache: TransformerBlockCache | None = None,
     ) -> tuple[Array, TransformerBlockCache]:
-        """Apply transformer block.
+        """Apply transformer block with unbatched input and caching support.
 
         Args:
             x_tn: Input tensor of shape (seq_len, embed_dim)
@@ -918,7 +1426,7 @@ class TransformerBlock(eqx.Module):
         chex.assert_rank(x_tn, 2)
 
         # Self-attention block with pre-norm
-        norm_x = jax.vmap(self.layer_norm1)(x_tn)
+        norm_x = jax.vmap(self.attn_norm)(x_tn)
 
         self_attn_fp8 = cache.get("self_attn_fp8") if cache else None
         attn_output, self_attn_cache, updated_self_fp8 = self.self_attn.forward(
@@ -935,9 +1443,9 @@ class TransformerBlock(eqx.Module):
 
         # Cross-attention block (if enabled) with pre-norm
         if self.cross_attn is not None:
-            assert self.layer_norm3 is not None
+            assert self.cross_attn_norm is not None
 
-            norm_x = jax.vmap(self.layer_norm3)(x_tn)
+            norm_x = jax.vmap(self.cross_attn_norm)(x_tn)
 
             cross_attn_fp8 = cache.get("cross_attn_fp8") if cache else None
             cross_attn_output, cross_cache, updated_cross_fp8 = self.cross_attn.forward(
@@ -953,7 +1461,7 @@ class TransformerBlock(eqx.Module):
             x_tn = x_tn + cross_attn_output
 
         # Feed-forward block with pre-norm
-        norm_x = jax.vmap(self.layer_norm2)(x_tn)
+        norm_x = jax.vmap(self.mlp_norm)(x_tn)
         ff_output = jax.vmap(self.feed_forward)(norm_x)
         x_tn = x_tn + ff_output
 
@@ -968,8 +1476,9 @@ class TransformerStack(eqx.Module):
     causal: bool = eqx.field(static=True)
     use_fp8: bool = eqx.field(static=True)
 
-    def __init__(
-        self,
+    @classmethod
+    def build(
+        cls,
         embed_dim: int,
         num_heads: int,
         ff_dim: int,
@@ -983,11 +1492,30 @@ class TransformerStack(eqx.Module):
         rotary_base: float = 10000.0,
         use_fp8: bool = False,
         compute_dtype: jnp.dtype = jnp.bfloat16,
-    ) -> None:
+    ) -> "TransformerStack":
+        """Build transformer stack from parameters.
+
+        Args:
+            embed_dim: Embedding dimension
+            num_heads: Number of attention heads
+            ff_dim: Feed-forward hidden dimension
+            num_layers: Number of transformer blocks
+            key: PRNG key for initialization
+            causal: Whether to use causal masking
+            cross_attention: Whether to include cross-attention
+            context_length: Maximum context length (for sliding window)
+            use_rotary_embeddings: Whether to use rotary position embeddings
+            rotary_base: Base for rotary position embeddings
+            use_fp8: Whether to use FP8 quantization
+            compute_dtype: Data type for computation
+
+        Returns:
+            TransformerStack instance
+        """
         keys = jax.random.split(key, num_layers)
 
-        self.layers = tuple(
-            TransformerBlock(
+        layers = tuple(
+            TransformerBlock.build(
                 embed_dim=embed_dim,
                 num_heads=num_heads,
                 ff_dim=ff_dim,
@@ -1003,9 +1531,12 @@ class TransformerStack(eqx.Module):
             for i in range(num_layers)
         )
 
-        self.num_layers = num_layers
-        self.causal = causal
-        self.use_fp8 = use_fp8
+        return cls(
+            layers=layers,
+            num_layers=num_layers,
+            causal=causal,
+            use_fp8=use_fp8,
+        )
 
     def init_cache(
         self,
@@ -1084,15 +1615,16 @@ class TransformerStack(eqx.Module):
 class Transformer(eqx.Module):
     token_embedding: eqx.nn.Embedding
     layers: TransformerStack
-    output_layer: eqx.nn.Linear | Fp8Linear | None
     layer_norm: eqx.nn.LayerNorm
-    embed_dim: int = eqx.field()
-    causal: bool = eqx.field()
-    context_length: int | None = eqx.field()
+    embed_dim: int = eqx.field(static=True)
+    causal: bool = eqx.field(static=True)
     use_fp8: bool = eqx.field(static=True)
+    output_layer: eqx.nn.Linear | Fp8Linear | None = eqx.field(default=None)
+    context_length: int | None = eqx.field(static=True, default=None)
 
-    def __init__(
-        self,
+    @classmethod
+    def build(
+        cls,
         vocab_size: int,
         embed_dim: int,
         num_heads: int,
@@ -1108,15 +1640,35 @@ class Transformer(eqx.Module):
         rotary_base: float = 10000.0,
         use_fp8: bool = False,
         compute_dtype: jnp.dtype = jnp.bfloat16,
-    ) -> None:
+    ) -> "Transformer":
+        """Build transformer from parameters.
+
+        Args:
+            vocab_size: Size of the vocabulary
+            embed_dim: Embedding dimension
+            num_heads: Number of attention heads
+            ff_dim: Feed-forward hidden dimension
+            num_layers: Number of transformer blocks
+            output_size: Size of output projection (None for no projection)
+            key: PRNG key for initialization
+            causal: Whether to use causal masking
+            cross_attention: Whether to include cross-attention
+            context_length: Maximum context length (for sliding window)
+            use_rotary_embeddings: Whether to use rotary position embeddings
+            rotary_base: Base for rotary position embeddings
+            use_fp8: Whether to use FP8 quantization
+            compute_dtype: Data type for computation
+
+        Returns:
+            Transformer instance
+        """
         # Calculate number of keys needed
         num_keys = 3 if output_size is None else 4
         keys = jax.random.split(key, num_keys)
 
-        self.token_embedding = eqx.nn.Embedding(vocab_size, embed_dim, key=keys[0])
-        self.use_fp8 = use_fp8
+        token_embedding = eqx.nn.Embedding(vocab_size, embed_dim, key=keys[0])
 
-        self.layers = TransformerStack(
+        layers = TransformerStack.build(
             embed_dim=embed_dim,
             num_heads=num_heads,
             ff_dim=ff_dim,
@@ -1131,15 +1683,21 @@ class Transformer(eqx.Module):
             compute_dtype=compute_dtype,
         )
 
-        self.layer_norm = eqx.nn.LayerNorm(embed_dim)
+        layer_norm = eqx.nn.LayerNorm(embed_dim)
+        output_layer: eqx.nn.Linear | Fp8Linear | None = None
         if output_size is not None:
-            self.output_layer = _make_linear(embed_dim, output_size, keys[3], use_fp8, compute_dtype)
-        else:
-            self.output_layer = None
+            output_layer = _make_linear(embed_dim, output_size, keys[3], use_fp8=use_fp8, compute_dtype=compute_dtype)
 
-        self.embed_dim = embed_dim
-        self.causal = causal
-        self.context_length = context_length
+        return cls(
+            token_embedding=token_embedding,
+            layers=layers,
+            layer_norm=layer_norm,
+            embed_dim=embed_dim,
+            causal=causal,
+            use_fp8=use_fp8,
+            output_layer=output_layer,
+            context_length=context_length,
+        )
 
     def init_cache(
         self,

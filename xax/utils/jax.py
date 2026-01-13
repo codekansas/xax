@@ -4,14 +4,28 @@ import functools
 import logging
 import os
 from functools import wraps
-from typing import Any, Callable, Hashable, Iterable, ParamSpec, Sequence, TypeVar, cast
+from typing import (
+    Any,
+    Callable,
+    Hashable,
+    Iterable,
+    Literal,
+    ParamSpec,
+    Sequence,
+    TypedDict,
+    TypeVar,
+    Unpack,
+    cast,
+    overload,
+)
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax._src import sharding_impls
 from jax._src.lib import xla_client as xc
-from jaxtyping import PyTree
+from jax.sharding import NamedSharding
+from jaxtyping import Array, PyTree
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +62,15 @@ def disable_jit_level() -> int:
 
 def should_disable_jit(jit_level: int | None) -> bool:
     return jit_level is not None and jit_level < disable_jit_level()
+
+
+def fix_unspecified_sharding(arr: Array, sharding: NamedSharding) -> Array:
+    if hasattr(arr, "sharding") and not hasattr(arr.sharding, "is_fully_replicated"):
+        # Array has unspecified sharding - get data from first shard
+        if hasattr(arr, "addressable_shards") and arr.addressable_shards:
+            data = np.asarray(arr.addressable_shards[0].data)
+            return jax.device_put(data, sharding)
+    return arr
 
 
 def to_numpy(arr: jnp.ndarray | np.ndarray) -> np.ndarray:
@@ -105,51 +128,69 @@ def get_hash(obj: object) -> int:
     return id(obj)
 
 
+class _JitKwargs(TypedDict, total=False):
+    """Keyword arguments passed through to jax.jit."""
+
+    in_shardings: Any  # noqa: ANN401
+    out_shardings: Any  # noqa: ANN401
+    static_argnums: int | Sequence[int] | None
+    static_argnames: str | Iterable[str] | None
+    donate_argnums: int | Sequence[int] | None
+    donate_argnames: str | Iterable[str] | None
+    keep_unused: bool
+    device: xc.Device | None
+    backend: str | None
+    inline: bool
+
+
+@overload
 def jit(
-    in_shardings: Any = sharding_impls.UNSPECIFIED,  # noqa: ANN401
-    out_shardings: Any = sharding_impls.UNSPECIFIED,  # noqa: ANN401
-    static_argnums: int | Sequence[int] | None = None,
-    static_argnames: str | Iterable[str] | None = None,
-    donate_argnums: int | Sequence[int] | None = None,
-    donate_argnames: str | Iterable[str] | None = None,
-    keep_unused: bool = False,
-    device: xc.Device | None = None,
-    backend: str | None = None,
-    inline: bool = False,
-    compiler_options: dict[str, Any] | None = None,
+    fn: Callable[P, R],
+    *,
     jit_level: int | None = None,
     error_on_recompile: bool = False,
-) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    **jitkwargs: Unpack[_JitKwargs],
+) -> Callable[P, R]: ...
+
+
+@overload
+def jit(
+    fn: None = None,
+    *,
+    jit_level: int | None = None,
+    error_on_recompile: bool = False,
+    **jitkwargs: Unpack[_JitKwargs],
+) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
+
+
+def jit(
+    fn: Callable[P, R] | None = None,
+    *,
+    jit_level: int | None = None,
+    error_on_recompile: bool = False,
+    **jitkwargs: Unpack[_JitKwargs],
+) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
     """Wrapper function that provides utility improvements over Jax's JIT.
 
     Specifically, this function works on class methods, is toggleable, and
     detects recompilations by matching hash values.
 
-    This is meant to be used as a decorator factory, and the decorated function
-    calls `wrapped`.
-    """
-    if should_disable_jit(jit_level):
-        return lambda fn: fn  # Identity function.
+    Can be used as a decorator factory or directly on a function:
+        @jit()
+        def foo(): ...
 
-    def decorator(fn: Callable[P, R]) -> Callable[P, R]:
-        jitted_fn = jax.jit(
-            fn,
-            in_shardings=in_shardings,
-            out_shardings=out_shardings,
-            static_argnums=static_argnums,
-            static_argnames=static_argnames,
-            donate_argnums=donate_argnums,
-            donate_argnames=donate_argnames,
-            keep_unused=keep_unused,
-            device=device,
-            backend=backend,
-            inline=inline,
-            compiler_options=compiler_options,
-        )
+        @jit
+        def bar(): ...
+
+        jit(baz)
+    """
+
+    def make_jitted(f: Callable[P, R]) -> Callable[P, R]:
+        jitted_fn = jax.jit(f, **jitkwargs)
 
         cache: dict[tuple[Any, tuple[str, ...]], int] = {}
 
-        @wraps(fn)
+        @wraps(f)
         def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
             if not error_on_recompile:
                 return jitted_fn(*args, **kwargs)
@@ -164,6 +205,74 @@ def jit(
             return cast(R, jitted_fn(*args, **kwargs))
 
         return wrapped
+
+    if should_disable_jit(jit_level):
+        if fn is not None:
+            return fn
+        return lambda f: f
+
+    if fn is not None:
+        return make_jitted(fn)
+
+    return make_jitted
+
+
+_DonateArg = Literal["all", "all-except-first", "warn", "warn-except-first", "none"]
+
+
+@overload
+def filter_jit(
+    fn: Callable[P, R],
+    *,
+    donate: _DonateArg = "none",
+    jit_level: int | None = None,
+    **jitkwargs: Unpack[_JitKwargs],
+) -> Callable[P, R]: ...
+
+
+@overload
+def filter_jit(
+    fn: None = None,
+    *,
+    donate: _DonateArg = "none",
+    jit_level: int | None = None,
+    **jitkwargs: Unpack[_JitKwargs],
+) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
+
+
+def filter_jit(
+    fn: Callable[P, R] | None = None,
+    *,
+    donate: _DonateArg = "none",
+    jit_level: int | None = None,
+    **jitkwargs: Unpack[_JitKwargs],
+) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
+    """Wrapper around eqx.filter_jit with xax's toggleable JIT feature.
+
+    This function combines equinox's filter_jit (which handles pytrees with
+    non-array leaves by treating them as static) with xax's JIT level control.
+
+    Args:
+        fn: The function to JIT compile. If None, returns a decorator.
+        donate: Buffer donation strategy passed to eqx.filter_jit.
+            Options: "none", "all", "all-except-first", "warn", "warn-except-first"
+        jit_level: Optional JIT level for conditional compilation.
+            If set and >= DISABLE_JIT_LEVEL env var, JIT is disabled.
+        **jitkwargs: Additional arguments passed to jax.jit (e.g., in_shardings, out_shardings).
+
+    Returns:
+        JIT-compiled function or decorator.
+    """
+    if should_disable_jit(jit_level):
+        if fn is not None:
+            return fn
+        return lambda f: f
+
+    if fn is not None:
+        return eqx.filter_jit(fn, donate=donate, **jitkwargs)
+
+    def decorator(f: Callable[P, R]) -> Callable[P, R]:
+        return eqx.filter_jit(f, donate=donate, **jitkwargs)
 
     return decorator
 

@@ -249,7 +249,7 @@ class TrainMixin(
         opt_states = []
         for model, opt in zip(models, optimizers, strict=True):
             # Use filter spec to only create optimizer state for trainable params
-            filter_spec = self.get_model_filter_spec(model)
+            filter_spec = self.get_trainable_filter_spec(model)
             trainable, _ = eqx.partition(model, filter_spec)
             trainable_casted = jax.tree.map(cast_to_grad_dtype, trainable)
             opt_states.append(opt.init(trainable_casted))
@@ -518,7 +518,7 @@ class TrainMixin(
     def model_partition_fn(self, item: Any) -> bool:  # noqa: ANN401
         return eqx.is_inexact_array(item)
 
-    def get_model_filter_spec(self, model: PyTree) -> PyTree | Callable[[Any], bool]:
+    def get_trainable_filter_spec(self, model: PyTree) -> PyTree | Callable[[Any], bool]:
         """Returns a filter spec for partitioning the model into trainable/frozen parts.
 
         Override this method to customize which parameters are trainable.

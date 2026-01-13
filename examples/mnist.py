@@ -5,14 +5,14 @@ Run this example with `python -m examples.mnist`.
 """
 
 from dataclasses import dataclass
-from typing import Callable, TypedDict
+from typing import Callable, TypedDict, override
 
 import equinox as eqx
 import jax
 import numpy as np
 import optax
 from datasets import Dataset, load_dataset
-from jaxtyping import Array, PRNGKeyArray, PyTree
+from jaxtyping import Array, PRNGKeyArray
 from PIL.Image import Image as PILImage
 
 import xax
@@ -76,6 +76,7 @@ class Model(eqx.Module):
 
 
 class MnistClassification(xax.SupervisedTask[Config]):
+    @override
     def get_model(self, params: xax.InitParams) -> Model:
         return Model(
             self.config.num_hidden_layers,
@@ -83,66 +84,41 @@ class MnistClassification(xax.SupervisedTask[Config]):
             key=params.key,
         )
 
+    @override
     def get_optimizer(self) -> xax.Optimizer:
         return optax.adam(self.config.learning_rate)
 
-    def get_output(self, model: Model, batch: Batch, state: xax.State, key: PRNGKeyArray) -> Array:
-        return jax.vmap(model)(batch["image"])
-
+    @override
     def compute_loss(
         self,
         model: Model,
         batch: Batch,
-        output: Array,
-        state: xax.State,
-        key: PRNGKeyArray,
-    ) -> Array:
-        y, yhat = batch["label"], output
-        loss = optax.softmax_cross_entropy_with_integer_labels(logits=yhat, labels=y)
-        return loss.mean()
-
-    def compute_metrics(
-        self,
-        model: PyTree,
-        batch: Batch,
-        output: Array,
         state: xax.State,
         heavy: bool,
         key: PRNGKeyArray,
-    ) -> dict[str, xax.Metric]:
-        y, yhat = batch["label"], output.argmax(axis=1)
+    ) -> tuple[Array, dict[str, xax.Metric]]:
+        output = jax.vmap(model)(batch["image"])
+        y = batch["label"]
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits=output, labels=y)
+
+        # Compute metrics
+        yhat = output.argmax(axis=1)
         metrics: dict[str, xax.Metric] = {}
         metrics["acc"] = xax.Scalar((yhat == y).astype(float).mean())
-        if not heavy:
-            return metrics
 
-        max_images = 16
-        batch = jax.tree.map(lambda x: jax.device_get(x[:max_images]), batch)
-        x = batch["image"]
-        metrics["predictions"] = xax.LabeledImages(
-            x,
-            {"pred": yhat, "true": y},
-            max_images=max_images,
-            target_resolution=(64, 64),
-        )
+        if heavy:
+            max_images = 16
+            x = batch["image"][:max_images]
+            metrics["predictions"] = xax.LabeledImages(
+                x,
+                {"pred": yhat[:max_images], "true": y[:max_images]},
+                max_images=max_images,
+                target_resolution=(64, 64),
+            )
 
-        return metrics
+        return loss.mean(), metrics
 
-    def log_heavy(
-        self,
-        model: Model,
-        batch: Batch,
-        output: Array,
-        metrics: xax.FrozenDict[str, Array],
-        state: xax.State,
-        key: PRNGKeyArray,
-    ) -> None:
-        max_images = 16
-        batch = jax.tree.map(lambda x: jax.device_get(x[:max_images]), batch)
-        x, y, yhat = batch["image"], batch["label"], output.argmax(axis=1)
-        labels = [f"pred: {p}\ntrue: {t}" for p, t in zip(yhat[:max_images], y[:max_images], strict=True)]
-        self.logger.log_labeled_images("predictions", (x, labels), max_images=max_images)
-
+    @override
     def get_dataset(self) -> Dataset:
         ds = load_dataset("ylecun/mnist", split="train")
 

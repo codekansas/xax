@@ -1,17 +1,6 @@
-"""Lightweight JAX LLM reference implementations (Qwen3, LLaMA, TinyLLaMA).
+"""Lightweight JAX LLM reference implementations."""
 
-These models are adapted from the `jax-ml/jax-llm-examples` reference
-implementations but simplified to match the `xax` style and dependency set.
-
-Key differences:
-
-* Uses Equinox modules and standard JAX primitives (no Pallas kernels).
-* Keeps grouped-query attention (separate q_heads/kv_heads) and rotary
-  embeddings to stay architecturally faithful while remaining lightweight.
-* Provides small default configs for CPU tests; full-size configs can be added
-  by users when loading real checkpoints.
-"""
-
+import functools
 import json
 import logging
 from dataclasses import dataclass, replace
@@ -27,9 +16,14 @@ from jaxtyping import Array
 from omegaconf import MISSING
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field as PydanticField
 
-from xax.arch.attention import RotaryEmbedding
+from xax.arch.attention import (
+    RMSNorm,
+    SelfAttentionBlock,
+    SwiGLU,
+    TransformerBlock,
+    apply_linear,
+)
 from xax.core.conf import field
-from xax.nn.lora import LoRALinear
 
 try:
     from huggingface_hub import snapshot_download
@@ -46,33 +40,6 @@ except ModuleNotFoundError as e:
     ) from e
 
 logger = logging.getLogger(__name__)
-
-
-# --------------------------------------------------------------------------- #
-# Core Modules                                                                 #
-# --------------------------------------------------------------------------- #
-
-
-def _linear(x_btd: Array, linear: eqx.nn.Linear) -> Array:
-    """Apply linear layer with einsum for better performance.
-
-    Also supports LoRALinear layers which have weight_oi/bias_o instead of weight/bias.
-    """
-    # Handle LoRALinear (weight_oi) vs eqx.nn.Linear (weight)
-    if isinstance(linear, LoRALinear):
-        # LoRALinear: use weight_oi and bias_o, plus LoRA delta
-        y_bto = jnp.einsum("...d,od->...o", x_btd, linear.weight_oi)
-        if linear.bias_o is not None:
-            y_bto = y_bto + linear.bias_o
-        # Add LoRA contribution: (x @ A) @ B * scaling
-        delta_bto = (x_btd @ linear.lora_a_ir) @ linear.lora_b_ro * linear.scaling
-        return y_bto + delta_bto
-    else:
-        # Standard eqx.nn.Linear
-        y_bto = jnp.einsum("...d,od->...o", x_btd, linear.weight)
-        if linear.bias is not None:
-            y_bto = y_bto + linear.bias
-        return y_bto
 
 
 @dataclass(frozen=True)
@@ -110,147 +77,6 @@ class LLMConfig:
         return self.rope_factor > 1.0 and self.rope_original_max_position_embeddings is not None
 
 
-class RMSNorm(eqx.Module):
-    """RMSNorm over the last dimension (no bias), matching LLaMA/Qwen style."""
-
-    weight: Array
-    eps: float = 1e-6
-
-    def __init__(self, dim: int, eps: float = 1e-6) -> None:
-        self.weight = jnp.ones((dim,), dtype=jnp.float32)
-        self.eps = eps
-
-    def __call__(self, x_btd: Array) -> Array:
-        norm = jnp.sqrt(jnp.mean(jnp.square(x_btd), axis=-1, keepdims=True) + self.eps)
-        return (x_btd / norm) * self.weight
-
-
-class MultiHeadAttention(eqx.Module):
-    """Grouped-query attention with rotary embeddings."""
-
-    q_proj: eqx.nn.Linear
-    k_proj: eqx.nn.Linear
-    v_proj: eqx.nn.Linear
-    o_proj: eqx.nn.Linear
-    rotary: RotaryEmbedding
-    q_norm: RMSNorm | None  # QK-Norm for Qwen3
-    k_norm: RMSNorm | None  # QK-Norm for Qwen3
-    q_heads: int
-    kv_heads: int
-    head_dim: int
-    dropout_rate: float
-    sliding_window_size: int | None = None  # None = full attention, int = window size
-    sinks: Array | None = None  # Learnable attention sinks for softmax stability
-
-    def __call__(
-        self,
-        x_btd: Array,
-        positions_bt: Array,
-        *,
-        key: jax.Array | None = None,
-        inference: bool = True,
-    ) -> Array:
-        chex.assert_rank(x_btd, 3)
-        chex.assert_rank(positions_bt, 2)
-        bsz, tsz, _ = x_btd.shape
-        chex.assert_shape(positions_bt, (bsz, tsz))
-
-        q_bthd = _linear(x_btd, self.q_proj).reshape(bsz, tsz, self.q_heads, self.head_dim)
-        k_bthd = _linear(x_btd, self.k_proj).reshape(bsz, tsz, self.kv_heads, self.head_dim)
-        v_bthd = _linear(x_btd, self.v_proj).reshape(bsz, tsz, self.kv_heads, self.head_dim)
-
-        # Apply QK-Norm before RoPE (Qwen3 style)
-        if self.q_norm is not None:
-            q_bthd = self.q_norm(q_bthd)
-        if self.k_norm is not None:
-            k_bthd = self.k_norm(k_bthd)
-
-        # Apply rotary embeddings
-        positions_flat = positions_bt.reshape(-1)
-        q_flat = q_bthd.reshape(-1, self.q_heads, self.head_dim)
-        k_flat = k_bthd.reshape(-1, self.kv_heads, self.head_dim)
-
-        q_flat = self.rotary.apply_rotary_embeddings(q_flat, positions=positions_flat)
-        k_flat = self.rotary.apply_rotary_embeddings(k_flat, positions=positions_flat)
-
-        q_bthd = q_flat.reshape(bsz, tsz, self.q_heads, self.head_dim)
-        k_bthd = k_flat.reshape(bsz, tsz, self.kv_heads, self.head_dim)
-
-        # Broadcast kv heads to match q heads (grouped-query attention)
-        repeat_factor = self.q_heads // self.kv_heads
-        k_bthd = jnp.repeat(k_bthd, repeat_factor, axis=2)
-        v_bthd = jnp.repeat(v_bthd, repeat_factor, axis=2)
-
-        # Compute attention logits
-        attn_logits_bhtt = jnp.einsum("bthd,bThd->bhtT", q_bthd, k_bthd) / jnp.sqrt(self.head_dim)
-
-        # Create causal mask with optional sliding window
-        causal_mask_tt = jnp.tril(jnp.ones((tsz, tsz), dtype=bool))
-        if self.sliding_window_size is not None:
-            window_mask = jnp.triu(jnp.ones((tsz, tsz), dtype=bool), k=-(self.sliding_window_size - 1))
-            causal_mask_tt = causal_mask_tt & window_mask
-        attn_logits_bhtt = jnp.where(causal_mask_tt[None, None, :, :], attn_logits_bhtt, -1e9)
-
-        # Compute softmax with optional attention sinks
-        if self.sinks is not None:
-            # Attention sinks: modified softmax with per-head learnable denominator
-            # Reference: https://arxiv.org/abs/2309.17453 (StreamingLLM)
-            sinks_h = self.sinks[None, :, None, None]
-            qk_max = jnp.maximum(jnp.max(attn_logits_bhtt, axis=-1, keepdims=True), sinks_h)
-            exp = jnp.exp(attn_logits_bhtt - qk_max)
-            attn_weights_bhtt = exp / (jnp.sum(exp, axis=-1, keepdims=True) + jnp.exp(sinks_h - qk_max))
-        else:
-            attn_weights_bhtt = jax.nn.softmax(attn_logits_bhtt, axis=-1)
-
-        # Dropout (only during training)
-        if self.dropout_rate > 0.0 and not inference:
-            assert key is not None, "Dropout requires PRNG key when not in inference mode."
-            attn_weights_bhtt = eqx.nn.Dropout(self.dropout_rate)(attn_weights_bhtt, key=key)
-
-        # Compute context
-        ctx_bthd = jnp.einsum("bhtT,bThd->bthd", attn_weights_bhtt, v_bthd)
-        ctx_btd = ctx_bthd.reshape(bsz, tsz, self.q_heads * self.head_dim)
-        return _linear(ctx_btd, self.o_proj)
-
-
-class FeedForward(eqx.Module):
-    """SwiGLU feed-forward layer (LLaMA/Qwen style)."""
-
-    gate: eqx.nn.Linear
-    up: eqx.nn.Linear
-    down: eqx.nn.Linear
-
-    def __call__(self, x_btd: Array) -> Array:
-        chex.assert_rank(x_btd, {2, 3})
-        gated_btd = jax.nn.silu(_linear(x_btd, self.gate)) * _linear(x_btd, self.up)
-        return _linear(gated_btd, self.down)
-
-
-class TransformerBlock(eqx.Module):
-    """Single transformer layer with pre-norm."""
-
-    attn: MultiHeadAttention
-    attn_norm: RMSNorm
-    mlp_norm: RMSNorm
-    mlp: FeedForward
-
-    def __call__(
-        self,
-        x_btd: Array,
-        positions_bt: Array,
-        *,
-        key: jax.Array | None = None,
-        inference: bool = True,
-    ) -> Array:
-        attn_key = None
-        if key is not None:
-            attn_key, _ = jax.random.split(key, 2)
-        normed = self.attn_norm(x_btd)
-        y_btd = x_btd + self.attn(normed, positions_bt, key=attn_key, inference=inference)
-        y_btd = y_btd + self.mlp(self.mlp_norm(y_btd))
-        return y_btd
-
-
 class LLM(eqx.Module):
     """Minimal decoder-only LLM."""
 
@@ -265,15 +91,13 @@ class LLM(eqx.Module):
         """Initialize LLM with random weights."""
         k_emb, *block_keys, k_head = jax.random.split(key, config.num_layers + 2)
         embed = eqx.nn.Embedding(config.vocab_size, config.embed_dim, key=k_emb)
-        blocks = []
+        blocks: list[TransformerBlock] = []
         mlp_width = config.mlp_hidden_dim or (config.embed_dim * config.mlp_mult)
         attn_bias = config.attention_bias
         mlp_bias = config.mlp_bias
 
         for i in range(config.num_layers):
             k_attn, k_mlp = jax.random.split(block_keys[i], 2)
-            q_dim = config.q_heads * config.head_dim
-            kv_dim = config.kv_heads * config.head_dim
 
             # Determine sliding window for this layer
             layer_window: int | None = None
@@ -281,56 +105,62 @@ class LLM(eqx.Module):
                 if "sliding" in config.layer_attention_types[i]:
                     layer_window = config.sliding_window_size
 
-            attn = MultiHeadAttention(
-                q_proj=eqx.nn.Linear(config.embed_dim, q_dim, use_bias=attn_bias, key=k_attn),
-                k_proj=eqx.nn.Linear(config.embed_dim, kv_dim, use_bias=attn_bias, key=k_attn),
-                v_proj=eqx.nn.Linear(config.embed_dim, kv_dim, use_bias=attn_bias, key=k_attn),
-                o_proj=eqx.nn.Linear(q_dim, config.embed_dim, use_bias=attn_bias, key=k_attn),
-                rotary=RotaryEmbedding(
-                    config.head_dim,
-                    base=config.rope_theta,
-                    style="concatenated",
-                    factor=config.rope_factor,
-                    original_max_position_embeddings=config.rope_original_max_position_embeddings,
-                    beta_slow=config.rope_beta_slow,
-                    beta_fast=config.rope_beta_fast,
-                ),
-                q_norm=None,
-                k_norm=None,
-                q_heads=config.q_heads,
-                kv_heads=config.kv_heads,
+            # Create attention block with proper settings
+            self_attn = SelfAttentionBlock.build(
+                embed_dim=config.embed_dim,
+                num_heads=config.q_heads,
+                num_kv_heads=config.kv_heads,
                 head_dim=config.head_dim,
-                dropout_rate=config.dropout_rate,
-                sliding_window_size=layer_window,
+                key=k_attn,
+                use_bias=attn_bias,
+                causal=True,
+                context_length=layer_window + 1 if layer_window else None,
+                use_rotary_embeddings=True,
+                rotary_base=config.rope_theta,
+                rotary_style="concatenated",
+                rotary_factor=config.rope_factor,
+                rotary_original_max_position_embeddings=config.rope_original_max_position_embeddings,
+                rotary_beta_slow=config.rope_beta_slow,
+                rotary_beta_fast=config.rope_beta_fast,
+                use_qk_norm=False,  # Will be set via weight loading if present
+                use_attention_sinks=config.use_attention_sinks,
             )
 
-            mlp = FeedForward(
-                gate=eqx.nn.Linear(config.embed_dim, mlp_width, use_bias=mlp_bias, key=k_mlp),
-                up=eqx.nn.Linear(config.embed_dim, mlp_width, use_bias=mlp_bias, key=k_mlp),
-                down=eqx.nn.Linear(mlp_width, config.embed_dim, use_bias=mlp_bias, key=k_mlp),
-            )
+            # Create feed-forward layer
+            mlp = SwiGLU.build(config.embed_dim, mlp_width, key=k_mlp, use_bias=mlp_bias)
 
             blocks.append(
                 TransformerBlock(
-                    attn=attn,
-                    attn_norm=RMSNorm(config.embed_dim, eps=config.rms_eps),
-                    mlp_norm=RMSNorm(config.embed_dim, eps=config.rms_eps),
-                    mlp=mlp,
+                    self_attn=self_attn,
+                    feed_forward=mlp,
+                    attn_norm=RMSNorm.build(config.embed_dim, eps=config.rms_eps),
+                    mlp_norm=RMSNorm.build(config.embed_dim, eps=config.rms_eps),
+                    num_heads=config.q_heads,
+                    head_dim=config.head_dim,
+                    causal=True,
+                    use_fp8=False,
+                    cross_attn=None,
+                    cross_attn_norm=None,
+                    context_length=layer_window + 1 if layer_window else None,
                 )
             )
 
-        norm = RMSNorm(config.embed_dim, eps=config.rms_eps)
+        norm = RMSNorm.build(config.embed_dim, eps=config.rms_eps)
         lm_head = eqx.nn.Linear(config.embed_dim, config.vocab_size, use_bias=False, key=k_head)
         return cls(embed=embed, blocks=tuple(blocks), norm=norm, lm_head=lm_head, config=config)
 
-    def __call__(
+    def forward_hidden(
         self,
         tokens_bt: Array,
         *,
         key: jax.Array | None = None,
         inference: bool = True,
     ) -> Array:
-        """Forward pass returning logits shaped (bsz, tsz, vocab_size)."""
+        """Forward pass returning hidden states shaped (bsz, tsz, embed_dim).
+
+        This is useful for memory-efficient loss computation where you want to
+        avoid materializing the full (bsz, tsz, vocab_size) logits tensor.
+        """
         chex.assert_rank(tokens_bt, 2)
         bsz, tsz = tokens_bt.shape
         positions_bt = jnp.broadcast_to(jnp.arange(tsz)[None, :], (bsz, tsz))
@@ -343,9 +173,6 @@ class LLM(eqx.Module):
         for i, block in enumerate(self.blocks):
             block_key = None if key_seq is None else key_seq[i]
             if self.config.use_remat:
-                # Gradient checkpointing: recompute block activations during backward pass
-                # This reduces memory usage at the cost of extra compute
-                # Split block into arrays (traced for gradients) and static parts (not traced)
                 block_arrays, block_static = eqx.partition(block, eqx.is_array)
 
                 @jax.checkpoint
@@ -364,28 +191,31 @@ class LLM(eqx.Module):
                 x_btd = remat_block(block_arrays, x_btd, positions_bt, block_key, inference)
             else:
                 x_btd = block(x_btd, positions_bt, key=block_key, inference=inference)
-        x_btd = self.norm(x_btd)
-        logits_btv = _linear(x_btd, self.lm_head)
+        return self.norm(x_btd)
+
+    def __call__(
+        self,
+        tokens_bt: Array,
+        *,
+        key: jax.Array | None = None,
+        inference: bool = True,
+    ) -> Array:
+        """Forward pass returning logits shaped (bsz, tsz, vocab_size)."""
+        x_btd = self.forward_hidden(tokens_bt, key=key, inference=inference)
+        logits_btv = apply_linear(x_btd, self.lm_head)
         return logits_btv
 
 
-# --------------------------------------------------------------------------- #
-# Default Configs                                                              #
-# --------------------------------------------------------------------------- #
+def build_qwen3_model(config: LLMConfig, *, key: jax.Array | None = None) -> LLM:
+    """Creates a Qwen3-style model.
 
-QWEN3_SMALL = LLMConfig(
-    vocab_size=32000,
-    embed_dim=256,
-    q_heads=8,
-    kv_heads=4,
-    head_dim=32,
-    num_layers=4,
-    max_tsz=512,
-)
+    Args:
+        config: LLMConfig specifying model architecture.
+        key: Optional PRNG key for initialization.
 
-
-def build_qwen3_model(config: LLMConfig = QWEN3_SMALL, *, key: jax.Array | None = None) -> LLM:
-    """Creates a Qwen3-style model."""
+    Returns:
+        Initialized LLM model.
+    """
     key = jax.random.key(0) if key is None else key
     return LLM.init(config, key=key)
 
@@ -395,13 +225,198 @@ def tie_embedding_and_head(model: LLM) -> LLM:
     return eqx.tree_at(lambda mm: mm.lm_head.weight, model, model.embed.weight)
 
 
-# --------------------------------------------------------------------------- #
-# HuggingFace Utilities                                                        #
-# --------------------------------------------------------------------------- #
+def chunked_cross_entropy_loss(
+    hidden_btd: Array,
+    targets_bt: Array,
+    lm_head_weight: Array,
+    mask_bt: Array | None = None,
+    chunk_size: int = 1,
+) -> Array:
+    """Compute cross-entropy loss in chunks to save memory.
+
+    Instead of materializing the full (batch, seq, vocab) logits tensor,
+    this function processes the sequence in chunks of size `chunk_size`,
+    computing logits and loss for each chunk before discarding the logits.
+
+    For a vocab of 150K and sequence of 512:
+    - Full logits: 512 * 150000 * 4 bytes = ~300MB per sample
+    - Chunked (8): 8 * 150000 * 4 bytes = ~4.8MB per chunk
+
+    Numerical stability:
+    - All computations are performed in float32 regardless of input dtype
+    - Uses log_softmax which implements the numerically stable log-sum-exp trick
+    - Accumulates loss and count in float32 to avoid precision loss
+
+    Args:
+        hidden_btd: Hidden states from model.forward_hidden(), shape (batch, seq, hidden_dim)
+        targets_bt: Target token indices, shape (batch, seq)
+        lm_head_weight: The lm_head weight matrix, shape (vocab_size, hidden_dim)
+        mask_bt: Optional mask for valid positions, shape (batch, seq). If None, all positions are valid.
+        chunk_size: Number of sequence positions to process at once.
+
+    Returns:
+        Scalar loss value (mean cross-entropy over valid positions) in float32.
+    """
+    bsz, tsz, hidden_dim = hidden_btd.shape
+
+    if mask_bt is None:
+        mask_bt = jnp.ones((bsz, tsz), dtype=jnp.bool_)
+
+    # Pad sequence to be divisible by chunk_size for static shapes
+    pad_size = (chunk_size - tsz % chunk_size) % chunk_size
+    if pad_size > 0:
+        hidden_btd = jnp.pad(hidden_btd, ((0, 0), (0, pad_size), (0, 0)))
+        targets_bt = jnp.pad(targets_bt, ((0, 0), (0, pad_size)))
+        mask_bt = jnp.pad(mask_bt, ((0, 0), (0, pad_size)), constant_values=False)
+
+    padded_tsz = tsz + pad_size
+    num_chunks = padded_tsz // chunk_size
+
+    # Reshape to (batch, num_chunks, chunk_size, ...)
+    hidden_bccd = hidden_btd.reshape(bsz, num_chunks, chunk_size, hidden_dim)
+    targets_bcc = targets_bt.reshape(bsz, num_chunks, chunk_size)
+    mask_bcc = mask_bt.reshape(bsz, num_chunks, chunk_size)
+
+    def process_chunk(
+        carry: tuple[Array, Array],
+        inputs: tuple[Array, Array, Array],
+    ) -> tuple[tuple[Array, Array], None]:
+        total_loss, total_count = carry
+        chunk_hidden, chunk_targets, chunk_mask = inputs
+
+        # Cast to float32 for numerical stability (inputs may be bfloat16)
+        chunk_hidden_f32 = chunk_hidden.astype(jnp.float32)
+        lm_head_f32 = lm_head_weight.astype(jnp.float32)
+
+        # Compute logits: (batch, chunk, hidden) @ (hidden, vocab) -> (batch, chunk, vocab)
+        chunk_logits = chunk_hidden_f32 @ lm_head_f32.T
+
+        # log_softmax is numerically stable: log(softmax(x)) = x - max(x) - log(sum(exp(x - max(x))))
+        log_probs = jax.nn.log_softmax(chunk_logits, axis=-1)
+
+        # Gather log prob of target tokens
+        target_log_probs = jnp.take_along_axis(log_probs, chunk_targets[..., None], axis=-1).squeeze(-1)
+        chunk_loss = -target_log_probs
+
+        # Mask and accumulate in float32
+        masked_loss = jnp.where(chunk_mask, chunk_loss, 0.0)
+        total_loss = total_loss + masked_loss.sum()
+        total_count = total_count + chunk_mask.astype(jnp.float32).sum()
+
+        return (total_loss, total_count), None
+
+    # Transpose to (num_chunks, batch, chunk_size, ...) for scan
+    hidden_cbcd = jnp.transpose(hidden_bccd, (1, 0, 2, 3))
+    targets_cbc = jnp.transpose(targets_bcc, (1, 0, 2))
+    mask_cbc = jnp.transpose(mask_bcc, (1, 0, 2))
+
+    init_carry = (
+        jnp.array(0.0, dtype=jnp.float32),
+        jnp.array(0.0, dtype=jnp.float32),
+    )
+    (total_loss, total_count), _ = jax.lax.scan(
+        process_chunk,
+        init_carry,
+        (hidden_cbcd, targets_cbc, mask_cbc),
+    )
+
+    # Safe division - if no valid tokens, return 0
+    return jnp.where(total_count > 0, total_loss / total_count, 0.0)
 
 
+def chunked_cross_entropy_acc(
+    hidden_btd: Array,
+    targets_bt: Array,
+    lm_head_weight: Array,
+    mask_bt: Array | None = None,
+    chunk_size: int = 1,
+) -> Array:
+    """Compute accuracy in chunks to save memory.
+
+    This is the accuracy counterpart to chunked_cross_entropy_loss. It computes
+    the fraction of correctly predicted tokens without materializing full logits.
+
+    Args:
+        hidden_btd: Hidden states from model.forward_hidden(), shape (batch, seq, hidden_dim)
+        targets_bt: Target token indices, shape (batch, seq)
+        lm_head_weight: The lm_head weight matrix, shape (vocab_size, hidden_dim)
+        mask_bt: Optional mask for valid positions, shape (batch, seq). If None, all positions are valid.
+        chunk_size: Number of sequence positions to process at once.
+
+    Returns:
+        Scalar accuracy value (fraction of correct predictions) in float32.
+    """
+    bsz, tsz, hidden_dim = hidden_btd.shape
+
+    if mask_bt is None:
+        mask_bt = jnp.ones((bsz, tsz), dtype=jnp.bool_)
+
+    # Pad sequence to be divisible by chunk_size for static shapes
+    pad_size = (chunk_size - tsz % chunk_size) % chunk_size
+    if pad_size > 0:
+        hidden_btd = jnp.pad(hidden_btd, ((0, 0), (0, pad_size), (0, 0)))
+        targets_bt = jnp.pad(targets_bt, ((0, 0), (0, pad_size)))
+        mask_bt = jnp.pad(mask_bt, ((0, 0), (0, pad_size)), constant_values=False)
+
+    padded_tsz = tsz + pad_size
+    num_chunks = padded_tsz // chunk_size
+
+    # Reshape to (batch, num_chunks, chunk_size, ...)
+    hidden_bccd = hidden_btd.reshape(bsz, num_chunks, chunk_size, hidden_dim)
+    targets_bcc = targets_bt.reshape(bsz, num_chunks, chunk_size)
+    mask_bcc = mask_bt.reshape(bsz, num_chunks, chunk_size)
+
+    def process_chunk(
+        carry: tuple[Array, Array],
+        inputs: tuple[Array, Array, Array],
+    ) -> tuple[tuple[Array, Array], None]:
+        total_correct, total_count = carry
+        chunk_hidden, chunk_targets, chunk_mask = inputs
+
+        # Cast to float32 for numerical stability (inputs may be bfloat16)
+        chunk_hidden_f32 = chunk_hidden.astype(jnp.float32)
+        lm_head_f32 = lm_head_weight.astype(jnp.float32)
+
+        # Compute logits: (batch, chunk, hidden) @ (hidden, vocab) -> (batch, chunk, vocab)
+        chunk_logits = chunk_hidden_f32 @ lm_head_f32.T
+
+        # Compute accuracy: check if argmax matches target
+        predictions = jnp.argmax(chunk_logits, axis=-1)
+        correct = predictions == chunk_targets
+
+        # Mask and accumulate
+        masked_correct = jnp.where(chunk_mask, correct.astype(jnp.float32), 0.0)
+        total_correct = total_correct + masked_correct.sum()
+        total_count = total_count + chunk_mask.astype(jnp.float32).sum()
+
+        return (total_correct, total_count), None
+
+    # Transpose to (num_chunks, batch, chunk_size, ...) for scan
+    hidden_cbcd = jnp.transpose(hidden_bccd, (1, 0, 2, 3))
+    targets_cbc = jnp.transpose(targets_bcc, (1, 0, 2))
+    mask_cbc = jnp.transpose(mask_bcc, (1, 0, 2))
+
+    init_carry = (
+        jnp.array(0.0, dtype=jnp.float32),
+        jnp.array(0.0, dtype=jnp.float32),
+    )
+    (total_correct, total_count), _ = jax.lax.scan(
+        process_chunk,
+        init_carry,
+        (hidden_cbcd, targets_cbc, mask_cbc),
+    )
+
+    # Safe division - if no valid tokens, return 0
+    return jnp.where(total_count > 0, total_correct / total_count, 0.0)
+
+
+@functools.lru_cache(maxsize=16)
 def download_repo(repo_id: str, revision: str | None = None, cache_dir: str | None = None) -> Path:
-    """Downloads a repo snapshot from the Huggingface Hub and returns the local path."""
+    """Downloads a repo snapshot from the Huggingface Hub and returns the local path.
+
+    Results are cached in-memory to avoid redundant HuggingFace Hub API calls
+    when the same repo is accessed multiple times (e.g., config + weights).
+    """
     return Path(snapshot_download(repo_id=repo_id, revision=revision, cache_dir=cache_dir))
 
 
@@ -550,26 +565,47 @@ def _parse_rope_scaling(cfg: dict[str, object]) -> tuple[float, int | None, floa
 
 def hf_config_to_llm_config(
     cfg: dict[str, object],
-    base: LLMConfig | None = None,
     *,
     use_remat: bool = False,
+    max_tsz: int = 32768,
 ) -> LLMConfig:
-    """Derive an LLMConfig from an HF config dict."""
-    base = base or QWEN3_SMALL
+    """Derive an LLMConfig from a HuggingFace config dict.
+
+    Args:
+        cfg: HuggingFace config dictionary (from load_hf_config).
+        use_remat: Whether to use gradient checkpointing (remat).
+        max_tsz: Maximum sequence length (not always in HF config).
+
+    Returns:
+        LLMConfig derived from the HuggingFace config.
+
+    Raises:
+        ValueError: If required fields are missing from the config.
+    """
     parsed = HFConfig.model_validate(cfg)
 
-    embed_dim = parsed.hidden_size or base.embed_dim
-    q_heads = parsed.num_attention_heads or base.q_heads
+    # Required fields - raise errors if missing
+    if parsed.hidden_size is None:
+        raise ValueError("HuggingFace config missing required field: hidden_size")
+    if parsed.num_attention_heads is None:
+        raise ValueError("HuggingFace config missing required field: num_attention_heads")
+    if parsed.num_hidden_layers is None:
+        raise ValueError("HuggingFace config missing required field: num_hidden_layers")
+    if parsed.vocab_size is None:
+        raise ValueError("HuggingFace config missing required field: vocab_size")
+
+    embed_dim = parsed.hidden_size
+    q_heads = parsed.num_attention_heads
     kv_heads = parsed.num_key_value_heads or max(1, q_heads // 2)
     head_dim = parsed.head_dim or (embed_dim // q_heads)
-    num_layers = parsed.num_hidden_layers or base.num_layers
-    vocab_size = parsed.vocab_size or base.vocab_size
-    mlp_hidden_dim = parsed.intermediate_size or (embed_dim * base.mlp_mult)
+    num_layers = parsed.num_hidden_layers
+    vocab_size = parsed.vocab_size
+    mlp_hidden_dim = parsed.intermediate_size or (embed_dim * 4)
     mlp_mult = max(1, mlp_hidden_dim // embed_dim)
-    rope_theta = parsed.rope_theta or base.rope_theta
-    rms_eps = parsed.rms_norm_eps or base.rms_eps
-    attention_bias = parsed.attention_bias if parsed.attention_bias is not None else base.attention_bias
-    mlp_bias = parsed.mlp_bias if parsed.mlp_bias is not None else base.mlp_bias
+    rope_theta = parsed.rope_theta or 10_000.0
+    rms_eps = parsed.rms_norm_eps or 1e-6
+    attention_bias = parsed.attention_bias if parsed.attention_bias is not None else False
+    mlp_bias = parsed.mlp_bias if parsed.mlp_bias is not None else False
 
     # YaRN RoPE scaling
     rope_factor, rope_original_max, rope_beta_slow, rope_beta_fast = _parse_rope_scaling(cfg)
@@ -586,9 +622,9 @@ def hf_config_to_llm_config(
         kv_heads=kv_heads,
         head_dim=head_dim,
         num_layers=num_layers,
-        max_tsz=base.max_tsz,
+        max_tsz=max_tsz,
         rope_theta=rope_theta,
-        dropout_rate=base.dropout_rate,
+        dropout_rate=0.0,
         mlp_mult=mlp_mult,
         mlp_hidden_dim=mlp_hidden_dim,
         rms_eps=rms_eps,
@@ -638,10 +674,11 @@ def load_hf_weights_into_llm(
         dtype = jnp.bfloat16
 
     config_dict, state = _fetch_state_dict(repo_id, revision)
-    derived_cfg = hf_config_to_llm_config(config_dict, base=model.config)
 
-    if derived_cfg.embed_dim != model.config.embed_dim:
-        raise ValueError(f"HF hidden_size {derived_cfg.embed_dim} != model.embed_dim {model.config.embed_dim}")
+    # Validate that model config matches the HF config
+    hf_parsed = HFConfig.model_validate(config_dict)
+    if hf_parsed.hidden_size is not None and hf_parsed.hidden_size != model.config.embed_dim:
+        raise ValueError(f"HF hidden_size {hf_parsed.hidden_size} != model.embed_dim {model.config.embed_dim}")
 
     mesh = jax.sharding.get_mesh()
     if mesh is None:
@@ -716,22 +753,20 @@ def load_hf_weights_into_llm(
         v_b = _get_bias(state, f"{pfx}.v_proj.bias", f"{pfx_alt}.v_proj.bias")
         o_b = _get_bias(state, f"{pfx}.o_proj.bias", f"{pfx_alt}.o_proj.bias")
 
-        block = eqx.tree_at(lambda b: b.attn.q_proj, block, map_linear(block.attn.q_proj, q_w, q_b))
-        block = eqx.tree_at(lambda b: b.attn.k_proj, block, map_linear(block.attn.k_proj, k_w, k_b))
-        block = eqx.tree_at(lambda b: b.attn.v_proj, block, map_linear(block.attn.v_proj, v_w, v_b))
-        block = eqx.tree_at(lambda b: b.attn.o_proj, block, map_linear(block.attn.o_proj, o_w, o_b))
+        block = eqx.tree_at(lambda b: b.self_attn.q_proj, block, map_linear(block.self_attn.q_proj, q_w, q_b))
+        block = eqx.tree_at(lambda b: b.self_attn.k_proj, block, map_linear(block.self_attn.k_proj, k_w, k_b))
+        block = eqx.tree_at(lambda b: b.self_attn.v_proj, block, map_linear(block.self_attn.v_proj, v_w, v_b))
+        block = eqx.tree_at(lambda b: b.self_attn.output_proj, block, map_linear(block.self_attn.output_proj, o_w, o_b))
 
         # QK-Norm (Qwen3 style) - only create if weights are present
         q_norm_w = state.get(f"{pfx_alt}.q_norm.weight")
         k_norm_w = state.get(f"{pfx_alt}.k_norm.weight")
         if q_norm_w is not None:
-            q_norm = RMSNorm(q_norm_w.shape[-1], eps=derived_cfg.rms_eps)
-            q_norm = eqx.tree_at(lambda n: n.weight, q_norm, to_dtype(q_norm_w))
-            block = eqx.tree_at(lambda b: b.attn.q_norm, block, q_norm, is_leaf=lambda x: x is None)
+            q_norm = RMSNorm(weight=to_dtype(q_norm_w), eps=model.config.rms_eps)
+            block = eqx.tree_at(lambda b: b.self_attn.q_norm, block, q_norm, is_leaf=lambda x: x is None)
         if k_norm_w is not None:
-            k_norm = RMSNorm(k_norm_w.shape[-1], eps=derived_cfg.rms_eps)
-            k_norm = eqx.tree_at(lambda n: n.weight, k_norm, to_dtype(k_norm_w))
-            block = eqx.tree_at(lambda b: b.attn.k_norm, block, k_norm, is_leaf=lambda x: x is None)
+            k_norm = RMSNorm(weight=to_dtype(k_norm_w), eps=model.config.rms_eps)
+            block = eqx.tree_at(lambda b: b.self_attn.k_norm, block, k_norm, is_leaf=lambda x: x is None)
 
         # Layer norms
         pre_gamma = _get_weight(state, f"{blk_pfx}.input_layernorm.weight", f"{blk_pfx_alt}.input_layernorm.weight")
@@ -741,7 +776,7 @@ def load_hf_weights_into_llm(
         block = eqx.tree_at(lambda b: b.attn_norm.weight, block, to_dtype(pre_gamma))
         block = eqx.tree_at(lambda b: b.mlp_norm.weight, block, to_dtype(post_gamma))
 
-        # MLP projections
+        # MLP projections (SwiGLU)
         gate_w = _get_weight(state, f"{mlp_pfx}.gate_proj.weight", f"{mlp_pfx_alt}.gate_proj.weight")
         up_w = _get_weight(state, f"{mlp_pfx}.up_proj.weight", f"{mlp_pfx_alt}.up_proj.weight")
         down_w = _get_weight(state, f"{mlp_pfx}.down_proj.weight", f"{mlp_pfx_alt}.down_proj.weight")
@@ -749,9 +784,9 @@ def load_hf_weights_into_llm(
         up_b = _get_bias(state, f"{mlp_pfx}.up_proj.bias", f"{mlp_pfx_alt}.up_proj.bias")
         down_b = _get_bias(state, f"{mlp_pfx}.down_proj.bias", f"{mlp_pfx_alt}.down_proj.bias")
 
-        block = eqx.tree_at(lambda b: b.mlp.gate, block, map_linear(block.mlp.gate, gate_w, gate_b))
-        block = eqx.tree_at(lambda b: b.mlp.up, block, map_linear(block.mlp.up, up_w, up_b))
-        block = eqx.tree_at(lambda b: b.mlp.down, block, map_linear(block.mlp.down, down_w, down_b))
+        block = eqx.tree_at(lambda b: b.feed_forward.gate, block, map_linear(block.feed_forward.gate, gate_w, gate_b))
+        block = eqx.tree_at(lambda b: b.feed_forward.up, block, map_linear(block.feed_forward.up, up_w, up_b))
+        block = eqx.tree_at(lambda b: b.feed_forward.down, block, map_linear(block.feed_forward.down, down_w, down_b))
 
         model = eqx.tree_at(lambda mod, i=idx: mod.blocks[i], model, block)
 
@@ -773,7 +808,7 @@ def llm_generate(
     top_p: float = 0.9,
 ) -> list[int]:
     """Sampling-based decoding for quick sanity checks (non-JIT version)."""
-    tokens_arr = llm_generate_jit(
+    tokens_arr, final_len = llm_generate_jit(
         model,
         jnp.array(tokens, dtype=jnp.int32),
         eos_id if eos_id is not None else -1,
@@ -782,7 +817,8 @@ def llm_generate(
         top_p,
         jax.random.key(0),
     )
-    return tokens_arr.tolist()
+    # Trim to actual generated length (excluding padding after EOS)
+    return tokens_arr[: int(final_len)].tolist()
 
 
 def llm_generate_jit(
@@ -793,7 +829,7 @@ def llm_generate_jit(
     temperature: float,
     top_p: float,
     key: Array,
-) -> Array:
+) -> tuple[Array, Array]:
     """JIT-compilable sampling-based decoding.
 
     Args:
@@ -806,7 +842,9 @@ def llm_generate_jit(
         key: PRNG key for sampling.
 
     Returns:
-        Generated token sequence including input tokens, shape (seq_len + max_new_tokens,).
+        Tuple of (tokens, final_length):
+        - tokens: Generated token sequence including input tokens, shape (seq_len + max_new_tokens,).
+        - final_length: Number of valid tokens (excluding padding after EOS).
     """
     # Pad tokens to max possible length
     initial_len = tokens_t.shape[0]
@@ -858,15 +896,10 @@ def llm_generate_jit(
 
         return (new_tokens, cur_pos + 1, key, done)
 
-    final_tokens, _, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_state)
+    final_tokens, final_pos, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_state)
 
-    # Return all tokens (caller can trim if needed)
-    return final_tokens
-
-
-# --------------------------------------------------------------------------- #
-# CLI Main                                                                     #
-# --------------------------------------------------------------------------- #
+    # Return tokens and the final valid length
+    return final_tokens, final_pos
 
 
 def main() -> None:
@@ -895,7 +928,7 @@ def main() -> None:
 
     # Load config and build model
     cfg_dict = load_hf_config(args.repo, revision=args.revision)
-    config = hf_config_to_llm_config(cfg_dict, base=QWEN3_SMALL)
+    config = hf_config_to_llm_config(cfg_dict)
     model = build_qwen3_model(config)
 
     # Load weights
