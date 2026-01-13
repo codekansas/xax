@@ -41,7 +41,7 @@ class Config(xax.SupervisedConfig):
     learning_rate: float = xax.field(1e-4, help="Peak learning rate")
     min_learning_rate: float = xax.field(1e-5, help="Minimum learning rate for cosine decay")
     warmup_steps: int = xax.field(100, help="Number of warmup steps")
-    sequence_length: int = xax.field(512, help="Maximum sequence length")
+    sequence_length: int = xax.field(513, help="Maximum sequence length (N - 1 should be a multiple of 64 for cuDNN)")
     use_gradient_checkpointing: bool = xax.field(True, help="Recompute activations to save memory")
 
 
@@ -159,7 +159,7 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
             prompt_tokens = self._generation_prompt_tokens
             eos_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else -1
             gen_key, key = jax.random.split(key)
-            generated = xax.llm_generate_jit(
+            generated_tokens, _ = xax.llm_generate_jit(
                 model,
                 prompt_tokens,
                 eos_id,
@@ -168,14 +168,18 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
                 top_p=0.9,
                 key=gen_key,
             )
-            metrics["generated"] = xax.Tokens(generated)
+            metrics["generated"] = xax.Tokens(generated_tokens)
 
         return loss, metrics
 
     @override
     def decode_tokens(self, tokens: Array | np.ndarray) -> str:
-        # Convert to list for tokenizer compatibility
+        # Convert to list and strip trailing zeros (padding from generation)
         token_list: list[int] = tokens.tolist()
+        last_zero = len(token_list)
+        while last_zero > 0 and token_list[last_zero - 1] == 0:
+            last_zero -= 1
+        token_list = token_list[:last_zero]
         return self.tokenizer.decode(token_list, skip_special_tokens=True)
 
     @override

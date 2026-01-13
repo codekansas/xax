@@ -12,6 +12,7 @@ Key differences:
   by users when loading real checkpoints.
 """
 
+import functools
 import json
 import logging
 from dataclasses import dataclass, replace
@@ -176,39 +177,43 @@ class MultiHeadAttention(eqx.Module):
         q_bthd = q_flat.reshape(bsz, tsz, self.q_heads, self.head_dim)
         k_bthd = k_flat.reshape(bsz, tsz, self.kv_heads, self.head_dim)
 
-        # Broadcast kv heads to match q heads (grouped-query attention)
-        repeat_factor = self.q_heads // self.kv_heads
-        k_bthd = jnp.repeat(k_bthd, repeat_factor, axis=2)
-        v_bthd = jnp.repeat(v_bthd, repeat_factor, axis=2)
-
-        # Compute attention logits
-        attn_logits_bhtt = jnp.einsum("bthd,bThd->bhtT", q_bthd, k_bthd) / jnp.sqrt(self.head_dim)
-
-        # Create causal mask with optional sliding window
-        causal_mask_tt = jnp.tril(jnp.ones((tsz, tsz), dtype=bool))
-        if self.sliding_window_size is not None:
-            window_mask = jnp.triu(jnp.ones((tsz, tsz), dtype=bool), k=-(self.sliding_window_size - 1))
-            causal_mask_tt = causal_mask_tt & window_mask
-        attn_logits_bhtt = jnp.where(causal_mask_tt[None, None, :, :], attn_logits_bhtt, -1e9)
-
-        # Compute softmax with optional attention sinks
+        # Use jax.nn.dot_product_attention for efficient attention computation.
+        # Shape is already (batch, seq, heads, dim) which matches JAX's expected (B, T, N, H).
+        # Note: attention sinks are handled via bias if present.
+        bias = None
         if self.sinks is not None:
-            # Attention sinks: modified softmax with per-head learnable denominator
-            # Reference: https://arxiv.org/abs/2309.17453 (StreamingLLM)
-            sinks_h = self.sinks[None, :, None, None]
-            qk_max = jnp.maximum(jnp.max(attn_logits_bhtt, axis=-1, keepdims=True), sinks_h)
-            exp = jnp.exp(attn_logits_bhtt - qk_max)
-            attn_weights_bhtt = exp / (jnp.sum(exp, axis=-1, keepdims=True) + jnp.exp(sinks_h - qk_max))
-        else:
-            attn_weights_bhtt = jax.nn.softmax(attn_logits_bhtt, axis=-1)
+            # Attention sinks add a learnable bias to attention logits per head.
+            # Shape: (1, 1, heads, 1) broadcast to (batch, seq, heads, seq)
+            bias = self.sinks[None, None, :, None]
 
-        # Dropout (only during training)
-        if self.dropout_rate > 0.0 and not inference:
-            assert key is not None, "Dropout requires PRNG key when not in inference mode."
-            attn_weights_bhtt = eqx.nn.Dropout(self.dropout_rate)(attn_weights_bhtt, key=key)
+        # Check if cuDNN flash attention can be used for better performance.
+        # Requirements:
+        # - dtype: fp16, bf16, or fp8
+        # - head_dim: <= 128 and multiple of 8
+        # - sequence length: multiple of 64 (checked dynamically)
+        # - sliding window: only left window (r_window=0) with causal mask
+        # - no custom bias (attention sinks disable cuDNN)
+        dtype = q_bthd.dtype
+        can_use_cudnn = (
+            dtype in (jnp.float16, jnp.bfloat16)
+            and self.head_dim <= 128
+            and self.head_dim % 8 == 0
+            and bias is None
+            and tsz % 64 == 0
+        )
+        implementation = "cudnn" if can_use_cudnn else None
 
-        # Compute context
-        ctx_bthd = jnp.einsum("bhtT,bThd->bthd", attn_weights_bhtt, v_bthd)
+        ctx_bthd = jax.nn.dot_product_attention(
+            q_bthd,
+            k_bthd,
+            v_bthd,
+            bias=bias,
+            is_causal=True,
+            scale=1.0 / (self.head_dim ** 0.5),
+            local_window_size=(self.sliding_window_size, 0) if self.sliding_window_size else None,
+            implementation=implementation,
+        )
+
         ctx_btd = ctx_bthd.reshape(bsz, tsz, self.q_heads * self.head_dim)
         return _linear(ctx_btd, self.o_proj)
 
@@ -589,8 +594,13 @@ def chunked_cross_entropy_acc(
     return jnp.where(total_count > 0, total_correct / total_count, 0.0)
 
 
+@functools.lru_cache(maxsize=16)
 def download_repo(repo_id: str, revision: str | None = None, cache_dir: str | None = None) -> Path:
-    """Downloads a repo snapshot from the Huggingface Hub and returns the local path."""
+    """Downloads a repo snapshot from the Huggingface Hub and returns the local path.
+
+    Results are cached in-memory to avoid redundant HuggingFace Hub API calls
+    when the same repo is accessed multiple times (e.g., config + weights).
+    """
     return Path(snapshot_download(repo_id=repo_id, revision=revision, cache_dir=cache_dir))
 
 
@@ -984,7 +994,7 @@ def llm_generate(
     top_p: float = 0.9,
 ) -> list[int]:
     """Sampling-based decoding for quick sanity checks (non-JIT version)."""
-    tokens_arr = llm_generate_jit(
+    tokens_arr, final_len = llm_generate_jit(
         model,
         jnp.array(tokens, dtype=jnp.int32),
         eos_id if eos_id is not None else -1,
@@ -993,7 +1003,8 @@ def llm_generate(
         top_p,
         jax.random.key(0),
     )
-    return tokens_arr.tolist()
+    # Trim to actual generated length (excluding padding after EOS)
+    return tokens_arr[:int(final_len)].tolist()
 
 
 def llm_generate_jit(
@@ -1004,7 +1015,7 @@ def llm_generate_jit(
     temperature: float,
     top_p: float,
     key: Array,
-) -> Array:
+) -> tuple[Array, Array]:
     """JIT-compilable sampling-based decoding.
 
     Args:
@@ -1017,7 +1028,9 @@ def llm_generate_jit(
         key: PRNG key for sampling.
 
     Returns:
-        Generated token sequence including input tokens, shape (seq_len + max_new_tokens,).
+        Tuple of (tokens, final_length):
+        - tokens: Generated token sequence including input tokens, shape (seq_len + max_new_tokens,).
+        - final_length: Number of valid tokens (excluding padding after EOS).
     """
     # Pad tokens to max possible length
     initial_len = tokens_t.shape[0]
@@ -1069,10 +1082,10 @@ def llm_generate_jit(
 
         return (new_tokens, cur_pos + 1, key, done)
 
-    final_tokens, _, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_state)
+    final_tokens, final_pos, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_state)
 
-    # Return all tokens (caller can trim if needed)
-    return final_tokens
+    # Return tokens and the final valid length
+    return final_tokens, final_pos
 
 
 # --------------------------------------------------------------------------- #
