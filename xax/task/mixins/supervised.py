@@ -152,11 +152,13 @@ class SupervisedMixin(
                 acc_loss = acc_loss + loss
                 return (acc_grads, acc_loss, key), None
 
-            # Accumulate gradients over micro-batches using scan.
+            # Accumulate gradients over remaining micro-batches using scan.
+            # Note: We skip batches[0] since it was already processed above.
+            remaining_batches = jax.tree.map(lambda x: x[1:], batches)
             (acc_grads, acc_loss, key), _ = jax.lax.scan(
                 accum_fn,
                 (acc_grads, acc_loss, key),
-                batches,
+                remaining_batches,
             )
 
             # Average gradients and loss over micro-batches.

@@ -139,7 +139,7 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
             targets_bt,
             model.lm_head.weight,
             mask_bt,
-            chunk_size=128,
+            chunk_size=256,
         )
 
         metrics: dict[str, xax.Metric] = {}
@@ -151,7 +151,7 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
                 targets_bt,
                 model.lm_head.weight,
                 mask_bt,
-                chunk_size=128,
+                chunk_size=256,
             )
             metrics["accuracy"] = xax.Scalar(accuracy)
 
