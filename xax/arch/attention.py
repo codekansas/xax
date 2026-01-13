@@ -1,10 +1,15 @@
 """Attention mechanisms for transformer models.
 
-This module implements standard attention mechanisms for transformers, but
-supporting a fixed-size context window and caching that can be used to train
-transformers which can be unrolled with a fixed-length cache.
+This module implements standard attention mechanisms for transformers, supporting:
+- Self-attention and cross-attention
+- Grouped Query Attention (GQA) for efficient KV caching
+- Rotary Position Embeddings (RoPE) with YaRN extension
+- Sliding window attention
+- FP8 quantization for matrix multiplications
+- cuDNN flash attention acceleration
 
-Supports optional FP8 quantization for matrix multiplications when use_fp8=True.
+These are general-purpose building blocks that can be used for training
+transformers from scratch or fine-tuning pre-trained models (with LoRA, etc).
 """
 
 import math
@@ -18,7 +23,111 @@ import jax.numpy as jnp
 from jaxtyping import Array, PRNGKeyArray
 
 from xax.nn.fp8 import Fp8Linear, Fp8Scales, init_fp8_scales
+from xax.nn.lora import LoRALinear
 from xax.utils.jax import scan as xax_scan
+
+
+class RMSNorm(eqx.Module):
+    """RMSNorm over the last dimension (no bias), matching LLaMA/Qwen style.
+
+    RMS normalization is more efficient than LayerNorm and works well for LLMs.
+    It normalizes by the root mean square without centering (no mean subtraction).
+    """
+
+    weight: Array
+    eps: float = 1e-6
+
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        self.weight = jnp.ones((dim,), dtype=jnp.float32)
+        self.eps = eps
+
+    def __call__(self, x: Array) -> Array:
+        norm = jnp.sqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + self.eps)
+        return (x / norm) * self.weight
+
+
+class SwiGLU(eqx.Module):
+    """SwiGLU feed-forward layer (LLaMA/Qwen style).
+
+    Uses gated linear unit with SiLU activation:
+        output = down(silu(gate(x)) * up(x))
+
+    This is more expressive than standard FFN and commonly used in modern LLMs.
+    """
+
+    gate: eqx.nn.Linear
+    up: eqx.nn.Linear
+    down: eqx.nn.Linear
+
+    def __init__(
+        self,
+        embed_dim: int,
+        hidden_dim: int | None = None,
+        *,
+        key: PRNGKeyArray,
+        use_bias: bool = False,
+    ) -> None:
+        """Initialize SwiGLU feed-forward layer.
+
+        Args:
+            embed_dim: Input/output embedding dimension
+            hidden_dim: Hidden dimension (defaults to 4 * embed_dim)
+            key: PRNG key for initialization
+            use_bias: Whether to use bias in linear layers
+        """
+        if hidden_dim is None:
+            hidden_dim = embed_dim * 4
+
+        k1, k2, k3 = jax.random.split(key, 3)
+        self.gate = eqx.nn.Linear(embed_dim, hidden_dim, use_bias=use_bias, key=k1)
+        self.up = eqx.nn.Linear(embed_dim, hidden_dim, use_bias=use_bias, key=k2)
+        self.down = eqx.nn.Linear(hidden_dim, embed_dim, use_bias=use_bias, key=k3)
+
+    def __call__(self, x: Array) -> Array:
+        chex.assert_rank(x, {2, 3})
+        gate_out = jax.nn.silu(x @ self.gate.weight.T)
+        up_out = x @ self.up.weight.T
+        if self.gate.bias is not None:
+            gate_out = gate_out + self.gate.bias
+        if self.up.bias is not None:
+            up_out = up_out + self.up.bias
+        hidden = gate_out * up_out
+        out = hidden @ self.down.weight.T
+        if self.down.bias is not None:
+            out = out + self.down.bias
+        return out
+
+
+def can_use_cudnn_attention(
+    dtype: jnp.dtype,
+    head_dim: int,
+    seq_len: int,
+    has_bias: bool = False,
+) -> bool:
+    """Check if cuDNN flash attention can be used.
+
+    cuDNN flash attention requirements:
+    - dtype: fp16, bf16, or fp8
+    - head_dim: <= 128 and multiple of 8
+    - sequence length: multiple of 64
+    - no custom attention bias (masks are OK)
+
+    Args:
+        dtype: Data type of Q/K/V tensors
+        head_dim: Dimension per attention head
+        seq_len: Sequence length
+        has_bias: Whether custom attention bias is used
+
+    Returns:
+        True if cuDNN can be used, False otherwise
+    """
+    return (
+        dtype in (jnp.float16, jnp.bfloat16)
+        and head_dim <= 128
+        and head_dim % 8 == 0
+        and seq_len % 64 == 0
+        and not has_bias
+    )
 
 
 class AttentionCache(TypedDict):
@@ -360,8 +469,181 @@ class RotaryEmbedding(eqx.Module):
         return result
 
 
+def llm_linear(x_btd: Array, linear: eqx.nn.Linear) -> Array:
+    """Apply linear layer with einsum for better performance.
+
+    Also supports LoRALinear layers which have weight_oi/bias_o instead of weight/bias.
+    This enables LoRA fine-tuning of pre-trained models.
+    """
+    if isinstance(linear, LoRALinear):
+        # LoRALinear: use weight_oi and bias_o, plus LoRA delta
+        y_bto = jnp.einsum("...d,od->...o", x_btd, linear.weight_oi)
+        if linear.bias_o is not None:
+            y_bto = y_bto + linear.bias_o
+        # Add LoRA contribution: (x @ A) @ B * alpha
+        delta_bto = (x_btd @ linear.lora_a_ir) @ linear.lora_b_ro * linear.alpha
+        return y_bto + delta_bto
+    else:
+        # Standard eqx.nn.Linear
+        y_bto = jnp.einsum("...d,od->...o", x_btd, linear.weight)
+        if linear.bias is not None:
+            y_bto = y_bto + linear.bias
+        return y_bto
+
+
+class LLMAttention(eqx.Module):
+    """Grouped-query attention with rotary embeddings for LLMs.
+
+    Features:
+    - Grouped Query Attention (GQA) for efficient KV caching
+    - Rotary Position Embeddings (RoPE) with YaRN extension
+    - QK-Norm (Qwen3 style) for training stability
+    - Sliding window attention for long contexts
+    - Attention sinks for improved generation quality
+    - LoRA support via llm_linear helper
+    - cuDNN flash attention acceleration
+    """
+
+    q_proj: eqx.nn.Linear
+    k_proj: eqx.nn.Linear
+    v_proj: eqx.nn.Linear
+    o_proj: eqx.nn.Linear
+    rotary: RotaryEmbedding
+    q_norm: RMSNorm | None  # QK-Norm for Qwen3
+    k_norm: RMSNorm | None  # QK-Norm for Qwen3
+    q_heads: int
+    kv_heads: int
+    head_dim: int
+    dropout_rate: float
+    sliding_window_size: int | None = None  # None = full attention, int = window size
+    sinks: Array | None = None  # Learnable attention sinks for softmax stability
+
+    def __call__(
+        self,
+        x_btd: Array,
+        positions_bt: Array,
+        *,
+        key: jax.Array | None = None,
+        inference: bool = True,
+    ) -> Array:
+        chex.assert_rank(x_btd, 3)
+        chex.assert_rank(positions_bt, 2)
+        bsz, tsz, _ = x_btd.shape
+        chex.assert_shape(positions_bt, (bsz, tsz))
+
+        q_bthd = llm_linear(x_btd, self.q_proj).reshape(bsz, tsz, self.q_heads, self.head_dim)
+        k_bthd = llm_linear(x_btd, self.k_proj).reshape(bsz, tsz, self.kv_heads, self.head_dim)
+        v_bthd = llm_linear(x_btd, self.v_proj).reshape(bsz, tsz, self.kv_heads, self.head_dim)
+
+        # Apply QK-Norm before RoPE (Qwen3 style)
+        if self.q_norm is not None:
+            q_bthd = self.q_norm(q_bthd)
+        if self.k_norm is not None:
+            k_bthd = self.k_norm(k_bthd)
+
+        # Apply rotary embeddings
+        positions_flat = positions_bt.reshape(-1)
+        q_flat = q_bthd.reshape(-1, self.q_heads, self.head_dim)
+        k_flat = k_bthd.reshape(-1, self.kv_heads, self.head_dim)
+
+        q_flat = self.rotary.apply_rotary_embeddings(q_flat, positions=positions_flat)
+        k_flat = self.rotary.apply_rotary_embeddings(k_flat, positions=positions_flat)
+
+        q_bthd = q_flat.reshape(bsz, tsz, self.q_heads, self.head_dim)
+        k_bthd = k_flat.reshape(bsz, tsz, self.kv_heads, self.head_dim)
+
+        # Use jax.nn.dot_product_attention for efficient attention computation.
+        # Shape is already (batch, seq, heads, dim) which matches JAX's expected (B, T, N, H).
+        # Note: attention sinks are handled via bias if present.
+        bias = None
+        if self.sinks is not None:
+            # Attention sinks add a learnable bias to attention logits per head.
+            # Shape: (1, 1, heads, 1) broadcast to (batch, seq, heads, seq)
+            bias = self.sinks[None, None, :, None]
+
+        # Check if cuDNN flash attention can be used
+        use_cudnn = can_use_cudnn_attention(
+            dtype=q_bthd.dtype,
+            head_dim=self.head_dim,
+            seq_len=tsz,
+            has_bias=bias is not None,
+        )
+        implementation = "cudnn" if use_cudnn else None
+
+        ctx_bthd = jax.nn.dot_product_attention(
+            q_bthd,
+            k_bthd,
+            v_bthd,
+            bias=bias,
+            is_causal=True,
+            scale=1.0 / (self.head_dim**0.5),
+            local_window_size=(self.sliding_window_size, 0) if self.sliding_window_size else None,
+            implementation=implementation,
+        )
+
+        ctx_btd = ctx_bthd.reshape(bsz, tsz, self.q_heads * self.head_dim)
+        return llm_linear(ctx_btd, self.o_proj)
+
+
+class LLMFeedForward(eqx.Module):
+    """SwiGLU feed-forward layer for LLMs with LoRA support.
+
+    Uses gated linear unit with SiLU activation:
+        output = down(silu(gate(x)) * up(x))
+
+    Supports LoRA fine-tuning via llm_linear helper.
+    """
+
+    gate: eqx.nn.Linear
+    up: eqx.nn.Linear
+    down: eqx.nn.Linear
+
+    def __call__(self, x_btd: Array) -> Array:
+        chex.assert_rank(x_btd, {2, 3})
+        gated_btd = jax.nn.silu(llm_linear(x_btd, self.gate)) * llm_linear(x_btd, self.up)
+        return llm_linear(gated_btd, self.down)
+
+
+class LLMBlock(eqx.Module):
+    """Single transformer layer with pre-norm for LLMs.
+
+    Uses RMSNorm and SwiGLU feed-forward, which are standard in modern LLMs
+    like LLaMA, Qwen, and Mistral.
+    """
+
+    attn: LLMAttention
+    attn_norm: RMSNorm
+    mlp_norm: RMSNorm
+    mlp: LLMFeedForward
+
+    def __call__(
+        self,
+        x_btd: Array,
+        positions_bt: Array,
+        *,
+        key: jax.Array | None = None,
+        inference: bool = True,
+    ) -> Array:
+        attn_key = None
+        if key is not None:
+            attn_key, _ = jax.random.split(key, 2)
+        normed = self.attn_norm(x_btd)
+        y_btd = x_btd + self.attn(normed, positions_bt, key=attn_key, inference=inference)
+        y_btd = y_btd + self.mlp(self.mlp_norm(y_btd))
+        return y_btd
+
+
 class SelfAttentionBlock(eqx.Module):
-    """Self-attention block using jax.nn.dot_product_attention."""
+    """Self-attention block with Grouped Query Attention (GQA) support.
+
+    Supports:
+    - Standard multi-head attention (num_kv_heads == num_heads)
+    - Grouped Query Attention (num_kv_heads < num_heads) for efficient KV caching
+    - Rotary Position Embeddings (RoPE)
+    - Sliding window attention
+    - cuDNN flash attention acceleration (when conditions are met)
+    - FP8 quantization
+    """
 
     q_proj: eqx.nn.Linear | Fp8Linear = eqx.field()
     k_proj: eqx.nn.Linear | Fp8Linear = eqx.field()
@@ -369,6 +651,7 @@ class SelfAttentionBlock(eqx.Module):
     output_proj: eqx.nn.Linear | Fp8Linear = eqx.field()
     rotary_emb: RotaryEmbedding | None = eqx.field()
     num_heads: int = eqx.field(static=True)
+    num_kv_heads: int = eqx.field(static=True)
     head_dim: int = eqx.field(static=True)
     causal: bool = eqx.field(static=True)
     local_window_size: int | None = eqx.field(static=True)
@@ -380,33 +663,59 @@ class SelfAttentionBlock(eqx.Module):
         num_heads: int,
         *,
         key: PRNGKeyArray,
+        num_kv_heads: int | None = None,
+        head_dim: int | None = None,
         causal: bool = False,
         context_length: int | None = None,
         use_rotary_embeddings: bool = False,
         rotary_base: float = 10000.0,
+        rotary_style: RotaryEmbeddingStyle = "concatenated",
         use_fp8: bool = False,
         compute_dtype: jnp.dtype = jnp.bfloat16,
     ) -> None:
+        """Initialize self-attention block.
+
+        Args:
+            embed_dim: Model embedding dimension
+            num_heads: Number of query attention heads
+            key: PRNG key for initialization
+            num_kv_heads: Number of key/value heads for GQA (defaults to num_heads)
+            head_dim: Dimension per head (defaults to embed_dim // num_heads)
+            causal: Whether to use causal masking
+            context_length: Sliding window size (None = full attention)
+            use_rotary_embeddings: Whether to use RoPE
+            rotary_base: RoPE theta base frequency
+            rotary_style: RoPE style ("concatenated" for LLaMA/Qwen, "interleaved" for GPT-NeoX)
+            use_fp8: Whether to use FP8 quantization
+            compute_dtype: Compute dtype for FP8 mode
+        """
         if context_length is not None:
             assert context_length > 1, "context_length must be at least 2"
 
         keys = jax.random.split(key, 4)
 
         self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        self.head_dim = head_dim if head_dim is not None else embed_dim // num_heads
         self.use_fp8 = use_fp8
-        assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
 
-        self.q_proj = _make_linear(embed_dim, embed_dim, keys[0], use_fp8, compute_dtype)
-        self.k_proj = _make_linear(embed_dim, embed_dim, keys[1], use_fp8, compute_dtype)
-        self.v_proj = _make_linear(embed_dim, embed_dim, keys[2], use_fp8, compute_dtype)
-        self.output_proj = _make_linear(embed_dim, embed_dim, keys[3], use_fp8, compute_dtype)
+        # GQA: num_heads must be divisible by num_kv_heads
+        assert num_heads % self.num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
+
+        q_dim = num_heads * self.head_dim
+        kv_dim = self.num_kv_heads * self.head_dim
+
+        self.q_proj = _make_linear(embed_dim, q_dim, keys[0], use_fp8, compute_dtype)
+        self.k_proj = _make_linear(embed_dim, kv_dim, keys[1], use_fp8, compute_dtype)
+        self.v_proj = _make_linear(embed_dim, kv_dim, keys[2], use_fp8, compute_dtype)
+        self.output_proj = _make_linear(q_dim, embed_dim, keys[3], use_fp8, compute_dtype)
 
         # Initialize rotary embeddings if requested
         if use_rotary_embeddings:
             self.rotary_emb = RotaryEmbedding(
                 head_dim=self.head_dim,
                 base=rotary_base,
+                style=rotary_style,
             )
         else:
             self.rotary_emb = None
@@ -422,15 +731,20 @@ class SelfAttentionBlock(eqx.Module):
     def embed_dim(self) -> int:
         return self.head_dim * self.num_heads
 
-    def _reshape_for_multihead(self, x: Array) -> Array:
-        """Reshape from (seq_len, embed_dim) to (seq_len, num_heads, head_dim)."""
+    def _reshape_q(self, x: Array) -> Array:
+        """Reshape Q from (seq_len, q_dim) to (seq_len, num_heads, head_dim)."""
         seq_len, _ = x.shape
         return x.reshape(seq_len, self.num_heads, self.head_dim)
 
+    def _reshape_kv(self, x: Array) -> Array:
+        """Reshape K/V from (seq_len, kv_dim) to (seq_len, num_kv_heads, head_dim)."""
+        seq_len, _ = x.shape
+        return x.reshape(seq_len, self.num_kv_heads, self.head_dim)
+
     def _combine_heads(self, x: Array) -> Array:
-        """Reshape from (seq_len, num_heads, head_dim) to (seq_len, embed_dim)."""
-        _, n, h = x.shape
-        return x.reshape(-1, n * h)
+        """Reshape from (seq_len, num_heads, head_dim) to (seq_len, q_dim)."""
+        seq_len, _, _ = x.shape
+        return x.reshape(seq_len, -1)
 
     def init_cache(self, dtype: jnp.dtype | None = None) -> AttentionCache:
         """Initialize cache for the input.
@@ -444,9 +758,9 @@ class SelfAttentionBlock(eqx.Module):
         if self.local_window_size is None:
             raise ValueError("context_length must be set for caching")
 
-        # Create fixed-length cache
-        k_cache = jnp.zeros((self.local_window_size, self.num_heads, self.head_dim), dtype=dtype)
-        v_cache = jnp.zeros((self.local_window_size, self.num_heads, self.head_dim), dtype=dtype)
+        # Create fixed-length cache (uses num_kv_heads for GQA efficiency)
+        k_cache = jnp.zeros((self.local_window_size, self.num_kv_heads, self.head_dim), dtype=dtype)
+        v_cache = jnp.zeros((self.local_window_size, self.num_kv_heads, self.head_dim), dtype=dtype)
 
         return {"k": k_cache, "v": v_cache, "position": 0}
 
@@ -488,7 +802,7 @@ class SelfAttentionBlock(eqx.Module):
         cache: AttentionCache | None = None,
         fp8_scales: Fp8ScalesCache | None = None,
     ) -> tuple[Array, AttentionCache, Fp8ScalesCache | None]:
-        """Apply self-attention.
+        """Apply self-attention with optional GQA and cuDNN acceleration.
 
         Args:
             x_tn: Input tensor of shape (seq_len, embed_dim)
@@ -512,10 +826,10 @@ class SelfAttentionBlock(eqx.Module):
         k, new_k_scales = _apply_linear_batched(self.k_proj, x_tn, k_scales)
         v, new_v_scales = _apply_linear_batched(self.v_proj, x_tn, v_scales)
 
-        # Reshape to multihead format
-        q = self._reshape_for_multihead(q)
-        k = self._reshape_for_multihead(k)
-        v = self._reshape_for_multihead(v)
+        # Reshape to multihead format (Q has num_heads, K/V have num_kv_heads)
+        q = self._reshape_q(q)
+        k = self._reshape_kv(k)
+        v = self._reshape_kv(v)
 
         seq_len = q.shape[0]
         if self.rotary_emb is not None:
@@ -539,11 +853,20 @@ class SelfAttentionBlock(eqx.Module):
         else:
             new_position = seq_len
 
+        # Check if cuDNN can be used
+        use_cudnn = can_use_cudnn_attention(
+            dtype=q.dtype,
+            head_dim=self.head_dim,
+            seq_len=seq_len,
+            has_bias=False,
+        )
+        implementation = "cudnn" if use_cudnn else None
+
         if seq_len == 1:
-            attn_output = jax.nn.dot_product_attention(q, k, v)
+            attn_output = jax.nn.dot_product_attention(q, k, v, implementation=implementation)
 
         elif mask is not None:
-            attn_output = jax.nn.dot_product_attention(q, k, v, mask=mask)
+            attn_output = jax.nn.dot_product_attention(q, k, v, mask=mask, implementation=implementation)
 
         elif cache is not None:
             raise NotImplementedError("For training with a cache, provide a mask instead.")
@@ -555,6 +878,7 @@ class SelfAttentionBlock(eqx.Module):
                 v,
                 is_causal=self.causal,
                 local_window_size=(self.local_window_size, 0) if self.local_window_size is not None else None,
+                implementation=implementation,
             )
 
         attn_output = self._combine_heads(attn_output)

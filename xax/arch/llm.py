@@ -16,9 +16,15 @@ from jaxtyping import Array
 from omegaconf import MISSING
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field as PydanticField
 
-from xax.arch.attention import RotaryEmbedding
+from xax.arch.attention import (
+    LLMAttention,
+    LLMBlock,
+    LLMFeedForward,
+    RMSNorm,
+    RotaryEmbedding,
+    llm_linear,
+)
 from xax.core.conf import field
-from xax.nn.lora import LoRALinear
 
 try:
     from huggingface_hub import snapshot_download
@@ -35,33 +41,6 @@ except ModuleNotFoundError as e:
     ) from e
 
 logger = logging.getLogger(__name__)
-
-
-# --------------------------------------------------------------------------- #
-# Core Modules                                                                 #
-# --------------------------------------------------------------------------- #
-
-
-def _linear(x_btd: Array, linear: eqx.nn.Linear) -> Array:
-    """Apply linear layer with einsum for better performance.
-
-    Also supports LoRALinear layers which have weight_oi/bias_o instead of weight/bias.
-    """
-    # Handle LoRALinear (weight_oi) vs eqx.nn.Linear (weight)
-    if isinstance(linear, LoRALinear):
-        # LoRALinear: use weight_oi and bias_o, plus LoRA delta
-        y_bto = jnp.einsum("...d,od->...o", x_btd, linear.weight_oi)
-        if linear.bias_o is not None:
-            y_bto = y_bto + linear.bias_o
-        # Add LoRA contribution: (x @ A) @ B * alpha
-        delta_bto = (x_btd @ linear.lora_a_ir) @ linear.lora_b_ro * linear.alpha
-        return y_bto + delta_bto
-    else:
-        # Standard eqx.nn.Linear
-        y_bto = jnp.einsum("...d,od->...o", x_btd, linear.weight)
-        if linear.bias is not None:
-            y_bto = y_bto + linear.bias
-        return y_bto
 
 
 @dataclass(frozen=True)
@@ -99,156 +78,11 @@ class LLMConfig:
         return self.rope_factor > 1.0 and self.rope_original_max_position_embeddings is not None
 
 
-class RMSNorm(eqx.Module):
-    """RMSNorm over the last dimension (no bias), matching LLaMA/Qwen style."""
-
-    weight: Array
-    eps: float = 1e-6
-
-    def __init__(self, dim: int, eps: float = 1e-6) -> None:
-        self.weight = jnp.ones((dim,), dtype=jnp.float32)
-        self.eps = eps
-
-    def __call__(self, x_btd: Array) -> Array:
-        norm = jnp.sqrt(jnp.mean(jnp.square(x_btd), axis=-1, keepdims=True) + self.eps)
-        return (x_btd / norm) * self.weight
-
-
-class MultiHeadAttention(eqx.Module):
-    """Grouped-query attention with rotary embeddings."""
-
-    q_proj: eqx.nn.Linear
-    k_proj: eqx.nn.Linear
-    v_proj: eqx.nn.Linear
-    o_proj: eqx.nn.Linear
-    rotary: RotaryEmbedding
-    q_norm: RMSNorm | None  # QK-Norm for Qwen3
-    k_norm: RMSNorm | None  # QK-Norm for Qwen3
-    q_heads: int
-    kv_heads: int
-    head_dim: int
-    dropout_rate: float
-    sliding_window_size: int | None = None  # None = full attention, int = window size
-    sinks: Array | None = None  # Learnable attention sinks for softmax stability
-
-    def __call__(
-        self,
-        x_btd: Array,
-        positions_bt: Array,
-        *,
-        key: jax.Array | None = None,
-        inference: bool = True,
-    ) -> Array:
-        chex.assert_rank(x_btd, 3)
-        chex.assert_rank(positions_bt, 2)
-        bsz, tsz, _ = x_btd.shape
-        chex.assert_shape(positions_bt, (bsz, tsz))
-
-        q_bthd = _linear(x_btd, self.q_proj).reshape(bsz, tsz, self.q_heads, self.head_dim)
-        k_bthd = _linear(x_btd, self.k_proj).reshape(bsz, tsz, self.kv_heads, self.head_dim)
-        v_bthd = _linear(x_btd, self.v_proj).reshape(bsz, tsz, self.kv_heads, self.head_dim)
-
-        # Apply QK-Norm before RoPE (Qwen3 style)
-        if self.q_norm is not None:
-            q_bthd = self.q_norm(q_bthd)
-        if self.k_norm is not None:
-            k_bthd = self.k_norm(k_bthd)
-
-        # Apply rotary embeddings
-        positions_flat = positions_bt.reshape(-1)
-        q_flat = q_bthd.reshape(-1, self.q_heads, self.head_dim)
-        k_flat = k_bthd.reshape(-1, self.kv_heads, self.head_dim)
-
-        q_flat = self.rotary.apply_rotary_embeddings(q_flat, positions=positions_flat)
-        k_flat = self.rotary.apply_rotary_embeddings(k_flat, positions=positions_flat)
-
-        q_bthd = q_flat.reshape(bsz, tsz, self.q_heads, self.head_dim)
-        k_bthd = k_flat.reshape(bsz, tsz, self.kv_heads, self.head_dim)
-
-        # Use jax.nn.dot_product_attention for efficient attention computation.
-        # Shape is already (batch, seq, heads, dim) which matches JAX's expected (B, T, N, H).
-        # Note: attention sinks are handled via bias if present.
-        bias = None
-        if self.sinks is not None:
-            # Attention sinks add a learnable bias to attention logits per head.
-            # Shape: (1, 1, heads, 1) broadcast to (batch, seq, heads, seq)
-            bias = self.sinks[None, None, :, None]
-
-        # Check if cuDNN flash attention can be used for better performance.
-        # Requirements:
-        # - dtype: fp16, bf16, or fp8
-        # - head_dim: <= 128 and multiple of 8
-        # - sequence length: multiple of 64 (checked dynamically)
-        # - sliding window: only left window (r_window=0) with causal mask
-        # - no custom bias (attention sinks disable cuDNN)
-        dtype = q_bthd.dtype
-        can_use_cudnn = (
-            dtype in (jnp.float16, jnp.bfloat16)
-            and self.head_dim <= 128
-            and self.head_dim % 8 == 0
-            and bias is None
-            and tsz % 64 == 0
-        )
-        implementation = "cudnn" if can_use_cudnn else None
-
-        ctx_bthd = jax.nn.dot_product_attention(
-            q_bthd,
-            k_bthd,
-            v_bthd,
-            bias=bias,
-            is_causal=True,
-            scale=1.0 / (self.head_dim**0.5),
-            local_window_size=(self.sliding_window_size, 0) if self.sliding_window_size else None,
-            implementation=implementation,
-        )
-
-        ctx_btd = ctx_bthd.reshape(bsz, tsz, self.q_heads * self.head_dim)
-        return _linear(ctx_btd, self.o_proj)
-
-
-class FeedForward(eqx.Module):
-    """SwiGLU feed-forward layer (LLaMA/Qwen style)."""
-
-    gate: eqx.nn.Linear
-    up: eqx.nn.Linear
-    down: eqx.nn.Linear
-
-    def __call__(self, x_btd: Array) -> Array:
-        chex.assert_rank(x_btd, {2, 3})
-        gated_btd = jax.nn.silu(_linear(x_btd, self.gate)) * _linear(x_btd, self.up)
-        return _linear(gated_btd, self.down)
-
-
-class TransformerBlock(eqx.Module):
-    """Single transformer layer with pre-norm."""
-
-    attn: MultiHeadAttention
-    attn_norm: RMSNorm
-    mlp_norm: RMSNorm
-    mlp: FeedForward
-
-    def __call__(
-        self,
-        x_btd: Array,
-        positions_bt: Array,
-        *,
-        key: jax.Array | None = None,
-        inference: bool = True,
-    ) -> Array:
-        attn_key = None
-        if key is not None:
-            attn_key, _ = jax.random.split(key, 2)
-        normed = self.attn_norm(x_btd)
-        y_btd = x_btd + self.attn(normed, positions_bt, key=attn_key, inference=inference)
-        y_btd = y_btd + self.mlp(self.mlp_norm(y_btd))
-        return y_btd
-
-
 class LLM(eqx.Module):
     """Minimal decoder-only LLM."""
 
     embed: eqx.nn.Embedding
-    blocks: tuple[TransformerBlock, ...]
+    blocks: tuple[LLMBlock, ...]
     norm: RMSNorm
     lm_head: eqx.nn.Linear
     config: LLMConfig
@@ -274,7 +108,7 @@ class LLM(eqx.Module):
                 if "sliding" in config.layer_attention_types[i]:
                     layer_window = config.sliding_window_size
 
-            attn = MultiHeadAttention(
+            attn = LLMAttention(
                 q_proj=eqx.nn.Linear(config.embed_dim, q_dim, use_bias=attn_bias, key=k_attn),
                 k_proj=eqx.nn.Linear(config.embed_dim, kv_dim, use_bias=attn_bias, key=k_attn),
                 v_proj=eqx.nn.Linear(config.embed_dim, kv_dim, use_bias=attn_bias, key=k_attn),
@@ -297,14 +131,14 @@ class LLM(eqx.Module):
                 sliding_window_size=layer_window,
             )
 
-            mlp = FeedForward(
+            mlp = LLMFeedForward(
                 gate=eqx.nn.Linear(config.embed_dim, mlp_width, use_bias=mlp_bias, key=k_mlp),
                 up=eqx.nn.Linear(config.embed_dim, mlp_width, use_bias=mlp_bias, key=k_mlp),
                 down=eqx.nn.Linear(mlp_width, config.embed_dim, use_bias=mlp_bias, key=k_mlp),
             )
 
             blocks.append(
-                TransformerBlock(
+                LLMBlock(
                     attn=attn,
                     attn_norm=RMSNorm(config.embed_dim, eps=config.rms_eps),
                     mlp_norm=RMSNorm(config.embed_dim, eps=config.rms_eps),
@@ -344,15 +178,15 @@ class LLM(eqx.Module):
 
                 @jax.checkpoint
                 def remat_block(
-                    arrays: TransformerBlock,
+                    arrays: LLMBlock,
                     x: Array,
                     pos: Array,
                     k: jax.Array | None,
                     inf: bool,
                     *,
-                    static: TransformerBlock = block_static,
+                    static: LLMBlock = block_static,
                 ) -> Array:
-                    b: TransformerBlock = eqx.combine(arrays, static)
+                    b: LLMBlock = eqx.combine(arrays, static)
                     return b(x, pos, key=k, inference=inf)
 
                 x_btd = remat_block(block_arrays, x_btd, positions_bt, block_key, inference)
@@ -369,7 +203,7 @@ class LLM(eqx.Module):
     ) -> Array:
         """Forward pass returning logits shaped (bsz, tsz, vocab_size)."""
         x_btd = self.forward_hidden(tokens_bt, key=key, inference=inference)
-        logits_btv = _linear(x_btd, self.lm_head)
+        logits_btv = llm_linear(x_btd, self.lm_head)
         return logits_btv
 
 
