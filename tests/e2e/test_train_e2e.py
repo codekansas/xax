@@ -4,7 +4,7 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, TypedDict, override
 
 import equinox as eqx
 import jax
@@ -58,26 +58,29 @@ class SimpleModel(eqx.Module):
 class SimpleTask(xax.SupervisedTask[SimpleConfig]):
     """Test task for end-to-end training verification."""
 
+    @override
     def get_model(self, params: xax.InitParams) -> SimpleModel:
         return SimpleModel(self.config, key=params.key)
 
+    @override
     def get_optimizer(self) -> xax.Optimizer:
         return optax.adam(self.config.learning_rate)
 
-    def get_output(self, model: SimpleModel, batch: Batch, state: xax.State, key: PRNGKeyArray) -> Array:
-        return jax.vmap(model)(batch["x"])
-
+    @override
     def compute_loss(
         self,
         model: SimpleModel,
         batch: Batch,
-        output: Array,
         state: xax.State,
+        heavy: bool,
         key: PRNGKeyArray,
-    ) -> Array:
+    ) -> tuple[Array, dict[str, xax.Metric]]:
+        output = jax.vmap(model)(batch["x"])
         y_one_hot = jax.nn.one_hot(batch["y"], 2)
-        return -jnp.mean(jnp.sum(output * y_one_hot, axis=-1))
+        loss = -jnp.mean(jnp.sum(output * y_one_hot, axis=-1))
+        return loss, {}
 
+    @override
     def get_dataset(self) -> Dataset:
         """Create a dummy dataset for testing."""
         key = jax.random.key(42)

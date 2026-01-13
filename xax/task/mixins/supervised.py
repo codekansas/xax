@@ -11,7 +11,6 @@ from abc import ABC
 from dataclasses import dataclass
 from threading import Thread
 from typing import (
-    Callable,
     Generic,
     Iterator,
     Sequence,
@@ -28,13 +27,13 @@ from jax.sharding import NamedSharding, PartitionSpec
 from jaxtyping import Array, PRNGKeyArray, PyTree
 
 from xax.core.conf import field
-from xax.core.state import Batch, Output, State
+from xax.core.state import Batch, State
 from xax.nn.parallel import is_master
 from xax.task.logger import Metric, Scalar
 from xax.task.mixins.data_loader import InMemoryBatchIterator
 from xax.task.mixins.train import InitParams, Optimizer, TrainConfig, TrainMixin
 from xax.utils.experiments import ContextTimer
-from xax.utils.jax import fix_unspecified_sharding, jit
+from xax.utils.jax import fix_unspecified_sharding, jit as xax_jit
 from xax.utils.logging import LOG_PING, LOG_STATUS
 from xax.utils.pytree import get_pytree_param_count
 from xax.utils.text import show_info
@@ -59,68 +58,32 @@ class SupervisedMixin(
     Generic[Config],
     ABC,
 ):
-    def get_output(self, model: PyTree, batch: Batch, state: State, key: PRNGKeyArray) -> Output:
-        """Gets the output from the model.
-
-        By default, we assume the model is a function that takes the batch as
-        input and returns the loss. This function can be patched to do more
-        complex operations instead.
-
-        Args:
-            model: The current model.
-            batch: The current minibatch of samples.
-            state: The current training state, or None during pmap execution.
-            key: The current PRNG key.
-
-        Returns:
-            The output from the model.
-        """
-        raise NotImplementedError("`get_output` must be implemented by the subclass")
-
-    def compute_loss(self, model: PyTree, batch: Batch, output: Output, state: State, key: PRNGKeyArray) -> Array:
-        """Gets the loss for the current batch.
-
-        By default, we assume the model is a function that takes the batch as
-        input and returns the loss. This function can be patched to do more
-        complex operations instead.
-
-        Args:
-            model: The current model.
-            batch: The current minibatch of samples.
-            output: The output from the model.
-            state: The current training state, or None during pmap execution.
-            key: The current PRNG key.
-
-        Returns:
-            The computed loss, as a tensor.
-        """
-        if not isinstance(output, Array):
-            raise ValueError(f"When model output is not the loss, you must override `compute_loss`. Got {type(output)}")
-        return output
-
-    def compute_metrics(
+    def compute_loss(
         self,
         model: PyTree,
         batch: Batch,
-        output: Output,
         state: State,
         heavy: bool,
         key: PRNGKeyArray,
-    ) -> dict[str, Metric]:
-        """Computes the metrics for the current batch.
+    ) -> tuple[Array, dict[str, Metric]]:
+        """Compute loss and metrics for the current batch.
+
+        This is the main method to implement for supervised learning tasks.
+        By combining loss and metrics computation, implementations can avoid
+        materializing large intermediate tensors (e.g., full logits for LLMs).
 
         Args:
             model: The current model.
             batch: The current minibatch of samples.
-            output: The output from the model.
             state: The current training state.
-            heavy: If we should be logging heavy metrics.
+            heavy: If we should be logging heavy metrics (e.g., generated text).
             key: The current PRNG key.
 
         Returns:
-            A dictionary of metrics.
+            A tuple of (loss, metrics) where loss is a scalar tensor and
+            metrics is a dictionary of Metric objects.
         """
-        return {}
+        raise NotImplementedError("`compute_loss` must be implemented by the subclass")
 
     def decode_tokens(self, tokens: Array | np.ndarray) -> str:
         raise NotImplementedError(
@@ -137,134 +100,106 @@ class SupervisedMixin(
         self.log_state_timers(state)
         self.write_logs(state, heavy)
 
-    def create_train_step_fn(
+    @xax_jit(
+        static_argnames=["self", "static_parts", "optimizer", "heavy"],
+        donate_argnames=["trainable_arr", "opt_state", "state", "key"],
+        jit_level=3,
+    )
+    def train_step(
         self,
-        model_static: PyTree,
+        trainable_arr: PyTree,
+        frozen_arr: PyTree,
+        static_parts: PyTree,
         optimizer: Optimizer,
-    ) -> Callable[
-        [PyTree, optax.OptState, Batch, State, PRNGKeyArray, bool],
-        tuple[PyTree, optax.OptState, State, dict[str, Metric]],
-    ]:
-        """Create a JIT-compiled training step function.
-
-        Args:
-            model_static: The static (non-trainable) parts of the model.
-            optimizer: The optimizer.
-
-        Returns:
-            A JIT-compiled function that performs one training step.
-            The function takes a `heavy` bool argument (static) to control
-            whether heavy metrics are computed.
-        """
+        opt_state: optax.OptState,
+        batches: Batch,
+        state: State,
+        key: PRNGKeyArray,
+        heavy: bool,
+    ) -> tuple[PyTree, optax.OptState, State, dict[str, Metric]]:
         num_accum_steps = self.config.gradient_accumulation_steps
         grad_dtype = self.config.precision.grad_jax_dtype
         param_dtype = self.config.precision.param_jax_dtype
         max_grad_norm = self.config.max_grad_norm
 
-        # Capture methods for use in inner function
-        get_output = self.get_output
-        compute_loss = self.compute_loss
-        compute_metrics = self.compute_metrics
-        cast_compute_dtype = self.cast_compute_dtype
+        def compute_grads(trainable_arr: PyTree, batch: Batch, step_key: PRNGKeyArray) -> tuple[PyTree, Array]:
+            def loss_fn(trainable_arr: PyTree) -> Array:
+                model = eqx.combine(trainable_arr, frozen_arr, static_parts)
+                batch_casted = jax.tree.map(self.cast_compute_dtype, batch)
+                # compute_loss returns (loss, metrics), we only need loss for gradients
+                loss, _ = self.compute_loss(model, batch_casted, state, False, step_key)
+                return loss
 
-        def train_step(
-            model_arr: PyTree,
-            opt_state: optax.OptState,
-            batches: Batch,
-            state: State,
-            key: PRNGKeyArray,
-            heavy: bool,
-        ) -> tuple[PyTree, optax.OptState, State, dict[str, Metric]]:
-            def compute_grads_and_loss(
-                model_arr: PyTree, batch: Batch, step_key: PRNGKeyArray
-            ) -> tuple[PyTree, Array, Output]:
-                def loss_fn(model_arr: PyTree) -> tuple[Array, Output]:
-                    model = eqx.combine(model_arr, model_static)
-                    batch_casted = jax.tree.map(cast_compute_dtype, batch)
-                    output_key, loss_key = jax.random.split(step_key)
-                    output = get_output(model, batch_casted, state, output_key)
-                    loss = compute_loss(model, batch_casted, output, state, loss_key)
-                    return loss, output
+            loss, grads = jax.value_and_grad(loss_fn)(trainable_arr)
+            grads = jax.tree.map(lambda g: g.astype(grad_dtype) if eqx.is_inexact_array(g) else g, grads)
+            return grads, loss
 
-                (loss, output), grads = jax.value_and_grad(loss_fn, has_aux=True)(model_arr)
-                grads = jax.tree.map(lambda g: g.astype(grad_dtype) if eqx.is_inexact_array(g) else g, grads)
-                return grads, loss, output
+        # Get gradients and loss for the first batch.
+        first_key, key = jax.random.split(key)
+        first_batch = jax.tree.map(lambda x: x[0], batches)
+        acc_grads, acc_loss = compute_grads(trainable_arr, first_batch, first_key)
 
-            # Get first leaf for batch size calculation later
-            first_leaf = jax.tree.leaves(batches)[0]
+        if num_accum_steps > 1:
 
             def accum_fn(
-                carry: tuple[PyTree, Array, Output, PRNGKeyArray],
+                carry: tuple[PyTree, Array, PRNGKeyArray],
                 batch: Batch,
-            ) -> tuple[tuple[PyTree, Array, Output, PRNGKeyArray], None]:
-                acc_grads, acc_loss, _, key = carry
+            ) -> tuple[tuple[PyTree, Array, PRNGKeyArray], None]:
+                acc_grads, acc_loss, key = carry
                 key, step_key = jax.random.split(key)
-                grads, loss, output = compute_grads_and_loss(model_arr, batch, step_key)
+                grads, loss = compute_grads(trainable_arr, batch, step_key)
                 acc_grads = jax.tree.map(jnp.add, acc_grads, grads)
                 acc_loss = acc_loss + loss
-                # Keep only the last output in carry; return None to avoid storing all outputs
-                return (acc_grads, acc_loss, output, key), None
+                return (acc_grads, acc_loss, key), None
 
-            # Run first micro-batch to get initial output structure
-            first_batch = jax.tree.map(lambda x: x[0], batches)
-            key, first_key = jax.random.split(key)
-            first_grads, first_loss, init_output = compute_grads_and_loss(model_arr, first_batch, first_key)
-
-            # Accumulate remaining gradients over micro-batches using scan.
-            # Only the last output is kept in the carry; we return None to avoid storing all outputs.
-            remaining_batches = jax.tree.map(lambda x: x[1:], batches)
-            (acc_grads, acc_loss, output, key), _ = jax.lax.scan(
+            # Accumulate gradients over micro-batches using scan.
+            (acc_grads, acc_loss, key), _ = jax.lax.scan(
                 accum_fn,
-                (first_grads, first_loss, init_output, key),
-                remaining_batches,
+                (acc_grads, acc_loss, key),
+                batches,
             )
 
             # Average gradients and loss over micro-batches.
             acc_grads = jax.tree.map(lambda g: g / num_accum_steps, acc_grads)
             acc_loss = acc_loss / num_accum_steps
 
-            # Clip gradients if configured
-            grad_norm = cast(Array, optax.global_norm(acc_grads))
-            if max_grad_norm is not None:
-                clip_fn = optax.clip_by_global_norm(max_grad_norm)
-                clip_state = clip_fn.init(acc_grads)
-                acc_grads, _ = clip_fn.update(acc_grads, clip_state)
+        # Clip gradients if configured
+        grad_norm = cast(Array, optax.global_norm(acc_grads))
+        if max_grad_norm is not None:
+            clip_fn = optax.clip_by_global_norm(max_grad_norm)
+            clip_state = clip_fn.init(acc_grads)
+            acc_grads, _ = clip_fn.update(acc_grads, clip_state)
 
-            # Apply optimizer updates
-            updates, new_opt_state = optimizer.update(acc_grads, opt_state, model_arr)
-            updates = jax.tree.map(lambda u: u.astype(param_dtype) if eqx.is_inexact_array(u) else u, updates)
-            new_model_arr = eqx.apply_updates(model_arr, updates)
+        # Apply optimizer updates
+        updates, new_opt_state = optimizer.update(acc_grads, opt_state, trainable_arr)
+        updates = jax.tree.map(lambda u: u.astype(param_dtype) if eqx.is_inexact_array(u) else u, updates)
+        new_trainable_arr = eqx.apply_updates(trainable_arr, updates)
 
-            # Calculate batch size and update state
-            batch_size = first_leaf.shape[1]
-            total_samples = batch_size * num_accum_steps
-            new_state = state.replace(
-                num_steps=state.num_steps + 1,
-                num_samples=state.num_samples + total_samples,
-            )
-            # Ensure state arrays have replicated sharding for multi-GPU
-            mesh = jax.sharding.get_abstract_mesh()
-            if mesh is not None and mesh.shape_tuple:
-                replicated = NamedSharding(mesh, PartitionSpec())
-                # Apply sharding constraint to underlying state arrays
-                new_int32_arr = jax.lax.with_sharding_constraint(new_state._int32_arr, replicated)
-                new_float32_arr = jax.lax.with_sharding_constraint(new_state._float32_arr, replicated)
-                new_state = State(_int32_arr=new_int32_arr, _float32_arr=new_float32_arr)
+        # Calculate batch size and update state
+        total_samples = self.batch_size * num_accum_steps
+        new_state = state.replace(
+            num_steps=state.num_steps + 1,
+            num_samples=state.num_samples + total_samples,
+        )
 
-            # Extract batch for metrics computation
-            batch = jax.tree.map(lambda x: x[-1], batches)
-            batch = jax.tree.map(lambda x: x.astype(jnp.float32) if eqx.is_inexact_array(x) else x, batch)
-            model = eqx.combine(new_model_arr, model_static)
+        # Ensure state arrays have replicated sharding for multi-GPU.
+        mesh = jax.sharding.get_abstract_mesh()
+        if mesh is not None and mesh.shape_tuple:
+            replicated = NamedSharding(mesh, PartitionSpec())
+            new_int32_arr = jax.lax.with_sharding_constraint(new_state._int32_arr, replicated)
+            new_float32_arr = jax.lax.with_sharding_constraint(new_state._float32_arr, replicated)
+            new_state = State(_int32_arr=new_int32_arr, _float32_arr=new_float32_arr)
 
-            # Compute metrics
-            metrics = compute_metrics(model, batch, output, new_state, heavy, key)
-            metrics["loss"] = Scalar(acc_loss)
-            metrics["grad_norm"] = Scalar(grad_norm)
+        # Compute metrics on last batch using updated model
+        batch = jax.tree.map(lambda x: x[-1], batches)
+        batch = jax.tree.map(self.cast_compute_dtype, batch)
+        model = eqx.combine(new_trainable_arr, frozen_arr, static_parts)
+        metrics_key, key = jax.random.split(key)
+        _, metrics = self.compute_loss(model, batch, new_state, heavy, metrics_key)
+        metrics["loss"] = Scalar(acc_loss)
+        metrics["grad_norm"] = Scalar(grad_norm)
 
-            return new_model_arr, new_opt_state, new_state, metrics
-
-        # Use static_argnames for `heavy` so both versions are compiled and cached
-        return jit(static_argnames=["heavy"])(train_step)
+        return new_trainable_arr, new_opt_state, new_state, metrics
 
     def train_loop(
         self,
@@ -281,8 +216,7 @@ class SupervisedMixin(
                 f"Found {len(models)} models, {len(optimizers)} optimizers and {len(opt_states)} optimizer states."
             )
 
-        filter_spec = self.get_model_filter_spec(models[0])
-        model_arr, model_static = eqx.partition(models[0], filter_spec)
+        model = models[0]
         optimizer = optimizers[0]
         opt_state = opt_states[0]
 
@@ -294,17 +228,24 @@ class SupervisedMixin(
             unspecified_sharding_fn = functools.partial(fix_unspecified_sharding, sharding=replicated_sharding)
 
             # Make sure that all arrays have specified sharding.
-            model_arr = jax.tree.map(unspecified_sharding_fn, model_arr)
+            model = jax.tree.map(unspecified_sharding_fn, model)
             opt_state = jax.tree.map(unspecified_sharding_fn, opt_state)
             state = jax.tree.map(unspecified_sharding_fn, state)
 
-        # Create JIT-compiled train step (heavy is a static arg, so both versions get cached)
-        train_step_fn = self.create_train_step_fn(model_static, optimizer)
+        # Partition model into trainable arrays (e.g., LoRA params) and everything else.
+        trainable_spec = self.get_trainable_filter_spec(model)
+        trainable_arr, frozen_and_static = eqx.partition(model, trainable_spec)
+
+        # Further partition frozen_and_static into frozen arrays (traced) and
+        # static parts (activation functions, configs - must be static in JIT).
+        frozen_arr, static_parts = eqx.partition(frozen_and_static, eqx.is_array)
 
         def save_checkpoint() -> None:
-            model = eqx.combine(model_arr, model_static)
+            # Only save trainable parameters - frozen weights can be loaded from
+            # the original source (e.g., HuggingFace). This significantly reduces
+            # checkpoint size for LoRA fine-tuning.
             self.save_checkpoint(
-                models=[model],
+                models=[trainable_arr],
                 optimizers=optimizers,
                 opt_states=[opt_state],
                 state=state,
@@ -337,8 +278,11 @@ class SupervisedMixin(
                 heavy = heavy_arr.item() or is_done
 
                 # Execute training step
-                model_arr, opt_state, state, metrics = train_step_fn(
-                    model_arr,
+                trainable_arr, opt_state, state, metrics = self.train_step(
+                    trainable_arr,
+                    frozen_arr,
+                    static_parts,
+                    optimizer,
                     opt_state,
                     batches_stacked,
                     state,

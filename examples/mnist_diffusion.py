@@ -5,7 +5,7 @@ Run this example with `python -m examples.mnist_diffusion`.
 """
 
 from dataclasses import dataclass
-from typing import TypedDict
+from typing import TypedDict, override
 
 import equinox as eqx
 import jax
@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from datasets import Dataset, load_dataset
-from jaxtyping import Array, PRNGKeyArray, PyTree
+from jaxtyping import Array, PRNGKeyArray
 
 import xax
 
@@ -104,6 +104,7 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
             pred_mode=xax.cast_diffusion_pred_mode(config.pred_mode),
         )
 
+    @override
     def get_model(self, params: xax.InitParams) -> UNet:
         return UNet(
             in_dim=1,
@@ -113,6 +114,7 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
             key=params.key,
         )
 
+    @override
     def get_optimizer(self) -> xax.Optimizer:
         warmup_schedule = optax.linear_schedule(
             init_value=0.0,
@@ -141,84 +143,73 @@ class MnistDiffusion(xax.SupervisedTask[Config]):
             b2=0.999,
         )
 
-    def get_output(self, model: UNet, batch: Batch, state: xax.State, key: PRNGKeyArray) -> Array:
-        """Computes the diffusion loss.
+    @override
+    def compute_loss(
+        self,
+        model: UNet,
+        batch: Batch,
+        state: xax.State,
+        heavy: bool,
+        key: PRNGKeyArray,
+    ) -> tuple[Array, dict[str, xax.Metric]]:
+        """Computes the diffusion loss and metrics.
 
         The model is called with (x_t, t, class_label) internally, but we need
         to wrap it to match the diffusion API which expects (x_t, t) -> output.
         """
         images_bhw = (batch["image"].astype(np.float32) / 255.0) - 0.5
         labels_b = batch["label"]
+        batch_size = labels_b.shape[0]
 
         def model_fn(x_bhw: Array, t_b: Array) -> Array:
             return jax.vmap(model)(x_bhw, t_b, labels_b)
 
-        loss = self.diffusion.loss(key, model_fn, images_bhw)
-        return loss.mean()
+        loss_key, sample_key = jax.random.split(key)
+        loss = self.diffusion.loss(loss_key, model_fn, images_bhw).mean()
 
-    def compute_loss(self, model: UNet, batch: Batch, output: Array, state: xax.State, key: PRNGKeyArray) -> Array:
-        """The output is already the loss."""
-        return output
-
-    def compute_metrics(
-        self,
-        model: PyTree,
-        batch: Batch,
-        output: Array,
-        state: xax.State,
-        heavy: bool,
-        key: PRNGKeyArray,
-    ) -> dict[str, xax.Metric]:
-        """Generate and log sample images."""
+        # Generate and log sample images when heavy logging is enabled
         metrics: dict[str, xax.Metric] = {}
-        if not heavy:
-            return metrics
+        if heavy:
+            max_images = 9
+            num_sample = self.config.sampling_timesteps or 50
 
-        max_images = 9
-        num_sample = self.config.sampling_timesteps or 50
+            metrics["real"] = xax.LabeledImages(
+                images_bhw,
+                labels_b,
+                max_images=max_images,
+                target_resolution=(64, 64),
+            )
 
-        images = (batch["image"].astype(np.float32) / 255.0) - 0.5
-        class_id = batch["label"]
-        batch_size = class_id.shape[0]
-        metrics["real"] = xax.LabeledImages(
-            images,
-            class_id,
-            max_images=max_images,
-            target_resolution=(64, 64),
-        )
+            # Generate samples
+            gen = self.diffusion.sample(
+                sample_key,
+                model_fn,
+                shape=(batch_size, 32, 32),
+                sampling_timesteps=num_sample,
+            )
 
-        def vanilla_func(x_bt: Array, t_b: Array) -> Array:
-            return jax.vmap(model)(x_bt, t_b, class_id)
+            # Get the final denoised samples (first element is the final sample)
+            generated_images = gen[0]
+            metrics["generated"] = xax.LabeledImages(
+                generated_images,
+                labels_b,
+                max_images=max_images,
+                target_resolution=(64, 64),
+            )
 
-        # Generate samples.
-        gen = self.diffusion.sample(
-            key,
-            vanilla_func,
-            shape=(batch_size, 32, 32),
-            sampling_timesteps=num_sample,
-        )
+            # Log single image sequence
+            indices = jnp.linspace(0, gen.shape[0] - 1, max_images).astype(jnp.int32).clip(0, gen.shape[0] - 1)
+            one_gen = gen[indices, 0]
+            metrics["generated_single"] = xax.LabeledImages(
+                one_gen,
+                indices,
+                max_images=max_images,
+                target_resolution=(64, 64),
+            )
 
-        # Get the final denoised samples (first element is the final sample).
-        generated_images = gen[0]
-        metrics["generated"] = xax.LabeledImages(
-            generated_images,
-            class_id,
-            max_images=max_images,
-            target_resolution=(64, 64),
-        )
+        return loss, metrics
 
-        # Log single image sequence.
-        indices = jnp.linspace(0, gen.shape[0] - 1, max_images).astype(jnp.int32).clip(0, gen.shape[0] - 1)
-        one_gen = gen[indices, 0]
-        metrics["generated_single"] = xax.LabeledImages(
-            one_gen,
-            indices,
-            max_images=max_images,
-            target_resolution=(64, 64),
-        )
-
-        return metrics
-
+    @override
     def get_dataset(self) -> Dataset:
         ds = load_dataset("ylecun/mnist", split="train")
         ds.set_format(type="numpy", columns=["image", "label"])

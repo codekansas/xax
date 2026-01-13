@@ -323,14 +323,18 @@ class LLM(eqx.Module):
         lm_head = eqx.nn.Linear(config.embed_dim, config.vocab_size, use_bias=False, key=k_head)
         return cls(embed=embed, blocks=tuple(blocks), norm=norm, lm_head=lm_head, config=config)
 
-    def __call__(
+    def forward_hidden(
         self,
         tokens_bt: Array,
         *,
         key: jax.Array | None = None,
         inference: bool = True,
     ) -> Array:
-        """Forward pass returning logits shaped (bsz, tsz, vocab_size)."""
+        """Forward pass returning hidden states shaped (bsz, tsz, embed_dim).
+
+        This is useful for memory-efficient loss computation where you want to
+        avoid materializing the full (bsz, tsz, vocab_size) logits tensor.
+        """
         chex.assert_rank(tokens_bt, 2)
         bsz, tsz = tokens_bt.shape
         positions_bt = jnp.broadcast_to(jnp.arange(tsz)[None, :], (bsz, tsz))
@@ -343,9 +347,6 @@ class LLM(eqx.Module):
         for i, block in enumerate(self.blocks):
             block_key = None if key_seq is None else key_seq[i]
             if self.config.use_remat:
-                # Gradient checkpointing: recompute block activations during backward pass
-                # This reduces memory usage at the cost of extra compute
-                # Split block into arrays (traced for gradients) and static parts (not traced)
                 block_arrays, block_static = eqx.partition(block, eqx.is_array)
 
                 @jax.checkpoint
@@ -364,7 +365,17 @@ class LLM(eqx.Module):
                 x_btd = remat_block(block_arrays, x_btd, positions_bt, block_key, inference)
             else:
                 x_btd = block(x_btd, positions_bt, key=block_key, inference=inference)
-        x_btd = self.norm(x_btd)
+        return self.norm(x_btd)
+
+    def __call__(
+        self,
+        tokens_bt: Array,
+        *,
+        key: jax.Array | None = None,
+        inference: bool = True,
+    ) -> Array:
+        """Forward pass returning logits shaped (bsz, tsz, vocab_size)."""
+        x_btd = self.forward_hidden(tokens_bt, key=key, inference=inference)
         logits_btv = _linear(x_btd, self.lm_head)
         return logits_btv
 
@@ -373,19 +384,17 @@ class LLM(eqx.Module):
 # Default Configs                                                              #
 # --------------------------------------------------------------------------- #
 
-QWEN3_SMALL = LLMConfig(
-    vocab_size=32000,
-    embed_dim=256,
-    q_heads=8,
-    kv_heads=4,
-    head_dim=32,
-    num_layers=4,
-    max_tsz=512,
-)
 
+def build_qwen3_model(config: LLMConfig, *, key: jax.Array | None = None) -> LLM:
+    """Creates a Qwen3-style model.
 
-def build_qwen3_model(config: LLMConfig = QWEN3_SMALL, *, key: jax.Array | None = None) -> LLM:
-    """Creates a Qwen3-style model."""
+    Args:
+        config: LLMConfig specifying model architecture.
+        key: Optional PRNG key for initialization.
+
+    Returns:
+        Initialized LLM model.
+    """
     key = jax.random.key(0) if key is None else key
     return LLM.init(config, key=key)
 
@@ -395,9 +404,189 @@ def tie_embedding_and_head(model: LLM) -> LLM:
     return eqx.tree_at(lambda mm: mm.lm_head.weight, model, model.embed.weight)
 
 
-# --------------------------------------------------------------------------- #
-# HuggingFace Utilities                                                        #
-# --------------------------------------------------------------------------- #
+def chunked_cross_entropy_loss(
+    hidden_btd: Array,
+    targets_bt: Array,
+    lm_head_weight: Array,
+    mask_bt: Array | None = None,
+    chunk_size: int = 1,
+) -> Array:
+    """Compute cross-entropy loss in chunks to save memory.
+
+    Instead of materializing the full (batch, seq, vocab) logits tensor,
+    this function processes the sequence in chunks of size `chunk_size`,
+    computing logits and loss for each chunk before discarding the logits.
+
+    For a vocab of 150K and sequence of 512:
+    - Full logits: 512 * 150000 * 4 bytes = ~300MB per sample
+    - Chunked (8): 8 * 150000 * 4 bytes = ~4.8MB per chunk
+
+    Numerical stability:
+    - All computations are performed in float32 regardless of input dtype
+    - Uses log_softmax which implements the numerically stable log-sum-exp trick
+    - Accumulates loss and count in float32 to avoid precision loss
+
+    Args:
+        hidden_btd: Hidden states from model.forward_hidden(), shape (batch, seq, hidden_dim)
+        targets_bt: Target token indices, shape (batch, seq)
+        lm_head_weight: The lm_head weight matrix, shape (vocab_size, hidden_dim)
+        mask_bt: Optional mask for valid positions, shape (batch, seq). If None, all positions are valid.
+        chunk_size: Number of sequence positions to process at once.
+
+    Returns:
+        Scalar loss value (mean cross-entropy over valid positions) in float32.
+    """
+    bsz, tsz, hidden_dim = hidden_btd.shape
+
+    if mask_bt is None:
+        mask_bt = jnp.ones((bsz, tsz), dtype=jnp.bool_)
+
+    # Pad sequence to be divisible by chunk_size for static shapes
+    pad_size = (chunk_size - tsz % chunk_size) % chunk_size
+    if pad_size > 0:
+        hidden_btd = jnp.pad(hidden_btd, ((0, 0), (0, pad_size), (0, 0)))
+        targets_bt = jnp.pad(targets_bt, ((0, 0), (0, pad_size)))
+        mask_bt = jnp.pad(mask_bt, ((0, 0), (0, pad_size)), constant_values=False)
+
+    padded_tsz = tsz + pad_size
+    num_chunks = padded_tsz // chunk_size
+
+    # Reshape to (batch, num_chunks, chunk_size, ...)
+    hidden_bccd = hidden_btd.reshape(bsz, num_chunks, chunk_size, hidden_dim)
+    targets_bcc = targets_bt.reshape(bsz, num_chunks, chunk_size)
+    mask_bcc = mask_bt.reshape(bsz, num_chunks, chunk_size)
+
+    def process_chunk(
+        carry: tuple[Array, Array],
+        inputs: tuple[Array, Array, Array],
+    ) -> tuple[tuple[Array, Array], None]:
+        total_loss, total_count = carry
+        chunk_hidden, chunk_targets, chunk_mask = inputs
+
+        # Cast to float32 for numerical stability (inputs may be bfloat16)
+        chunk_hidden_f32 = chunk_hidden.astype(jnp.float32)
+        lm_head_f32 = lm_head_weight.astype(jnp.float32)
+
+        # Compute logits: (batch, chunk, hidden) @ (hidden, vocab) -> (batch, chunk, vocab)
+        chunk_logits = chunk_hidden_f32 @ lm_head_f32.T
+
+        # log_softmax is numerically stable: log(softmax(x)) = x - max(x) - log(sum(exp(x - max(x))))
+        log_probs = jax.nn.log_softmax(chunk_logits, axis=-1)
+
+        # Gather log prob of target tokens
+        target_log_probs = jnp.take_along_axis(log_probs, chunk_targets[..., None], axis=-1).squeeze(-1)
+        chunk_loss = -target_log_probs
+
+        # Mask and accumulate in float32
+        masked_loss = jnp.where(chunk_mask, chunk_loss, 0.0)
+        total_loss = total_loss + masked_loss.sum()
+        total_count = total_count + chunk_mask.astype(jnp.float32).sum()
+
+        return (total_loss, total_count), None
+
+    # Transpose to (num_chunks, batch, chunk_size, ...) for scan
+    hidden_cbcd = jnp.transpose(hidden_bccd, (1, 0, 2, 3))
+    targets_cbc = jnp.transpose(targets_bcc, (1, 0, 2))
+    mask_cbc = jnp.transpose(mask_bcc, (1, 0, 2))
+
+    init_carry = (
+        jnp.array(0.0, dtype=jnp.float32),
+        jnp.array(0.0, dtype=jnp.float32),
+    )
+    (total_loss, total_count), _ = jax.lax.scan(
+        process_chunk,
+        init_carry,
+        (hidden_cbcd, targets_cbc, mask_cbc),
+    )
+
+    # Safe division - if no valid tokens, return 0
+    return jnp.where(total_count > 0, total_loss / total_count, 0.0)
+
+
+def chunked_cross_entropy_acc(
+    hidden_btd: Array,
+    targets_bt: Array,
+    lm_head_weight: Array,
+    mask_bt: Array | None = None,
+    chunk_size: int = 1,
+) -> Array:
+    """Compute accuracy in chunks to save memory.
+
+    This is the accuracy counterpart to chunked_cross_entropy_loss. It computes
+    the fraction of correctly predicted tokens without materializing full logits.
+
+    Args:
+        hidden_btd: Hidden states from model.forward_hidden(), shape (batch, seq, hidden_dim)
+        targets_bt: Target token indices, shape (batch, seq)
+        lm_head_weight: The lm_head weight matrix, shape (vocab_size, hidden_dim)
+        mask_bt: Optional mask for valid positions, shape (batch, seq). If None, all positions are valid.
+        chunk_size: Number of sequence positions to process at once.
+
+    Returns:
+        Scalar accuracy value (fraction of correct predictions) in float32.
+    """
+    bsz, tsz, hidden_dim = hidden_btd.shape
+
+    if mask_bt is None:
+        mask_bt = jnp.ones((bsz, tsz), dtype=jnp.bool_)
+
+    # Pad sequence to be divisible by chunk_size for static shapes
+    pad_size = (chunk_size - tsz % chunk_size) % chunk_size
+    if pad_size > 0:
+        hidden_btd = jnp.pad(hidden_btd, ((0, 0), (0, pad_size), (0, 0)))
+        targets_bt = jnp.pad(targets_bt, ((0, 0), (0, pad_size)))
+        mask_bt = jnp.pad(mask_bt, ((0, 0), (0, pad_size)), constant_values=False)
+
+    padded_tsz = tsz + pad_size
+    num_chunks = padded_tsz // chunk_size
+
+    # Reshape to (batch, num_chunks, chunk_size, ...)
+    hidden_bccd = hidden_btd.reshape(bsz, num_chunks, chunk_size, hidden_dim)
+    targets_bcc = targets_bt.reshape(bsz, num_chunks, chunk_size)
+    mask_bcc = mask_bt.reshape(bsz, num_chunks, chunk_size)
+
+    def process_chunk(
+        carry: tuple[Array, Array],
+        inputs: tuple[Array, Array, Array],
+    ) -> tuple[tuple[Array, Array], None]:
+        total_correct, total_count = carry
+        chunk_hidden, chunk_targets, chunk_mask = inputs
+
+        # Cast to float32 for numerical stability (inputs may be bfloat16)
+        chunk_hidden_f32 = chunk_hidden.astype(jnp.float32)
+        lm_head_f32 = lm_head_weight.astype(jnp.float32)
+
+        # Compute logits: (batch, chunk, hidden) @ (hidden, vocab) -> (batch, chunk, vocab)
+        chunk_logits = chunk_hidden_f32 @ lm_head_f32.T
+
+        # Compute accuracy: check if argmax matches target
+        predictions = jnp.argmax(chunk_logits, axis=-1)
+        correct = predictions == chunk_targets
+
+        # Mask and accumulate
+        masked_correct = jnp.where(chunk_mask, correct.astype(jnp.float32), 0.0)
+        total_correct = total_correct + masked_correct.sum()
+        total_count = total_count + chunk_mask.astype(jnp.float32).sum()
+
+        return (total_correct, total_count), None
+
+    # Transpose to (num_chunks, batch, chunk_size, ...) for scan
+    hidden_cbcd = jnp.transpose(hidden_bccd, (1, 0, 2, 3))
+    targets_cbc = jnp.transpose(targets_bcc, (1, 0, 2))
+    mask_cbc = jnp.transpose(mask_bcc, (1, 0, 2))
+
+    init_carry = (
+        jnp.array(0.0, dtype=jnp.float32),
+        jnp.array(0.0, dtype=jnp.float32),
+    )
+    (total_correct, total_count), _ = jax.lax.scan(
+        process_chunk,
+        init_carry,
+        (hidden_cbcd, targets_cbc, mask_cbc),
+    )
+
+    # Safe division - if no valid tokens, return 0
+    return jnp.where(total_count > 0, total_correct / total_count, 0.0)
 
 
 def download_repo(repo_id: str, revision: str | None = None, cache_dir: str | None = None) -> Path:
@@ -550,26 +739,47 @@ def _parse_rope_scaling(cfg: dict[str, object]) -> tuple[float, int | None, floa
 
 def hf_config_to_llm_config(
     cfg: dict[str, object],
-    base: LLMConfig | None = None,
     *,
     use_remat: bool = False,
+    max_tsz: int = 32768,
 ) -> LLMConfig:
-    """Derive an LLMConfig from an HF config dict."""
-    base = base or QWEN3_SMALL
+    """Derive an LLMConfig from a HuggingFace config dict.
+
+    Args:
+        cfg: HuggingFace config dictionary (from load_hf_config).
+        use_remat: Whether to use gradient checkpointing (remat).
+        max_tsz: Maximum sequence length (not always in HF config).
+
+    Returns:
+        LLMConfig derived from the HuggingFace config.
+
+    Raises:
+        ValueError: If required fields are missing from the config.
+    """
     parsed = HFConfig.model_validate(cfg)
 
-    embed_dim = parsed.hidden_size or base.embed_dim
-    q_heads = parsed.num_attention_heads or base.q_heads
+    # Required fields - raise errors if missing
+    if parsed.hidden_size is None:
+        raise ValueError("HuggingFace config missing required field: hidden_size")
+    if parsed.num_attention_heads is None:
+        raise ValueError("HuggingFace config missing required field: num_attention_heads")
+    if parsed.num_hidden_layers is None:
+        raise ValueError("HuggingFace config missing required field: num_hidden_layers")
+    if parsed.vocab_size is None:
+        raise ValueError("HuggingFace config missing required field: vocab_size")
+
+    embed_dim = parsed.hidden_size
+    q_heads = parsed.num_attention_heads
     kv_heads = parsed.num_key_value_heads or max(1, q_heads // 2)
     head_dim = parsed.head_dim or (embed_dim // q_heads)
-    num_layers = parsed.num_hidden_layers or base.num_layers
-    vocab_size = parsed.vocab_size or base.vocab_size
-    mlp_hidden_dim = parsed.intermediate_size or (embed_dim * base.mlp_mult)
+    num_layers = parsed.num_hidden_layers
+    vocab_size = parsed.vocab_size
+    mlp_hidden_dim = parsed.intermediate_size or (embed_dim * 4)
     mlp_mult = max(1, mlp_hidden_dim // embed_dim)
-    rope_theta = parsed.rope_theta or base.rope_theta
-    rms_eps = parsed.rms_norm_eps or base.rms_eps
-    attention_bias = parsed.attention_bias if parsed.attention_bias is not None else base.attention_bias
-    mlp_bias = parsed.mlp_bias if parsed.mlp_bias is not None else base.mlp_bias
+    rope_theta = parsed.rope_theta or 10_000.0
+    rms_eps = parsed.rms_norm_eps or 1e-6
+    attention_bias = parsed.attention_bias if parsed.attention_bias is not None else False
+    mlp_bias = parsed.mlp_bias if parsed.mlp_bias is not None else False
 
     # YaRN RoPE scaling
     rope_factor, rope_original_max, rope_beta_slow, rope_beta_fast = _parse_rope_scaling(cfg)
@@ -586,9 +796,9 @@ def hf_config_to_llm_config(
         kv_heads=kv_heads,
         head_dim=head_dim,
         num_layers=num_layers,
-        max_tsz=base.max_tsz,
+        max_tsz=max_tsz,
         rope_theta=rope_theta,
-        dropout_rate=base.dropout_rate,
+        dropout_rate=0.0,
         mlp_mult=mlp_mult,
         mlp_hidden_dim=mlp_hidden_dim,
         rms_eps=rms_eps,
@@ -638,10 +848,11 @@ def load_hf_weights_into_llm(
         dtype = jnp.bfloat16
 
     config_dict, state = _fetch_state_dict(repo_id, revision)
-    derived_cfg = hf_config_to_llm_config(config_dict, base=model.config)
 
-    if derived_cfg.embed_dim != model.config.embed_dim:
-        raise ValueError(f"HF hidden_size {derived_cfg.embed_dim} != model.embed_dim {model.config.embed_dim}")
+    # Validate that model config matches the HF config
+    hf_parsed = HFConfig.model_validate(config_dict)
+    if hf_parsed.hidden_size is not None and hf_parsed.hidden_size != model.config.embed_dim:
+        raise ValueError(f"HF hidden_size {hf_parsed.hidden_size} != model.embed_dim {model.config.embed_dim}")
 
     mesh = jax.sharding.get_mesh()
     if mesh is None:
@@ -725,11 +936,11 @@ def load_hf_weights_into_llm(
         q_norm_w = state.get(f"{pfx_alt}.q_norm.weight")
         k_norm_w = state.get(f"{pfx_alt}.k_norm.weight")
         if q_norm_w is not None:
-            q_norm = RMSNorm(q_norm_w.shape[-1], eps=derived_cfg.rms_eps)
+            q_norm = RMSNorm(q_norm_w.shape[-1], eps=model.config.rms_eps)
             q_norm = eqx.tree_at(lambda n: n.weight, q_norm, to_dtype(q_norm_w))
             block = eqx.tree_at(lambda b: b.attn.q_norm, block, q_norm, is_leaf=lambda x: x is None)
         if k_norm_w is not None:
-            k_norm = RMSNorm(k_norm_w.shape[-1], eps=derived_cfg.rms_eps)
+            k_norm = RMSNorm(k_norm_w.shape[-1], eps=model.config.rms_eps)
             k_norm = eqx.tree_at(lambda n: n.weight, k_norm, to_dtype(k_norm_w))
             block = eqx.tree_at(lambda b: b.attn.k_norm, block, k_norm, is_leaf=lambda x: x is None)
 
@@ -895,7 +1106,7 @@ def main() -> None:
 
     # Load config and build model
     cfg_dict = load_hf_config(args.repo, revision=args.revision)
-    config = hf_config_to_llm_config(cfg_dict, base=QWEN3_SMALL)
+    config = hf_config_to_llm_config(cfg_dict)
     model = build_qwen3_model(config)
 
     # Load weights

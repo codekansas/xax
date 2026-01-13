@@ -3,7 +3,7 @@
 
 from dataclasses import dataclass
 from functools import partial
-from typing import TypedDict
+from typing import TypedDict, override
 
 import jax
 import jax.numpy as jnp
@@ -16,6 +16,7 @@ from transformers.models.qwen2.tokenization_qwen2_fast import Qwen2TokenizerFast
 
 import xax
 
+# DEFAULT_MODEL_REPO = "Qwen/Qwen3-1.7B"  # Can also use 0.6B or 4B (4B needs >32GB VRAM)
 DEFAULT_MODEL_REPO = "Qwen/Qwen3-0.6B"
 DEFAULT_LORA_TARGETS = ("q_proj", "v_proj", "k_proj", "o_proj")
 
@@ -27,6 +28,9 @@ class Batch(TypedDict):
 
 @dataclass
 class Config(xax.SupervisedConfig):
+    # Model settings
+    model_repo: str = xax.field(DEFAULT_MODEL_REPO, help="HuggingFace model repository")
+
     # LoRA settings
     lora_rank: int = xax.field(16, help="Rank of LoRA decomposition")
     lora_alpha: float = xax.field(1.0, help="LoRA scaling factor (1.0 = no amplification)")
@@ -45,7 +49,7 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
     def __init__(self, config: Config) -> None:
         super().__init__(config)
 
-        self.tokenizer: Qwen2TokenizerFast = AutoTokenizer.from_pretrained(DEFAULT_MODEL_REPO)
+        self.tokenizer: Qwen2TokenizerFast = AutoTokenizer.from_pretrained(config.model_repo)
 
         # Pre-encode the generation prompt for use in compute_metrics
         prompt = "To be or not to be"
@@ -54,11 +58,11 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
             dtype=jnp.int32,
         )
 
+    @override
     def get_model(self, params: xax.InitParams) -> xax.LLM:
         # Loads the HF model config, optionally enabling gradient checkpointing.
         llm_config = xax.hf_config_to_llm_config(
-            xax.load_hf_config(DEFAULT_MODEL_REPO),
-            base=xax.QWEN3_SMALL,
+            xax.load_hf_config(self.config.model_repo),
             use_remat=self.config.use_gradient_checkpointing,
         )
 
@@ -66,7 +70,7 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
         model = xax.build_qwen3_model(llm_config, key=params.key)
 
         # Load pre-trained weights
-        model = xax.load_hf_weights_into_llm(model, DEFAULT_MODEL_REPO)
+        model = xax.load_hf_weights_into_llm(model, self.config.model_repo)
 
         # Apply LoRA selectively to specified layers (e.g., q_proj, v_proj)
         return xax.loraize_by_path(
@@ -78,11 +82,13 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
             key=params.key,
         )
 
-    def get_model_filter_spec(self, model: xax.LLM) -> xax.LLM:
-        # Only train LoRA parameters (lora_a and lora_b matrices)
-        # Base model weights are frozen
+    @override
+    def get_trainable_filter_spec(self, model: xax.LLM) -> xax.LLM:
+        # Only train LoRA parameters (lora_a and lora_b matrices).
+        # Base model weights are frozen.
         return xax.lora_filter_spec(model)
 
+    @override
     def get_optimizer(self) -> xax.Optimizer:
         # Create learning rate schedule with warmup and cosine decay
         if self.config.max_steps is not None:
@@ -108,49 +114,48 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
             weight_decay=0.01,
         )
 
-    def get_output(self, model: xax.LLM, batch: Batch, state: xax.State, key: PRNGKeyArray) -> Array:
-        # LLM takes (batch, seq_len) and returns (batch, seq_len, vocab_size)
-        # Use all but last token as input
-        input_ids_bt = batch["input_ids"][:, :-1]
-        logits_btv = model(input_ids_bt, key=key, inference=False)
-        return logits_btv
-
+    @override
     def compute_loss(
         self,
         model: xax.LLM,
         batch: Batch,
-        output: Array,
-        state: xax.State,
-        key: PRNGKeyArray,
-    ) -> Array:
-        # Targets are shifted by 1 (next-token prediction)
-        targets_bt = batch["input_ids"][:, 1:]
-        mask_bt = batch["attention_mask"][:, 1:] == 1
-        loss_bt = optax.softmax_cross_entropy_with_integer_labels(logits=output, labels=targets_bt)
-        masked_loss = jnp.where(mask_bt, loss_bt, 0.0)
-        loss = masked_loss.sum() / (mask_bt.sum() + 1e-8)
-        return loss
-
-    def compute_metrics(
-        self,
-        model: xax.LLM,
-        batch: Batch,
-        output: Array,
         state: xax.State,
         heavy: bool,
         key: PRNGKeyArray,
-    ) -> dict[str, xax.Metric]:
+    ) -> tuple[Array, dict[str, xax.Metric]]:
+        # Use all but last token as input, targets are shifted by 1
+        input_ids_bt = batch["input_ids"][:, :-1]
         targets_bt = batch["input_ids"][:, 1:]
-        preds_bt = output.argmax(axis=-1)
         mask_bt = batch["attention_mask"][:, 1:] == 1
 
+        # Memory-efficient forward pass: get hidden states without computing full logits
+        hidden_btd = model.forward_hidden(input_ids_bt, key=key, inference=False)
+
+        # Compute loss using chunked cross-entropy to avoid materializing full logits
+        # This processes the sequence in chunks, computing logits for each chunk
+        # and discarding them after computing the loss contribution
+        loss = xax.chunked_cross_entropy_loss(
+            hidden_btd,
+            targets_bt,
+            model.lm_head.weight,
+            mask_bt,
+            chunk_size=128,
+        )
+
         metrics: dict[str, xax.Metric] = {}
-        correct = (preds_bt == targets_bt) & mask_bt
-        metrics["acc"] = xax.Scalar(correct.sum() / mask_bt.sum())
 
         if heavy:
+            # Compute prediction accuracy.
+            accuracy = xax.chunked_cross_entropy_acc(
+                hidden_btd,
+                targets_bt,
+                model.lm_head.weight,
+                mask_bt,
+                chunk_size=128,
+            )
+            metrics["accuracy"] = xax.Scalar(accuracy)
+
             # Generate text using JIT-compilable generation
-            # Use a fixed prompt encoded at class initialization time
             prompt_tokens = self._generation_prompt_tokens
             eos_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else -1
             gen_key, key = jax.random.split(key)
@@ -165,13 +170,15 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
             )
             metrics["generated"] = xax.Tokens(generated)
 
-        return metrics
+        return loss, metrics
 
+    @override
     def decode_tokens(self, tokens: Array | np.ndarray) -> str:
         # Convert to list for tokenizer compatibility
         token_list: list[int] = tokens.tolist()
         return self.tokenizer.decode(token_list, skip_special_tokens=True)
 
+    @override
     def get_dataset(self) -> Dataset:
         ds = load_dataset("Trelis/tiny-shakespeare", split="train")
         tokenize_fn = partial(
@@ -201,9 +208,9 @@ def _tokenize_with_tokenizer(
 if __name__ == "__main__":
     ShakespeareLora.launch(
         Config(
-            batch_size=8,
+            batch_size=16,
             max_grad_norm=1.0,
-            gradient_accumulation_steps=8,
+            gradient_accumulation_steps=4,
             log_heavy_every_n_seconds=120,
             max_steps=50_000,
         ),
