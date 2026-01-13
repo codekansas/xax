@@ -23,7 +23,6 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax._src import sharding_impls
 from jax._src.lib import xla_client as xc
 from jax.sharding import NamedSharding
 from jaxtyping import Array, PyTree
@@ -129,23 +128,28 @@ def get_hash(obj: object) -> int:
     return id(obj)
 
 
+class _JitKwargs(TypedDict, total=False):
+    """Keyword arguments passed through to jax.jit."""
+
+    in_shardings: Any  # noqa: ANN401
+    out_shardings: Any  # noqa: ANN401
+    static_argnums: int | Sequence[int] | None
+    static_argnames: str | Iterable[str] | None
+    donate_argnums: int | Sequence[int] | None
+    donate_argnames: str | Iterable[str] | None
+    keep_unused: bool
+    device: xc.Device | None
+    backend: str | None
+    inline: bool
+
+
 @overload
 def jit(
     fn: Callable[P, R],
     *,
-    in_shardings: Any = ...,  # noqa: ANN401
-    out_shardings: Any = ...,  # noqa: ANN401
-    static_argnums: int | Sequence[int] | None = None,
-    static_argnames: str | Iterable[str] | None = None,
-    donate_argnums: int | Sequence[int] | None = None,
-    donate_argnames: str | Iterable[str] | None = None,
-    keep_unused: bool = False,
-    device: xc.Device | None = None,
-    backend: str | None = None,
-    inline: bool = False,
-    compiler_options: dict[str, Any] | None = None,
     jit_level: int | None = None,
     error_on_recompile: bool = False,
+    **jitkwargs: Unpack[_JitKwargs],
 ) -> Callable[P, R]: ...
 
 
@@ -153,38 +157,18 @@ def jit(
 def jit(
     fn: None = None,
     *,
-    in_shardings: Any = ...,  # noqa: ANN401
-    out_shardings: Any = ...,  # noqa: ANN401
-    static_argnums: int | Sequence[int] | None = None,
-    static_argnames: str | Iterable[str] | None = None,
-    donate_argnums: int | Sequence[int] | None = None,
-    donate_argnames: str | Iterable[str] | None = None,
-    keep_unused: bool = False,
-    device: xc.Device | None = None,
-    backend: str | None = None,
-    inline: bool = False,
-    compiler_options: dict[str, Any] | None = None,
     jit_level: int | None = None,
     error_on_recompile: bool = False,
+    **jitkwargs: Unpack[_JitKwargs],
 ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
 
 
 def jit(
     fn: Callable[P, R] | None = None,
     *,
-    in_shardings: Any = sharding_impls.UNSPECIFIED,  # noqa: ANN401
-    out_shardings: Any = sharding_impls.UNSPECIFIED,  # noqa: ANN401
-    static_argnums: int | Sequence[int] | None = None,
-    static_argnames: str | Iterable[str] | None = None,
-    donate_argnums: int | Sequence[int] | None = None,
-    donate_argnames: str | Iterable[str] | None = None,
-    keep_unused: bool = False,
-    device: xc.Device | None = None,
-    backend: str | None = None,
-    inline: bool = False,
-    compiler_options: dict[str, Any] | None = None,
     jit_level: int | None = None,
     error_on_recompile: bool = False,
+    **jitkwargs: Unpack[_JitKwargs],
 ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
     """Wrapper function that provides utility improvements over Jax's JIT.
 
@@ -202,20 +186,7 @@ def jit(
     """
 
     def make_jitted(f: Callable[P, R]) -> Callable[P, R]:
-        jitted_fn = jax.jit(
-            f,
-            in_shardings=in_shardings,
-            out_shardings=out_shardings,
-            static_argnums=static_argnums,
-            static_argnames=static_argnames,
-            donate_argnums=donate_argnums,
-            donate_argnames=donate_argnames,
-            keep_unused=keep_unused,
-            device=device,
-            backend=backend,
-            inline=inline,
-            compiler_options=compiler_options,
-        )
+        jitted_fn = jax.jit(f, **jitkwargs)
 
         cache: dict[tuple[Any, tuple[str, ...]], int] = {}
 
@@ -247,22 +218,6 @@ def jit(
 
 
 _DonateArg = Literal["all", "all-except-first", "warn", "warn-except-first", "none"]
-
-
-class _JitKwargs(TypedDict, total=False):
-    """Keyword arguments passed through to jax.jit."""
-
-    in_shardings: Any  # noqa: ANN401
-    out_shardings: Any  # noqa: ANN401
-    static_argnums: int | Sequence[int] | None
-    static_argnames: str | Iterable[str] | None
-    donate_argnums: int | Sequence[int] | None
-    donate_argnames: str | Iterable[str] | None
-    keep_unused: bool
-    device: xc.Device | None
-    backend: str | None
-    inline: bool
-    abstracted_axes: Any  # noqa: ANN401
 
 
 @overload
