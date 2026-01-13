@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --no-project --script
 """LoRA fine-tuning of a pre-trained LLM on Shakespeare text."""
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import partial
 from typing import TypedDict
 
@@ -16,6 +16,9 @@ from transformers.models.qwen2.tokenization_qwen2_fast import Qwen2TokenizerFast
 
 import xax
 
+DEFAULT_MODEL_REPO = "Qwen/Qwen3-0.6B"
+DEFAULT_LORA_TARGETS = ("q_proj", "v_proj", "k_proj", "o_proj")
+
 
 class Batch(TypedDict):
     attention_mask: Array
@@ -24,23 +27,17 @@ class Batch(TypedDict):
 
 @dataclass
 class Config(xax.SupervisedConfig):
-    # Model settings
-    model_repo: str = xax.field("Qwen/Qwen3-0.6B", help="HuggingFace model repository")
-
     # LoRA settings
     lora_rank: int = xax.field(16, help="Rank of LoRA decomposition")
     lora_alpha: float = xax.field(1.0, help="LoRA scaling factor (1.0 = no amplification)")
     lora_dropout: float = xax.field(0.0, help="Dropout rate for LoRA layers")
-    lora_targets: tuple[str, ...] | None = xax.field(
-        ("q_proj", "v_proj"),
-        help="Layer name patterns to apply LoRA to (e.g., q_proj, v_proj, k_proj, o_proj, mlp)",
-    )
+    lora_targets: tuple[str, ...] | None = xax.field(DEFAULT_LORA_TARGETS, help="Layer name suffixes to apply LoRA to")
 
     # Training settings
     learning_rate: float = xax.field(1e-4, help="Peak learning rate")
     min_learning_rate: float = xax.field(1e-5, help="Minimum learning rate for cosine decay")
     warmup_steps: int = xax.field(100, help="Number of warmup steps")
-    sequence_length: int = xax.field(256, help="Maximum sequence length")
+    sequence_length: int = xax.field(512, help="Maximum sequence length")
     use_gradient_checkpointing: bool = xax.field(True, help="Recompute activations to save memory")
 
 
@@ -48,13 +45,7 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
     def __init__(self, config: Config) -> None:
         super().__init__(config)
 
-        self.tokenizer: Qwen2TokenizerFast = AutoTokenizer.from_pretrained(config.model_repo)
-        llm_config = xax.hf_config_to_llm_config(
-            xax.load_hf_config(config.model_repo),
-            base=xax.QWEN3_SMALL,
-        )
-        # Enable gradient checkpointing if configured
-        self._llm_config = replace(llm_config, use_remat=config.use_gradient_checkpointing)
+        self.tokenizer: Qwen2TokenizerFast = AutoTokenizer.from_pretrained(DEFAULT_MODEL_REPO)
 
         # Pre-encode the generation prompt for use in compute_metrics
         prompt = "To be or not to be"
@@ -63,16 +54,19 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
             dtype=jnp.int32,
         )
 
-    @property
-    def vocab_size(self) -> int:
-        return self._llm_config.vocab_size
-
     def get_model(self, params: xax.InitParams) -> xax.LLM:
+        # Loads the HF model config, optionally enabling gradient checkpointing.
+        llm_config = xax.hf_config_to_llm_config(
+            xax.load_hf_config(DEFAULT_MODEL_REPO),
+            base=xax.QWEN3_SMALL,
+            use_remat=self.config.use_gradient_checkpointing,
+        )
+
         # Build model with correct config
-        model = xax.build_qwen3_model(self._llm_config, key=params.key)
+        model = xax.build_qwen3_model(llm_config, key=params.key)
 
         # Load pre-trained weights
-        model = xax.load_hf_weights_into_llm(model, self.config.model_repo)
+        model = xax.load_hf_weights_into_llm(model, DEFAULT_MODEL_REPO)
 
         # Apply LoRA selectively to specified layers (e.g., q_proj, v_proj)
         return xax.loraize_by_path(
@@ -207,9 +201,9 @@ def _tokenize_with_tokenizer(
 if __name__ == "__main__":
     ShakespeareLora.launch(
         Config(
-            batch_size=64,
+            batch_size=8,
             max_grad_norm=1.0,
-            gradient_accumulation_steps=1,
+            gradient_accumulation_steps=8,
             log_heavy_every_n_seconds=120,
             max_steps=50_000,
         ),

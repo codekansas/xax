@@ -34,7 +34,7 @@ from xax.task.logger import Metric, Scalar
 from xax.task.mixins.data_loader import InMemoryBatchIterator
 from xax.task.mixins.train import InitParams, Optimizer, TrainConfig, TrainMixin
 from xax.utils.experiments import ContextTimer
-from xax.utils.jax import fix_unspecified_sharding
+from xax.utils.jax import fix_unspecified_sharding, jit
 from xax.utils.logging import LOG_PING, LOG_STATUS
 from xax.utils.pytree import get_pytree_param_count
 from xax.utils.text import show_info
@@ -141,9 +141,8 @@ class SupervisedMixin(
         self,
         model_static: PyTree,
         optimizer: Optimizer,
-        heavy: bool,
     ) -> Callable[
-        [PyTree, optax.OptState, Batch, State, PRNGKeyArray],
+        [PyTree, optax.OptState, Batch, State, PRNGKeyArray, bool],
         tuple[PyTree, optax.OptState, State, dict[str, Metric]],
     ]:
         """Create a JIT-compiled training step function.
@@ -151,10 +150,11 @@ class SupervisedMixin(
         Args:
             model_static: The static (non-trainable) parts of the model.
             optimizer: The optimizer.
-            heavy: Whether to compute heavy metrics.
 
         Returns:
             A JIT-compiled function that performs one training step.
+            The function takes a `heavy` bool argument (static) to control
+            whether heavy metrics are computed.
         """
         num_accum_steps = self.config.gradient_accumulation_steps
         grad_dtype = self.config.precision.grad_jax_dtype
@@ -173,6 +173,7 @@ class SupervisedMixin(
             batches: Batch,
             state: State,
             key: PRNGKeyArray,
+            heavy: bool,
         ) -> tuple[PyTree, optax.OptState, State, dict[str, Metric]]:
             def compute_grads_and_loss(
                 model_arr: PyTree, batch: Batch, step_key: PRNGKeyArray
@@ -189,24 +190,34 @@ class SupervisedMixin(
                 grads = jax.tree.map(lambda g: g.astype(grad_dtype) if eqx.is_inexact_array(g) else g, grads)
                 return grads, loss, output
 
-            # Initialize accumulators.
+            # Get first leaf for batch size calculation later
             first_leaf = jax.tree.leaves(batches)[0]
-            init_grads = jax.tree.map(lambda x: jnp.zeros_like(x, dtype=grad_dtype), model_arr)
-            init_loss = jnp.zeros_like(first_leaf, shape=(), dtype=jnp.float32)
 
             def accum_fn(
-                carry: tuple[PyTree, Array, PRNGKeyArray],
+                carry: tuple[PyTree, Array, Output, PRNGKeyArray],
                 batch: Batch,
-            ) -> tuple[tuple[PyTree, Array, PRNGKeyArray], Output]:
-                acc_grads, acc_loss, key = carry
+            ) -> tuple[tuple[PyTree, Array, Output, PRNGKeyArray], None]:
+                acc_grads, acc_loss, _, key = carry
                 key, step_key = jax.random.split(key)
                 grads, loss, output = compute_grads_and_loss(model_arr, batch, step_key)
                 acc_grads = jax.tree.map(jnp.add, acc_grads, grads)
                 acc_loss = acc_loss + loss
-                return (acc_grads, acc_loss, key), output
+                # Keep only the last output in carry; return None to avoid storing all outputs
+                return (acc_grads, acc_loss, output, key), None
 
-            # Accumulate gradients over micro-batches using scan.
-            (acc_grads, acc_loss, key), outputs = jax.lax.scan(accum_fn, (init_grads, init_loss, key), batches)
+            # Run first micro-batch to get initial output structure
+            first_batch = jax.tree.map(lambda x: x[0], batches)
+            key, first_key = jax.random.split(key)
+            first_grads, first_loss, init_output = compute_grads_and_loss(model_arr, first_batch, first_key)
+
+            # Accumulate remaining gradients over micro-batches using scan.
+            # Only the last output is kept in the carry; we return None to avoid storing all outputs.
+            remaining_batches = jax.tree.map(lambda x: x[1:], batches)
+            (acc_grads, acc_loss, output, key), _ = jax.lax.scan(
+                accum_fn,
+                (first_grads, first_loss, init_output, key),
+                remaining_batches,
+            )
 
             # Average gradients and loss over micro-batches.
             acc_grads = jax.tree.map(lambda g: g / num_accum_steps, acc_grads)
@@ -223,9 +234,6 @@ class SupervisedMixin(
             updates, new_opt_state = optimizer.update(acc_grads, opt_state, model_arr)
             updates = jax.tree.map(lambda u: u.astype(param_dtype) if eqx.is_inexact_array(u) else u, updates)
             new_model_arr = eqx.apply_updates(model_arr, updates)
-
-            # Return the last output for metrics
-            output = jax.tree.map(lambda x: x[-1], outputs)
 
             # Calculate batch size and update state
             batch_size = first_leaf.shape[1]
@@ -255,7 +263,8 @@ class SupervisedMixin(
 
             return new_model_arr, new_opt_state, new_state, metrics
 
-        return eqx.filter_jit(train_step)
+        # Use static_argnames for `heavy` so both versions are compiled and cached
+        return jit(static_argnames=["heavy"])(train_step)
 
     def train_loop(
         self,
@@ -289,9 +298,8 @@ class SupervisedMixin(
             opt_state = jax.tree.map(unspecified_sharding_fn, opt_state)
             state = jax.tree.map(unspecified_sharding_fn, state)
 
-        # Create JIT-compiled train step
-        light_train_step_fn = self.create_train_step_fn(model_static, optimizer, False)
-        heavy_train_step_fn = self.create_train_step_fn(model_static, optimizer, True)
+        # Create JIT-compiled train step (heavy is a static arg, so both versions get cached)
+        train_step_fn = self.create_train_step_fn(model_static, optimizer)
 
         def save_checkpoint() -> None:
             model = eqx.combine(model_arr, model_static)
@@ -317,6 +325,10 @@ class SupervisedMixin(
                     batches = tuple(itertools.islice(ds, self.config.gradient_accumulation_steps))
                     batches_stacked = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *batches)
 
+                # Ensure batches have consistent sharding to prevent recompilation
+                if mesh is not None and mesh.devices.size > 1:
+                    batches_stacked = jax.tree.map(unspecified_sharding_fn, batches_stacked)
+
                 step_key, key = jax.random.split(key)
 
                 # Get log mode (heavy flag) and update state. Always do heavy
@@ -325,13 +337,13 @@ class SupervisedMixin(
                 heavy = heavy_arr.item() or is_done
 
                 # Execute training step
-                train_step_fn = heavy_train_step_fn if heavy else light_train_step_fn
                 model_arr, opt_state, state, metrics = train_step_fn(
                     model_arr,
                     opt_state,
                     batches_stacked,
                     state,
                     step_key,
+                    heavy,
                 )
 
                 self.log_step(FrozenDict(metrics), state, heavy)
