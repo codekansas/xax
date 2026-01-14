@@ -17,14 +17,17 @@ class LoRALinear(eqx.Module):
     The base weight and bias are treated as frozen parameters; only the low-rank
     matrices ``lora_a_ir`` and ``lora_b_ro`` are updated during fine-tuning.
 
-    The ``alpha`` parameter directly scales the LoRA contribution (default 1.0),
-    independent of rank. Use alpha > 1.0 to amplify LoRA updates.
+    Following the standard LoRA formulation, the contribution is scaled by
+    ``alpha / rank``. This ensures consistent gradient magnitudes regardless of
+    rank choice. With the default ``alpha=16``, rank 16 gives a scaling of 1.0,
+    while rank 8 gives 2.0, and rank 32 gives 0.5.
     """
 
     weight_oi: Array
     bias_o: Array | None
     lora_a_ir: Array
     lora_b_ro: Array
+    rank: int = eqx.field(static=True)
     alpha: float = eqx.field(static=True)
     dropout_rate: float = eqx.field(static=True)
 
@@ -34,11 +37,20 @@ class LoRALinear(eqx.Module):
         linear: eqx.nn.Linear,
         rank: int,
         *,
-        alpha: float = 1.0,
+        alpha: float = 16.0,
         dropout_rate: float = 0.0,
         key: PRNGKeyArray | None = None,
     ) -> "LoRALinear":
-        """Create a LoRA-augmented linear layer from an ``eqx.nn.Linear``."""
+        """Create a LoRA-augmented linear layer from an ``eqx.nn.Linear``.
+
+        Args:
+            linear: The base linear layer to augment.
+            rank: Rank of the low-rank decomposition.
+            alpha: LoRA scaling parameter. The actual scaling is alpha/rank.
+                With the default alpha=16 and rank=16, scaling is 1.0.
+            dropout_rate: Dropout rate for LoRA layers.
+            key: PRNG key for initialization.
+        """
         if rank < 1:
             raise ValueError("rank must be at least 1")
         if key is None:
@@ -56,9 +68,15 @@ class LoRALinear(eqx.Module):
             bias_o=None if linear.bias is None else jax.lax.stop_gradient(linear.bias),
             lora_a_ir=lora_a_ir,
             lora_b_ro=lora_b_ro,
+            rank=rank,
             alpha=alpha,
             dropout_rate=dropout_rate,
         )
+
+    @property
+    def scaling(self) -> float:
+        """Return the LoRA scaling factor (alpha / rank)."""
+        return self.alpha / self.rank
 
     def __call__(self, x_bi: Array, *, key: PRNGKeyArray | None = None, inference: bool = False) -> Array:
         y_bo = x_bi @ self.weight_oi.T
@@ -74,18 +92,27 @@ class LoRALinear(eqx.Module):
             x_lora_bi = jnp.where(mask_bi, x_bi / keep_prob, 0.0)
 
         delta_bo = (x_lora_bi @ self.lora_a_ir) @ self.lora_b_ro
-        return y_bo + delta_bo * self.alpha
+        return y_bo + delta_bo * self.scaling
 
 
 def loraize_linear(
     linear: eqx.nn.Linear,
     rank: int,
     *,
-    alpha: float = 1.0,
+    alpha: float = 16.0,
     dropout_rate: float = 0.0,
     key: PRNGKeyArray | None = None,
 ) -> LoRALinear:
-    """Replace an Equinox linear layer with a ``LoRALinear``."""
+    """Replace an Equinox linear layer with a ``LoRALinear``.
+
+    Args:
+        linear: The base linear layer to augment.
+        rank: Rank of the low-rank decomposition.
+        alpha: LoRA scaling parameter. The actual scaling is alpha/rank.
+            With the default alpha=16 and rank=16, scaling is 1.0.
+        dropout_rate: Dropout rate for LoRA layers.
+        key: PRNG key for initialization.
+    """
     return LoRALinear.from_linear(linear, rank, alpha=alpha, dropout_rate=dropout_rate, key=key)
 
 
@@ -93,12 +120,22 @@ def loraize(
     module: Tmodule,
     rank: int,
     *,
-    alpha: float = 1.0,
+    alpha: float = 16.0,
     dropout_rate: float = 0.0,
     predicate: Callable[[eqx.nn.Linear], bool] | None = None,
     key: PRNGKeyArray | None = None,
 ) -> Tmodule:
-    """Recursively replace ``eqx.nn.Linear`` layers with ``LoRALinear``."""
+    """Recursively replace ``eqx.nn.Linear`` layers with ``LoRALinear``.
+
+    Args:
+        module: The module to transform.
+        rank: LoRA rank for the low-rank decomposition.
+        alpha: LoRA scaling parameter. The actual scaling is alpha/rank.
+            With the default alpha=16 and rank=16, scaling is 1.0.
+        dropout_rate: Dropout rate for LoRA layers.
+        predicate: Optional function to filter which Linear layers to convert.
+        key: PRNG key for initialization.
+    """
     if predicate is None:
 
         def predicate(_: eqx.nn.Linear) -> bool:  # noqa: ARG001
@@ -124,7 +161,7 @@ def loraize_by_path(
     *,
     include_suffixes: list[str] | None = None,
     exclude_suffixes: list[str] | None = None,
-    alpha: float = 1.0,
+    alpha: float = 16.0,
     dropout_rate: float = 0.0,
     key: PRNGKeyArray | None = None,
 ) -> Tmodule:
@@ -141,7 +178,8 @@ def loraize_by_path(
         include_suffixes: List of suffixes to match against layer paths.
             If None, all Linear layers are candidates.
         exclude_suffixes: List of suffixes that exclude a layer if matched.
-        alpha: LoRA scaling factor (default 1.0). Use > 1.0 to amplify updates.
+        alpha: LoRA scaling parameter. The actual scaling is alpha/rank.
+            With the default alpha=16 and rank=16, scaling is 1.0.
         dropout_rate: Dropout rate for LoRA layers.
         key: PRNG key for initialization.
 
@@ -215,7 +253,7 @@ def merge_lora(module: Tmodule) -> Tmodule:
 
     def convert(node: Any) -> Any:  # noqa: ANN001, ANN401
         if isinstance(node, LoRALinear):
-            delta_oi = (node.lora_a_ir @ node.lora_b_ro).T * node.alpha
+            delta_oi = (node.lora_a_ir @ node.lora_b_ro).T * node.scaling
             merged_weight_oi = node.weight_oi + delta_oi
             merged = eqx.nn.Linear(
                 in_features=node.weight_oi.shape[1],
