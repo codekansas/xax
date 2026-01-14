@@ -49,7 +49,7 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
     def __init__(self, config: Config) -> None:
         super().__init__(config)
 
-        self.tokenizer: Qwen2TokenizerFast = AutoTokenizer.from_pretrained(config.model_repo)
+        self.tokenizer: Qwen2TokenizerFast = AutoTokenizer.from_pretrained(config.llm_repo.value)
 
         # Pre-encode the generation prompt for use in compute_metrics
         self._generation_prompt_tokens = jnp.array(
@@ -156,7 +156,7 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
             prompt_tokens = self._generation_prompt_tokens
             eos_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else -1
             gen_key, key = jax.random.split(key)
-            generated_tokens, _ = xax.llm_generate_jit(
+            gen_result = xax.llm_generate_jit(
                 model,
                 prompt_tokens,
                 eos_id,
@@ -164,7 +164,10 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
                 temperature=0.8,
                 top_p=0.9,
                 key=gen_key,
+                use_cache=True,
+                return_cache=False,
             )
+            generated_tokens = gen_result[0]
             metrics["generated"] = xax.Tokens(generated_tokens)
 
         return loss, metrics
