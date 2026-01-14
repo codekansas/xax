@@ -286,9 +286,38 @@ class TrainMixin(
 
         if init_ckpt_path is not None:
             logger.info("Loading checkpoint from %s", init_ckpt_path)
-            models, state, config = self.load_ckpt(init_ckpt_path, params, part="model_state_config")
+
+            # Build actual models with HF weights loaded (not via eval_shape).
+            # This is needed because checkpoints only save trainable params (e.g., LoRA),
+            # while frozen params (e.g., base LLM weights) must be loaded from source.
+            models = self._get_models(params)
+            models = jax.tree.map(self.cast_param_dtype, models)
+
+            # Get trainable filter spec and extract trainable part as restore template.
+            # The checkpoint structure matches trainable_arr, not the full model.
+            trainable_templates = []
+            for model in models:
+                filter_spec = self.get_trainable_filter_spec(model)
+                trainable, _ = eqx.partition(model, filter_spec)
+                trainable_templates.append(jax.tree.map(as_shape_dtype, trainable))
+
+            # Restore trainable params from checkpoint
+            trainable_restored = load_ckpt(init_ckpt_path, part="model", model_templates=trainable_templates)
+
+            # Combine restored trainable params with the full models
+            restored_models = []
+            for model, trainable in zip(models, trainable_restored, strict=True):
+                filter_spec = self.get_trainable_filter_spec(model)
+                _, frozen = eqx.partition(model, filter_spec)
+                restored_models.append(eqx.combine(trainable, frozen))
+            models = restored_models
+
             if model_sharding is not None:
                 models = jax.tree.map(_shard, models)
+
+            # Load state and config from checkpoint
+            state = load_ckpt(init_ckpt_path, part="state")
+            config = self.get_config(load_ckpt(init_ckpt_path, part="config"), use_cli=False)
             config_diff = get_diff_string(diff_configs(asdict(config), asdict(self.config)))
             if config_diff:
                 logger.warning("Loaded config differs from current config:\n%s", config_diff)

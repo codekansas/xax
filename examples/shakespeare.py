@@ -16,8 +16,7 @@ from transformers.models.qwen2.tokenization_qwen2_fast import Qwen2TokenizerFast
 
 import xax
 
-# DEFAULT_MODEL_REPO = "Qwen/Qwen3-1.7B"  # Can also use 0.6B or 4B (4B needs >32GB VRAM)
-DEFAULT_MODEL_REPO = "Qwen/Qwen3-0.6B"
+# Attention (q_proj, v_proj) + MLP (gate, up) layers for best quality
 DEFAULT_LORA_TARGETS = ("q_proj", "v_proj", "gate", "up")
 
 
@@ -29,7 +28,7 @@ class Batch(TypedDict):
 @dataclass
 class Config(xax.SupervisedConfig):
     # Model settings
-    model_repo: str = xax.field(DEFAULT_MODEL_REPO, help="HuggingFace model repository")
+    llm_repo: xax.LLMRepo = xax.field(xax.LLMRepo.QWEN3_600M, help="Pretrained model")
 
     # LoRA settings
     lora_rank: int = xax.field(16, help="Rank of LoRA decomposition")
@@ -63,17 +62,8 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
 
     @override
     def get_model(self, params: xax.InitParams) -> xax.LLM:
-        # Loads the HF model config, optionally enabling gradient checkpointing.
-        llm_config = xax.hf_config_to_llm_config(
-            xax.load_hf_config(self.config.model_repo),
-            use_remat=self.config.use_gradient_checkpointing,
-        )
-
         # Build model with correct config
-        model = xax.build_qwen3_model(llm_config, key=params.key)
-
-        # Load pre-trained weights
-        model = xax.load_hf_weights_into_llm(model, self.config.model_repo)
+        model = xax.build_pretrained_model(self.config.llm_repo)
 
         # Apply LoRA selectively to specified layers (e.g., q_proj, v_proj)
         return xax.loraize_by_path(

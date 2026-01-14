@@ -3,8 +3,11 @@
 import functools
 import json
 import logging
+import sys
 from dataclasses import dataclass, replace
+from enum import Enum
 from pathlib import Path
+from typing import Iterator
 
 import chex
 import equinox as eqx
@@ -52,7 +55,7 @@ class LLMConfig:
     kv_heads: int = field(MISSING, help="Number of key/value attention heads (for GQA)")
     head_dim: int = field(MISSING, help="Dimension per attention head")
     num_layers: int = field(MISSING, help="Number of transformer layers")
-    max_tsz: int = field(MISSING, help="Maximum sequence length")
+    max_tsz: int = field(32768, help="Maximum sequence length")
     rope_theta: float = field(10_000.0, help="RoPE theta base frequency")
     dropout_rate: float = field(0.0, help="Dropout rate")
     mlp_mult: int = field(4, help="MLP hidden dimension multiplier")
@@ -67,7 +70,8 @@ class LLMConfig:
     sliding_window_size: int | None = field(None, help="Sliding window size (None = full attention)")
     layer_attention_types: tuple[str, ...] | None = field(None, help="Per-layer attention type ('sliding' or 'full')")
     use_attention_sinks: bool = field(False, help="Use learnable attention sinks for stability")
-    use_remat: bool = field(False, help="Recompute activations during backward to save memory")
+    use_remat: bool = field(True, help="Recompute activations during backward to save memory")
+    use_qk_norm: bool = field(False, help="Apply QK normalization in attention (Qwen3 style)")
 
     def with_vocab(self, vocab_size: int) -> "LLMConfig":
         return replace(self, vocab_size=vocab_size)
@@ -87,7 +91,7 @@ class LLM(eqx.Module):
     config: LLMConfig
 
     @classmethod
-    def init(cls, config: LLMConfig, *, key: jax.Array) -> "LLM":
+    def build(cls, config: LLMConfig, *, key: jax.Array) -> "LLM":
         """Initialize LLM with random weights."""
         k_emb, *block_keys, k_head = jax.random.split(key, config.num_layers + 2)
         embed = eqx.nn.Embedding(config.vocab_size, config.embed_dim, key=k_emb)
@@ -122,7 +126,7 @@ class LLM(eqx.Module):
                 rotary_original_max_position_embeddings=config.rope_original_max_position_embeddings,
                 rotary_beta_slow=config.rope_beta_slow,
                 rotary_beta_fast=config.rope_beta_fast,
-                use_qk_norm=False,  # Will be set via weight loading if present
+                use_qk_norm=config.use_qk_norm,
                 use_attention_sinks=config.use_attention_sinks,
             )
 
@@ -206,18 +210,25 @@ class LLM(eqx.Module):
         return logits_btv
 
 
-def build_qwen3_model(config: LLMConfig, *, key: jax.Array | None = None) -> LLM:
-    """Creates a Qwen3-style model.
+class LLMRepo(Enum):
+    QWEN3_600M = "Qwen/Qwen3-0.6B"
+    QWEN3_1_5B = "Qwen/Qwen3-1.5B"
+    QWEN3_3B = "Qwen/Qwen3-3B"
+    QWEN3_7B = "Qwen/Qwen3-7B"
+    QWEN3_14B = "Qwen/Qwen3-14B"
+    QWEN3_32B = "Qwen/Qwen3-32B"
+
+
+def build_pretrained_model(repo: LLMRepo, dtype: jnp.dtype | None = None) -> LLM:
+    """Loads a pretrained model.
 
     Args:
-        config: LLMConfig specifying model architecture.
-        key: Optional PRNG key for initialization.
-
-    Returns:
-        Initialized LLM model.
+        repo: Pretrained model repository.
+        dtype: Optional dtype for the model.
     """
-    key = jax.random.key(0) if key is None else key
-    return LLM.init(config, key=key)
+    config = hf_config_to_llm_config(cfg=load_hf_config(repo.value))
+    model = LLM.build(config, key=jax.random.key(0))
+    return load_hf_weights_into_llm(model, repo.value, dtype=dtype)
 
 
 def tie_embedding_and_head(model: LLM) -> LLM:
@@ -533,6 +544,10 @@ class HFConfig(BaseModel):
         default=None,
         validation_alias=AliasChoices("layer_types", "sliding_attention_map"),
     )
+    model_type: str | None = PydanticField(
+        default=None,
+        validation_alias=AliasChoices("model_type"),
+    )
 
 
 def _parse_rope_scaling(cfg: dict[str, object]) -> tuple[float, int | None, float, float]:
@@ -563,18 +578,11 @@ def _parse_rope_scaling(cfg: dict[str, object]) -> tuple[float, int | None, floa
     return factor, original_max_pos, beta_slow, beta_fast
 
 
-def hf_config_to_llm_config(
-    cfg: dict[str, object],
-    *,
-    use_remat: bool = False,
-    max_tsz: int = 32768,
-) -> LLMConfig:
+def hf_config_to_llm_config(cfg: dict[str, object]) -> LLMConfig:
     """Derive an LLMConfig from a HuggingFace config dict.
 
     Args:
         cfg: HuggingFace config dictionary (from load_hf_config).
-        use_remat: Whether to use gradient checkpointing (remat).
-        max_tsz: Maximum sequence length (not always in HF config).
 
     Returns:
         LLMConfig derived from the HuggingFace config.
@@ -615,6 +623,9 @@ def hf_config_to_llm_config(
     layer_attention_types = tuple(parsed.layer_types) if parsed.layer_types else None
     use_attention_sinks = layer_attention_types is not None
 
+    # Qwen3 models use QK normalization
+    use_qk_norm = parsed.model_type in ("qwen3", "qwen3_moe")
+
     return LLMConfig(
         vocab_size=vocab_size,
         embed_dim=embed_dim,
@@ -622,7 +633,6 @@ def hf_config_to_llm_config(
         kv_heads=kv_heads,
         head_dim=head_dim,
         num_layers=num_layers,
-        max_tsz=max_tsz,
         rope_theta=rope_theta,
         dropout_rate=0.0,
         mlp_mult=mlp_mult,
@@ -637,7 +647,7 @@ def hf_config_to_llm_config(
         sliding_window_size=sliding_window_size,
         layer_attention_types=layer_attention_types,
         use_attention_sinks=use_attention_sinks,
-        use_remat=use_remat,
+        use_qk_norm=use_qk_norm,
     )
 
 
@@ -673,16 +683,16 @@ def load_hf_weights_into_llm(
     if dtype is None:
         dtype = jnp.bfloat16
 
+    mesh = jax.sharding.get_mesh()
+    if mesh is None:
+        raise ValueError("Mesh is not set. Please set the mesh via jax.set_mesh() before loading weights.")
+
     config_dict, state = _fetch_state_dict(repo_id, revision)
 
     # Validate that model config matches the HF config
     hf_parsed = HFConfig.model_validate(config_dict)
     if hf_parsed.hidden_size is not None and hf_parsed.hidden_size != model.config.embed_dim:
         raise ValueError(f"HF hidden_size {hf_parsed.hidden_size} != model.embed_dim {model.config.embed_dim}")
-
-    mesh = jax.sharding.get_mesh()
-    if mesh is None:
-        raise ValueError("Mesh is not set. Please set the mesh via jax.set_mesh() before loading weights.")
 
     if mesh.devices.size > 1:
         # Replicate weights across all devices (no partitioning)
@@ -758,15 +768,16 @@ def load_hf_weights_into_llm(
         block = eqx.tree_at(lambda b: b.self_attn.v_proj, block, map_linear(block.self_attn.v_proj, v_w, v_b))
         block = eqx.tree_at(lambda b: b.self_attn.output_proj, block, map_linear(block.self_attn.output_proj, o_w, o_b))
 
-        # QK-Norm (Qwen3 style) - only create if weights are present
+        # QK-Norm (Qwen3 style) - only update if weights are present
         q_norm_w = state.get(f"{pfx_alt}.q_norm.weight")
         k_norm_w = state.get(f"{pfx_alt}.k_norm.weight")
+        is_qk_norm_leaf = lambda x: isinstance(x, RMSNorm) or x is None
         if q_norm_w is not None:
             q_norm = RMSNorm(weight=to_dtype(q_norm_w), eps=model.config.rms_eps)
-            block = eqx.tree_at(lambda b: b.self_attn.q_norm, block, q_norm, is_leaf=lambda x: x is None)
+            block = eqx.tree_at(lambda b: b.self_attn.q_norm, block, q_norm, is_leaf=is_qk_norm_leaf)
         if k_norm_w is not None:
             k_norm = RMSNorm(weight=to_dtype(k_norm_w), eps=model.config.rms_eps)
-            block = eqx.tree_at(lambda b: b.self_attn.k_norm, block, k_norm, is_leaf=lambda x: x is None)
+            block = eqx.tree_at(lambda b: b.self_attn.k_norm, block, k_norm, is_leaf=is_qk_norm_leaf)
 
         # Layer norms
         pre_gamma = _get_weight(state, f"{blk_pfx}.input_layernorm.weight", f"{blk_pfx_alt}.input_layernorm.weight")
@@ -912,13 +923,13 @@ def main() -> None:
     import argparse  # noqa: PLC0415
 
     parser = argparse.ArgumentParser(description="Run lightweight LLM with HuggingFace weights.")
-    parser.add_argument("--repo", type=str, required=True, help="HF repo id, e.g., Qwen/Qwen3-0.6B")
+    parser.add_argument("--repo", type=LLMRepo, required=True, help="LLM repository")
     parser.add_argument("--revision", type=str, default=None)
     parser.add_argument("--prompt", type=str, default="Hello world")
-    parser.add_argument("--max-new-tokens", type=int, default=20)
+    parser.add_argument("--max-new-tokens", type=int, default=256, help="Max tokens to generate (default: 256)")
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.9)
-    parser.add_argument("--chat-template", action="store_true", help="Apply chat template for chat models.")
+    parser.add_argument("--no-stream", action="store_true", help="Disable streaming (print all at once).")
     parser.add_argument("--dtype", choices=["float32", "bfloat16", "float16"], default="bfloat16")
     args = parser.parse_args()
 
@@ -926,44 +937,57 @@ def main() -> None:
     dtype_map = {"float32": jnp.float32, "bfloat16": jnp.bfloat16, "float16": jnp.float16}
     dtype = dtype_map[args.dtype]
 
-    # Load config and build model
-    cfg_dict = load_hf_config(args.repo, revision=args.revision)
-    config = hf_config_to_llm_config(cfg_dict)
-    model = build_qwen3_model(config)
+    # Loads the model repository.
+    logger.info("Loading weights from %s...", args.repo.value)
+    model = build_pretrained_model(args.repo, dtype=dtype)
 
-    # Load weights
-    logger.info("Loading weights from %s...", args.repo)
-    model = load_hf_weights_into_llm(model, args.repo, revision=args.revision, dtype=dtype)
-    logger.info("Weights loaded successfully!")
+    # Load tokenizer.
+    tokenizer = AutoTokenizer.from_pretrained(args.repo.value, revision=args.revision)
 
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.repo, revision=args.revision)
-
-    # Prepare input tokens
-    if args.chat_template or ("chat" in args.repo.lower()):
-        tokens = tokenizer.apply_chat_template(
-            [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": args.prompt},
-            ],
-            add_generation_prompt=True,
-        )
-    else:
-        tokens = tokenizer.encode(args.prompt, return_tensors="np", add_special_tokens=False)[0].tolist()
-
-    # Generate
-    output_tokens = llm_generate(
-        model,
-        tokens=tokens,
-        eos_id=tokenizer.eos_token_id,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
+    # Prepare input tokens.
+    tokens = tokenizer.apply_chat_template(
+        [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": args.prompt},
+        ],
+        add_generation_prompt=True,
     )
 
-    # Print result
-    text = tokenizer.decode(output_tokens, skip_special_tokens=True)
-    print(text)
+    # Generate with streaming or batch mode
+    if args.no_stream:
+        # Batch mode: generate all then print
+        output_tokens = llm_generate(
+            model,
+            tokens=tokens,
+            eos_id=tokenizer.eos_token_id,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+        )
+        text = tokenizer.decode(output_tokens, skip_special_tokens=True)
+        print(text)
+
+    else:
+        # Streaming mode: print tokens as they're generated
+        generated_tokens: list[int] = []
+        prev_text = ""
+        for token in llm_generate_stream(
+            model,
+            tokens=tokens,
+            eos_id=tokenizer.eos_token_id,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+        ):
+            generated_tokens.append(token)
+            # Decode all tokens and print only the new part
+            text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            if len(text) > len(prev_text):
+                new_text = text[len(prev_text) :]
+                sys.stdout.write(new_text)
+                sys.stdout.flush()
+                prev_text = text
+        print()  # Final newline
 
 
 if __name__ == "__main__":

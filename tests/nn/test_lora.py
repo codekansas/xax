@@ -6,7 +6,13 @@ import jax.numpy as jnp
 import jax.random as jrandom
 import pytest
 
-from xax.nn.lora import LoRALinear, lora_filter_spec, loraize, loraize_linear, merge_lora
+from xax.nn.lora import (
+    LoRALinear,
+    lora_filter_spec,
+    loraize,
+    loraize_linear,
+    merge_lora,
+)
 
 
 def test_lora_linear_matches_manual_delta() -> None:
