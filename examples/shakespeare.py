@@ -32,7 +32,7 @@ class Config(xax.SupervisedConfig):
     model_repo: str = xax.field(DEFAULT_MODEL_REPO, help="HuggingFace model repository")
 
     # LoRA settings
-    lora_rank: int = xax.field(16, help="Rank of LoRA decomposition")
+    lora_rank: int = xax.field(64, help="Rank of LoRA decomposition")
     lora_alpha: float = xax.field(32.0, help="LoRA alpha parameter (actual scaling is alpha/rank)")
     lora_dropout: float = xax.field(0.0, help="Dropout rate for LoRA layers")
     lora_targets: tuple[str, ...] | None = xax.field(DEFAULT_LORA_TARGETS, help="Layer name suffixes to apply LoRA to")
@@ -146,6 +146,10 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
         )
 
         metrics: dict[str, xax.Metric] = {}
+
+        # Always log perplexity (exp of loss)
+        perplexity = jnp.exp(loss)
+        metrics["perplexity"] = xax.Scalar(perplexity)
 
         if heavy:
             # Compute prediction accuracy.
