@@ -18,7 +18,7 @@ import xax
 
 # DEFAULT_MODEL_REPO = "Qwen/Qwen3-1.7B"  # Can also use 0.6B or 4B (4B needs >32GB VRAM)
 DEFAULT_MODEL_REPO = "Qwen/Qwen3-0.6B"
-DEFAULT_LORA_TARGETS = ("q_proj", "v_proj", "k_proj", "o_proj")
+DEFAULT_LORA_TARGETS = ("q_proj", "v_proj", "gate", "up")
 
 
 class Batch(TypedDict):
@@ -147,6 +147,10 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
 
         metrics: dict[str, xax.Metric] = {}
 
+        # Always log perplexity (exp of loss)
+        perplexity = jnp.exp(loss)
+        metrics["perplexity"] = xax.Scalar(perplexity)
+
         if heavy:
             # Compute prediction accuracy.
             accuracy = xax.chunked_cross_entropy_acc(
@@ -219,6 +223,7 @@ if __name__ == "__main__":
             max_grad_norm=1.0,
             gradient_accumulation_steps=1,
             log_heavy_every_n_seconds=120,
-            max_steps=50_000,
+            max_steps=60 * 10,
+            step_kind="second",
         ),
     )
