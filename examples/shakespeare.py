@@ -33,7 +33,7 @@ class Config(xax.SupervisedConfig):
 
     # LoRA settings
     lora_rank: int = xax.field(16, help="Rank of LoRA decomposition")
-    lora_alpha: float = xax.field(32.0, help="LoRA alpha parameter (actual scaling is alpha/rank)")
+    lora_alpha: float = xax.field(16.0, help="LoRA alpha parameter (actual scaling is alpha/rank)")
     lora_dropout: float = xax.field(0.0, help="Dropout rate for LoRA layers")
     lora_targets: tuple[str, ...] | None = xax.field(DEFAULT_LORA_TARGETS, help="Layer name suffixes to apply LoRA to")
 
