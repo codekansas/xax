@@ -33,14 +33,14 @@ class Config(xax.SupervisedConfig):
 
     # LoRA settings
     lora_rank: int = xax.field(16, help="Rank of LoRA decomposition")
-    lora_alpha: float = xax.field(16.0, help="LoRA alpha parameter (actual scaling is alpha/rank)")
+    lora_alpha: float = xax.field(32.0, help="LoRA alpha parameter (actual scaling is alpha/rank)")
     lora_dropout: float = xax.field(0.0, help="Dropout rate for LoRA layers")
     lora_targets: tuple[str, ...] | None = xax.field(DEFAULT_LORA_TARGETS, help="Layer name suffixes to apply LoRA to")
 
     # Training settings
-    learning_rate: float = xax.field(1e-4, help="Peak learning rate")
+    learning_rate: float = xax.field(5e-4, help="Peak learning rate")
     min_learning_rate: float = xax.field(1e-5, help="Minimum learning rate for cosine decay")
-    warmup_steps: int = xax.field(100, help="Number of warmup steps")
+    warmup_steps: int = xax.field(50, help="Number of warmup steps")
     sequence_length: int = xax.field(1025, help="Maximum sequence length (N - 1 should be a multiple of 64 for cuDNN)")
     use_gradient_checkpointing: bool = xax.field(True, help="Recompute activations to save memory")
     eval_prompt: str = xax.field("To be or not to be", help="Prompt to use for evaluation")
