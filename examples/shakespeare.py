@@ -18,7 +18,7 @@ import xax
 
 # DEFAULT_MODEL_REPO = "Qwen/Qwen3-1.7B"  # Can also use 0.6B or 4B (4B needs >32GB VRAM)
 DEFAULT_MODEL_REPO = "Qwen/Qwen3-0.6B"
-DEFAULT_LORA_TARGETS = ("q_proj", "v_proj", "k_proj", "o_proj")
+DEFAULT_LORA_TARGETS = ("q_proj", "v_proj", "gate", "up")
 
 
 class Batch(TypedDict):
@@ -32,7 +32,7 @@ class Config(xax.SupervisedConfig):
     model_repo: str = xax.field(DEFAULT_MODEL_REPO, help="HuggingFace model repository")
 
     # LoRA settings
-    lora_rank: int = xax.field(64, help="Rank of LoRA decomposition")
+    lora_rank: int = xax.field(16, help="Rank of LoRA decomposition")
     lora_alpha: float = xax.field(32.0, help="LoRA alpha parameter (actual scaling is alpha/rank)")
     lora_dropout: float = xax.field(0.0, help="Dropout rate for LoRA layers")
     lora_targets: tuple[str, ...] | None = xax.field(DEFAULT_LORA_TARGETS, help="Layer name suffixes to apply LoRA to")
@@ -223,6 +223,7 @@ if __name__ == "__main__":
             max_grad_norm=1.0,
             gradient_accumulation_steps=1,
             log_heavy_every_n_seconds=120,
-            max_steps=50_000,
+            max_steps=60 * 10,
+            step_kind="second",
         ),
     )
