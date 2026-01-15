@@ -28,6 +28,7 @@ from xax.arch.attention import (
     apply_linear,
 )
 from xax.core.conf import field
+from xax.utils.jax import jit as xax_jit
 
 try:
     from huggingface_hub import snapshot_download
@@ -1005,6 +1006,10 @@ def _sample_next_token(
     return next_token, key
 
 
+@xax_jit(
+    static_argnames=["eos_id", "max_new_tokens", "temperature", "top_p", "return_cache"],
+    donate_argnames=["tokens_t", "key", "cache"],
+)
 def llm_generate_jit(
     model: LLM,
     tokens_t: Array,
@@ -1014,31 +1019,9 @@ def llm_generate_jit(
     top_p: float,
     key: Array,
     *,
-    use_cache: bool = True,
+    cache: list[AttentionCache] | None = None,
     return_cache: bool = False,
 ) -> tuple[Array, Array] | tuple[Array, Array, list[AttentionCache]]:
-    """JIT-compilable sampling-based decoding.
-
-    Args:
-        model: The LLM model.
-        tokens_t: Initial token sequence, shape (seq_len,).
-        eos_id: End-of-sequence token ID (-1 to disable).
-        max_new_tokens: Maximum number of new tokens to generate.
-        temperature: Sampling temperature (>0).
-        top_p: Top-p (nucleus) sampling probability.
-        key: PRNG key for sampling.
-        use_cache: If True (default), use KV caching for O(n) generation.
-            If False, recompute full sequence each step (O(n²) but simpler).
-        return_cache: If True, return the KV cache along with tokens.
-            Only valid when use_cache=True.
-
-    Returns:
-        If return_cache=False: Tuple of (tokens, final_length)
-        If return_cache=True: Tuple of (tokens, final_length, caches)
-        - tokens: Generated token sequence including input tokens, shape (seq_len + max_new_tokens,).
-        - final_length: Number of valid tokens (excluding padding after EOS).
-        - caches: List of KV caches per layer (only if return_cache=True).
-    """
     initial_len = tokens_t.shape[0]
     max_len = initial_len + max_new_tokens
 
@@ -1046,8 +1029,10 @@ def llm_generate_jit(
     padded_tokens = jnp.zeros(max_len, dtype=jnp.int32)
     padded_tokens = padded_tokens.at[:initial_len].set(tokens_t)
 
-    if use_cache:
-        # Cached generation: O(n) complexity
+    if cache is None and return_cache:
+        cache = model.init_cache(max_len, dtype=model.embed.weight.dtype)
+
+    if cache is not None:
         return _llm_generate_jit_cached(
             model,
             padded_tokens,
@@ -1061,9 +1046,6 @@ def llm_generate_jit(
             return_cache,
         )
     else:
-        # Non-cached generation: O(n²) complexity, simpler implementation
-        if return_cache:
-            raise ValueError("return_cache=True requires use_cache=True")
         return _llm_generate_jit_no_cache(
             model,
             padded_tokens,
