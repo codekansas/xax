@@ -177,7 +177,7 @@ def can_use_cudnn_attention(
 class AttentionCache(TypedDict):
     k: Array
     v: Array
-    position: int  # Position counter for rotary embeddings
+    position: Array
 
 
 class Fp8ScalesCache(TypedDict):
@@ -767,23 +767,26 @@ class SelfAttentionBlock(eqx.Module):
         ctx_btd = ctx_bthd.reshape(bsz, tsz, self.num_heads * self.head_dim)
         return apply_linear(ctx_btd, self.output_proj)
 
-    def init_cache(self, dtype: jnp.dtype | None = None) -> AttentionCache:
+    def init_cache(self, max_len: int | None = None, dtype: jnp.dtype | None = None) -> AttentionCache:
         """Initialize cache for the input.
 
         Args:
             dtype: The dtype of the cache
+            max_len: The maximum length of the cache
 
         Returns:
             Cache with fixed-length k and v tensors
         """
-        if self.local_window_size is None:
-            raise ValueError("context_length must be set for caching")
+        if max_len is None:
+            max_len = self.local_window_size
+        if max_len is None:
+            raise ValueError("context_length or max_len must be set for caching")
 
         # Create fixed-length cache (uses num_kv_heads for GQA efficiency)
-        k_cache = jnp.zeros((self.local_window_size, self.num_kv_heads, self.head_dim), dtype=dtype)
-        v_cache = jnp.zeros((self.local_window_size, self.num_kv_heads, self.head_dim), dtype=dtype)
+        k_cache = jnp.zeros((max_len, self.num_kv_heads, self.head_dim), dtype=dtype)
+        v_cache = jnp.zeros((max_len, self.num_kv_heads, self.head_dim), dtype=dtype)
 
-        return {"k": k_cache, "v": v_cache, "position": 0}
+        return {"k": k_cache, "v": v_cache, "position": jnp.array(0, dtype=jnp.int32)}
 
     def init_mask(
         self,
@@ -872,13 +875,15 @@ class SelfAttentionBlock(eqx.Module):
         if cache is not None:
             k_cache = cache["k"]
             v_cache = cache["v"]
-            k = jnp.concatenate([k_cache, k], axis=0)
-            v = jnp.concatenate([v_cache, v], axis=0)
+            p = cache["position"]
 
-            new_position = cache["position"] + seq_len
+            k = jax.lax.dynamic_update_slice(k_cache, k, (p, 0, 0))
+            v = jax.lax.dynamic_update_slice(v_cache, v, (p, 0, 0))
+
+            new_position = p + seq_len
 
         else:
-            new_position = seq_len
+            new_position = jnp.asarray(seq_len)
 
         # Handle attention sinks via bias
         bias = None
@@ -895,13 +900,37 @@ class SelfAttentionBlock(eqx.Module):
         implementation = "cudnn" if use_cudnn else None
 
         if seq_len == 1:
-            attn_output = jax.nn.dot_product_attention(q, k, v, bias=bias, implementation=implementation)
+            # For single-token generation with cache, mask to only attend to valid positions
+            if cache is None:
+                attn_output = jax.nn.dot_product_attention(q, k, v, bias=bias, implementation=implementation)
+            else:
+                max_cache_len = k.shape[0]
+                # Mask: attend to positions 0 to new_position-1 (inclusive)
+                # new_position is p + 1 after adding the current token
+                valid_mask = jnp.arange(max_cache_len) < new_position
+                valid_mask = valid_mask[None, None, None, :]  # (1, 1, 1, max_cache_len)
+                attn_output = jax.nn.dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    mask=valid_mask,
+                    bias=bias,
+                    implementation=implementation,
+                )
 
         elif mask is not None:
             attn_output = jax.nn.dot_product_attention(q, k, v, mask=mask, bias=bias, implementation=implementation)
 
         elif cache is not None:
-            raise NotImplementedError("For training with a cache, provide a mask instead.")
+            attn_output = jax.nn.dot_product_attention(
+                q,
+                k,
+                v,
+                bias=bias,
+                is_causal=self.causal,
+                local_window_size=(self.local_window_size, 0) if self.local_window_size is not None else None,
+                implementation=implementation,
+            )
 
         else:
             attn_output = jax.nn.dot_product_attention(
@@ -1049,7 +1078,7 @@ class CrossAttentionBlock(eqx.Module):
                 new_fp8["v_proj"] = new_v_scales
             updated_fp8_scales = new_fp8
 
-        return {"k": k, "v": v, "position": 0}, updated_fp8_scales
+        return {"k": k, "v": v, "position": jnp.asarray(0)}, updated_fp8_scales
 
     def forward(
         self,
@@ -1098,7 +1127,7 @@ class CrossAttentionBlock(eqx.Module):
             v, new_v_scales = _apply_linear_batched(self.v_proj, kv_sn, v_scales)
             k = self._reshape_for_multihead(k)
             v = self._reshape_for_multihead(v)
-            q_position = 0
+            q_position = jnp.asarray(0)
         else:
             raise ValueError("Either `cache` or `kv_sn` must be provided.")
 
@@ -1322,6 +1351,7 @@ class TransformerBlock(eqx.Module):
 
     def init_cache(
         self,
+        max_len: int | None = None,
         dtype: jnp.dtype | None = None,
         context_sn: Array | None = None,
         fp8_history_length: int | None = None,
@@ -1329,6 +1359,7 @@ class TransformerBlock(eqx.Module):
         """Initialize cache for the input.
 
         Args:
+            max_len: The maximum length of the cache
             dtype: Data type for cache tensors
             context_sn: Context sequence for cross-attention
             fp8_history_length: If provided, also initialize FP8 scales for delayed scaling
@@ -1338,7 +1369,8 @@ class TransformerBlock(eqx.Module):
         """
         if dtype is None and context_sn is not None:
             dtype = context_sn.dtype
-        cache: TransformerBlockCache = {"self_attn": self.self_attn.init_cache(dtype=dtype)}
+        self_attn_cache = self.self_attn.init_cache(max_len=max_len, dtype=dtype)
+        cache: TransformerBlockCache = {"self_attn": self_attn_cache}
         if self.cross_attn is not None:
             if context_sn is None:
                 raise ValueError("context_sn must be provided if cross_attn is not None")
@@ -1368,40 +1400,15 @@ class TransformerBlock(eqx.Module):
 
     def __call__(
         self,
-        x_btd: Array,
-        positions_bt: Array | None = None,
+        x_tn: Array,
         *,
-        key: jax.Array | None = None,
-        inference: bool = True,
-    ) -> Array:
-        """Apply transformer block with batched input (for LLM training/inference).
+        context_sn: Array | None = None,
+        mask: Array | None = None,
+        cache: TransformerBlockCache | None = None,
+    ) -> tuple[Array, TransformerBlockCache]:
+        return self.forward(x_tn, context_sn=context_sn, mask=mask, cache=cache)
 
-        This is a simplified interface for the common case of batched input
-        without FP8 or caching. For caching/FP8, use the `forward` method.
-
-        Args:
-            x_btd: Input tensor of shape (batch, seq_len, embed_dim)
-            positions_bt: Position indices for RoPE, shape (batch, seq_len).
-                If None, uses sequential positions starting from 0.
-            key: PRNG key for dropout (if applicable)
-            inference: Whether in inference mode
-
-        Returns:
-            Output tensor of shape (batch, seq_len, embed_dim)
-        """
-        attn_key = None
-        if key is not None:
-            attn_key, _ = jax.random.split(key, 2)
-
-        # Self-attention with pre-norm
-        normed = self.attn_norm(x_btd)
-        y_btd = x_btd + self.self_attn(normed, positions_bt, key=attn_key, inference=inference)
-
-        # Feed-forward with pre-norm
-        y_btd = y_btd + self.feed_forward(self.mlp_norm(y_btd))
-
-        return y_btd
-
+    @eqx.filter_checkpoint
     def forward(
         self,
         x_tn: Array,
@@ -1461,9 +1468,9 @@ class TransformerBlock(eqx.Module):
             x_tn = x_tn + cross_attn_output
 
         # Feed-forward block with pre-norm
-        norm_x = jax.vmap(self.mlp_norm)(x_tn)
-        ff_output = jax.vmap(self.feed_forward)(norm_x)
-        x_tn = x_tn + ff_output
+        norm_x_tn = self.mlp_norm(x_tn)
+        ff_output_tn = self.feed_forward(norm_x_tn)
+        x_tn = x_tn + ff_output_tn
 
         return x_tn, updated_cache
 

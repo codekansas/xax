@@ -6,7 +6,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jrandom
-from jaxtyping import Array, PRNGKeyArray
+from jaxtyping import Array, PRNGKeyArray, PyTree
 
 Tmodule = TypeVar("Tmodule", bound=eqx.Module)
 
@@ -275,3 +275,133 @@ def merge_lora(module: Tmodule) -> Tmodule:
         return node
 
     return jax.tree_util.tree_map(convert, module, is_leaf=lambda node: isinstance(node, LoRALinear))
+
+
+def extract_lora_weights(module: Tmodule) -> PyTree:
+    """Extract LoRA weights (lora_a, lora_b, rank, alpha) from a module.
+
+    Returns a pytree with the same structure as the module, but containing only
+    LoRA parameters. Non-LoRA leaves are replaced with None.
+
+    This can be used to save LoRA weights separately from the base model:
+
+        lora_weights = extract_lora_weights(model)
+        # Save lora_weights with your preferred serialization
+
+    Args:
+        module: Module containing LoRALinear layers.
+
+    Returns:
+        PyTree with LoRA parameters extracted, None for non-LoRA leaves.
+    """
+
+    def extract(node: Any) -> Any:  # noqa: ANN401
+        if isinstance(node, LoRALinear):
+            return {
+                "lora_a_ir": node.lora_a_ir,
+                "lora_b_ro": node.lora_b_ro,
+                "rank": node.rank,
+                "alpha": node.alpha,
+            }
+        return None
+
+    return jax.tree_util.tree_map(extract, module, is_leaf=lambda node: isinstance(node, LoRALinear))
+
+
+def load_lora_weights(module: Tmodule, lora_weights: PyTree) -> Tmodule:
+    """Load LoRA weights into a LoRA-ized module.
+
+    The module must already have LoRALinear layers in the same positions as
+    the lora_weights pytree. This function replaces the LoRA parameters
+    (lora_a_ir, lora_b_ro) with the loaded values.
+
+    Args:
+        module: Module with LoRALinear layers to update.
+        lora_weights: PyTree from extract_lora_weights with LoRA parameters.
+
+    Returns:
+        Module with LoRA weights loaded.
+
+    Raises:
+        ValueError: If the module structure doesn't match the lora_weights.
+    """
+
+    def load(node: Any, weights: Any) -> Any:  # noqa: ANN401
+        if isinstance(node, LoRALinear) and weights is not None:
+            if not isinstance(weights, dict):
+                raise ValueError(f"Expected dict for LoRA weights, got {type(weights)}")
+            # Create new LoRALinear with loaded weights
+            return LoRALinear(
+                weight_oi=node.weight_oi,
+                bias_o=node.bias_o,
+                lora_a_ir=weights["lora_a_ir"],
+                lora_b_ro=weights["lora_b_ro"],
+                rank=weights["rank"],
+                alpha=weights["alpha"],
+                dropout_rate=node.dropout_rate,
+            )
+        return node
+
+    return jax.tree_util.tree_map(
+        load,
+        module,
+        lora_weights,
+        is_leaf=lambda node: isinstance(node, LoRALinear),
+    )
+
+
+def apply_lora_and_merge(base_module: Tmodule, lora_weights: PyTree) -> Tmodule:
+    """Apply LoRA weights to a base module and merge them into the base weights.
+
+    This function takes a module with standard eqx.nn.Linear layers and applies
+    LoRA weights directly, merging them into the base weights. The result is a
+    module with modified Linear layers (no LoRALinear).
+
+    This is useful for stacked LoRA fine-tuning:
+    1. Load base model
+    2. Apply and merge first LoRA fine-tune
+    3. Apply new LoRA layers for second fine-tune
+    4. Train the new LoRA layers
+
+    Args:
+        base_module: Module with eqx.nn.Linear layers.
+        lora_weights: PyTree from extract_lora_weights with LoRA parameters.
+
+    Returns:
+        Module with LoRA deltas merged into base weights.
+    """
+
+    def apply_and_merge(node: Any, weights: Any) -> Any:  # noqa: ANN401
+        if isinstance(node, eqx.nn.Linear) and weights is not None:
+            if not isinstance(weights, dict):
+                raise ValueError(f"Expected dict for LoRA weights, got {type(weights)}")
+
+            lora_a_ir = weights["lora_a_ir"]
+            lora_b_ro = weights["lora_b_ro"]
+            rank = weights["rank"]
+            alpha = weights["alpha"]
+            scaling = alpha / rank
+
+            # Compute delta and merge
+            delta_oi = (lora_a_ir @ lora_b_ro).T * scaling
+            merged_weight_oi = node.weight + delta_oi
+
+            # Create new Linear with merged weights
+            merged = eqx.nn.Linear(
+                in_features=node.in_features,
+                out_features=node.out_features,
+                use_bias=node.bias is not None,
+                key=jrandom.key(0),
+            )
+            merged = eqx.tree_at(lambda x: x.weight, merged, merged_weight_oi)
+            if node.bias is not None:
+                merged = eqx.tree_at(lambda x: x.bias, merged, node.bias)
+            return merged
+        return node
+
+    return jax.tree_util.tree_map(
+        apply_and_merge,
+        base_module,
+        lora_weights,
+        is_leaf=lambda node: isinstance(node, eqx.nn.Linear),
+    )

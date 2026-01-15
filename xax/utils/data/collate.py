@@ -178,7 +178,7 @@ def collate(
         for j in range(len(item)):
             output_list.append(collate([i[j] for i in items], mode=mode, pad=pad))
         if is_named_tuple(item):
-            return type(item)(*output_list)  # type: ignore[arg-type]
+            return type(item)(*output_list)
         if isinstance(item, tuple):
             return tuple(output_list)
         return output_list

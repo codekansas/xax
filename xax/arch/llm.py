@@ -3,8 +3,11 @@
 import functools
 import json
 import logging
+import sys
 from dataclasses import dataclass, replace
+from enum import Enum
 from pathlib import Path
+from typing import Iterator, overload
 
 import chex
 import equinox as eqx
@@ -12,7 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
-from jaxtyping import Array
+from jaxtyping import Array, PRNGKeyArray
 from omegaconf import MISSING
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field as PydanticField
 
@@ -21,9 +24,11 @@ from xax.arch.attention import (
     SelfAttentionBlock,
     SwiGLU,
     TransformerBlock,
+    TransformerBlockCache,
     apply_linear,
 )
 from xax.core.conf import field
+from xax.utils.jax import filter_jit as xax_filter_jit, jit as xax_jit
 
 try:
     from huggingface_hub import snapshot_download
@@ -52,7 +57,7 @@ class LLMConfig:
     kv_heads: int = field(MISSING, help="Number of key/value attention heads (for GQA)")
     head_dim: int = field(MISSING, help="Dimension per attention head")
     num_layers: int = field(MISSING, help="Number of transformer layers")
-    max_tsz: int = field(MISSING, help="Maximum sequence length")
+    max_tsz: int = field(32768, help="Maximum sequence length")
     rope_theta: float = field(10_000.0, help="RoPE theta base frequency")
     dropout_rate: float = field(0.0, help="Dropout rate")
     mlp_mult: int = field(4, help="MLP hidden dimension multiplier")
@@ -67,7 +72,7 @@ class LLMConfig:
     sliding_window_size: int | None = field(None, help="Sliding window size (None = full attention)")
     layer_attention_types: tuple[str, ...] | None = field(None, help="Per-layer attention type ('sliding' or 'full')")
     use_attention_sinks: bool = field(False, help="Use learnable attention sinks for stability")
-    use_remat: bool = field(False, help="Recompute activations during backward to save memory")
+    use_qk_norm: bool = field(False, help="Apply QK normalization in attention (Qwen3 style)")
 
     def with_vocab(self, vocab_size: int) -> "LLMConfig":
         return replace(self, vocab_size=vocab_size)
@@ -87,7 +92,7 @@ class LLM(eqx.Module):
     config: LLMConfig
 
     @classmethod
-    def init(cls, config: LLMConfig, *, key: jax.Array) -> "LLM":
+    def build(cls, config: LLMConfig, *, key: jax.Array) -> "LLM":
         """Initialize LLM with random weights."""
         k_emb, *block_keys, k_head = jax.random.split(key, config.num_layers + 2)
         embed = eqx.nn.Embedding(config.vocab_size, config.embed_dim, key=k_emb)
@@ -122,7 +127,7 @@ class LLM(eqx.Module):
                 rotary_original_max_position_embeddings=config.rope_original_max_position_embeddings,
                 rotary_beta_slow=config.rope_beta_slow,
                 rotary_beta_fast=config.rope_beta_fast,
-                use_qk_norm=False,  # Will be set via weight loading if present
+                use_qk_norm=config.use_qk_norm,
                 use_attention_sinks=config.use_attention_sinks,
             )
 
@@ -149,75 +154,108 @@ class LLM(eqx.Module):
         lm_head = eqx.nn.Linear(config.embed_dim, config.vocab_size, use_bias=False, key=k_head)
         return cls(embed=embed, blocks=tuple(blocks), norm=norm, lm_head=lm_head, config=config)
 
+    def init_cache(self, max_len: int | None = None, dtype: jnp.dtype = jnp.bfloat16) -> list[TransformerBlockCache]:
+        """Initialize KV cache for autoregressive generation.
+
+        Args:
+            max_len: Maximum sequence length to cache.
+            dtype: Data type for cache arrays.
+
+        Returns:
+            List of TransformerBlockCache dictionaries, one per layer.
+        """
+        caches = []
+        for block in self.blocks:
+            caches.append(block.init_cache(max_len=max_len, dtype=dtype))
+        return caches
+
+    @overload
+    def forward_hidden(self, tokens_t: Array) -> Array: ...
+
+    @overload
     def forward_hidden(
         self,
-        tokens_bt: Array,
+        tokens_t: Array,
         *,
-        key: jax.Array | None = None,
-        inference: bool = True,
-    ) -> Array:
+        caches: list[TransformerBlockCache],
+    ) -> tuple[Array, list[TransformerBlockCache]]: ...
+
+    def forward_hidden(
+        self,
+        tokens_t: Array,
+        *,
+        caches: list[TransformerBlockCache] | None = None,
+    ) -> tuple[Array, list[TransformerBlockCache]] | Array:
         """Forward pass returning hidden states shaped (bsz, tsz, embed_dim).
 
         This is useful for memory-efficient loss computation where you want to
         avoid materializing the full (bsz, tsz, vocab_size) logits tensor.
+
+        Args:
+            tokens_t: Tokens, shape (seq_len,).
+            caches: List of KV caches, one per layer.
+
+        Returns:
+            Tuple of (hidden states, updated caches).
         """
-        chex.assert_rank(tokens_bt, 2)
-        bsz, tsz = tokens_bt.shape
-        positions_bt = jnp.broadcast_to(jnp.arange(tsz)[None, :], (bsz, tsz))
+        chex.assert_rank(tokens_t, 1)
+        x_tn = jax.vmap(self.embed)(tokens_t)
+        if caches is None:
+            for block in self.blocks:
+                x_tn, cache = block.forward(x_tn, cache=None)
+            return self.norm(x_tn)
+        else:
+            caches_out: list[TransformerBlockCache] = []
+            for block, cache in zip(self.blocks, caches, strict=True):
+                x_tn, cache = block.forward(x_tn, cache=cache)
+                caches_out.append(cache)
+            return self.norm(x_tn), caches_out
 
-        key_seq = None
-        if key is not None:
-            key_seq = jax.random.split(key, len(self.blocks))
+    @overload
+    def forward(self, tokens_t: Array) -> Array: ...
 
-        x_btd = jnp.take(self.embed.weight, tokens_bt, axis=0)
-        for i, block in enumerate(self.blocks):
-            block_key = None if key_seq is None else key_seq[i]
-            if self.config.use_remat:
-                block_arrays, block_static = eqx.partition(block, eqx.is_array)
-
-                @jax.checkpoint
-                def remat_block(
-                    arrays: TransformerBlock,
-                    x: Array,
-                    pos: Array,
-                    k: jax.Array | None,
-                    inf: bool,
-                    *,
-                    static: TransformerBlock = block_static,
-                ) -> Array:
-                    b: TransformerBlock = eqx.combine(arrays, static)
-                    return b(x, pos, key=k, inference=inf)
-
-                x_btd = remat_block(block_arrays, x_btd, positions_bt, block_key, inference)
-            else:
-                x_btd = block(x_btd, positions_bt, key=block_key, inference=inference)
-        return self.norm(x_btd)
-
-    def __call__(
+    @overload
+    def forward(
         self,
-        tokens_bt: Array,
+        tokens_t: Array,
         *,
-        key: jax.Array | None = None,
-        inference: bool = True,
-    ) -> Array:
-        """Forward pass returning logits shaped (bsz, tsz, vocab_size)."""
-        x_btd = self.forward_hidden(tokens_bt, key=key, inference=inference)
-        logits_btv = apply_linear(x_btd, self.lm_head)
-        return logits_btv
+        caches: list[TransformerBlockCache],
+    ) -> tuple[Array, list[TransformerBlockCache]]: ...
+
+    def forward(
+        self,
+        tokens_t: Array,
+        *,
+        caches: list[TransformerBlockCache] | None = None,
+    ) -> tuple[Array, list[TransformerBlockCache]] | Array:
+        if caches is None:
+            x_td = self.forward_hidden(tokens_t)
+            return apply_linear(x_td, self.lm_head)
+        else:
+            x_td, cache = self.forward_hidden(tokens_t, caches=caches)
+            logits_tv = apply_linear(x_td, self.lm_head)
+            return logits_tv, cache
 
 
-def build_qwen3_model(config: LLMConfig, *, key: jax.Array | None = None) -> LLM:
-    """Creates a Qwen3-style model.
+class LLMRepo(Enum):
+    QWEN3_600M = "Qwen/Qwen3-0.6B"
+    QWEN3_1_5B = "Qwen/Qwen3-1.5B"
+    QWEN3_3B = "Qwen/Qwen3-3B"
+    QWEN3_7B = "Qwen/Qwen3-7B"
+    QWEN3_14B = "Qwen/Qwen3-14B"
+    QWEN3_32B = "Qwen/Qwen3-32B"
+
+
+def build_pretrained_model(repo: LLMRepo, dtype: jnp.dtype | None = None) -> LLM:
+    """Loads a pretrained model.
 
     Args:
-        config: LLMConfig specifying model architecture.
-        key: Optional PRNG key for initialization.
-
-    Returns:
-        Initialized LLM model.
+        repo: Pretrained model repository.
+        dtype: Optional dtype for the model.
     """
-    key = jax.random.key(0) if key is None else key
-    return LLM.init(config, key=key)
+    config = hf_config_to_llm_config(cfg=load_hf_config(repo.value))
+    model = LLM.build(config, key=jax.random.key(0))
+    return load_hf_weights_into_llm(model, repo.value, dtype=dtype)
 
 
 def tie_embedding_and_head(model: LLM) -> LLM:
@@ -226,10 +264,10 @@ def tie_embedding_and_head(model: LLM) -> LLM:
 
 
 def chunked_cross_entropy_loss(
-    hidden_btd: Array,
-    targets_bt: Array,
+    hidden_td: Array,
+    targets_t: Array,
     lm_head_weight: Array,
-    mask_bt: Array | None = None,
+    mask_t: Array | None = None,
     chunk_size: int = 1,
 ) -> Array:
     """Compute cross-entropy loss in chunks to save memory.
@@ -248,34 +286,34 @@ def chunked_cross_entropy_loss(
     - Accumulates loss and count in float32 to avoid precision loss
 
     Args:
-        hidden_btd: Hidden states from model.forward_hidden(), shape (batch, seq, hidden_dim)
-        targets_bt: Target token indices, shape (batch, seq)
+        hidden_td: Hidden states from model.forward_hidden(), shape (seq, hidden_dim)
+        targets_t: Target token indices, shape (seq,)
         lm_head_weight: The lm_head weight matrix, shape (vocab_size, hidden_dim)
-        mask_bt: Optional mask for valid positions, shape (batch, seq). If None, all positions are valid.
+        mask_t: Optional mask for valid positions, shape (seq,). If None, all positions are valid.
         chunk_size: Number of sequence positions to process at once.
 
     Returns:
         Scalar loss value (mean cross-entropy over valid positions) in float32.
     """
-    bsz, tsz, hidden_dim = hidden_btd.shape
+    tsz, hidden_dim = hidden_td.shape
 
-    if mask_bt is None:
-        mask_bt = jnp.ones((bsz, tsz), dtype=jnp.bool_)
+    if mask_t is None:
+        mask_t = jnp.ones((tsz), dtype=jnp.bool_)
 
     # Pad sequence to be divisible by chunk_size for static shapes
     pad_size = (chunk_size - tsz % chunk_size) % chunk_size
     if pad_size > 0:
-        hidden_btd = jnp.pad(hidden_btd, ((0, 0), (0, pad_size), (0, 0)))
-        targets_bt = jnp.pad(targets_bt, ((0, 0), (0, pad_size)))
-        mask_bt = jnp.pad(mask_bt, ((0, 0), (0, pad_size)), constant_values=False)
+        hidden_td = jnp.pad(hidden_td, ((0, pad_size), (0, 0)))
+        targets_t = jnp.pad(targets_t, ((0, pad_size)))
+        mask_t = jnp.pad(mask_t, ((0, pad_size)), constant_values=False)
 
     padded_tsz = tsz + pad_size
     num_chunks = padded_tsz // chunk_size
 
-    # Reshape to (batch, num_chunks, chunk_size, ...)
-    hidden_bccd = hidden_btd.reshape(bsz, num_chunks, chunk_size, hidden_dim)
-    targets_bcc = targets_bt.reshape(bsz, num_chunks, chunk_size)
-    mask_bcc = mask_bt.reshape(bsz, num_chunks, chunk_size)
+    # Reshape to (num_chunks, chunk_size, ...)
+    hidden_ccd = hidden_td.reshape(num_chunks, chunk_size, hidden_dim)
+    targets_cc = targets_t.reshape(num_chunks, chunk_size)
+    mask_cc = mask_t.reshape(num_chunks, chunk_size)
 
     def process_chunk(
         carry: tuple[Array, Array],
@@ -305,19 +343,11 @@ def chunked_cross_entropy_loss(
 
         return (total_loss, total_count), None
 
-    # Transpose to (num_chunks, batch, chunk_size, ...) for scan
-    hidden_cbcd = jnp.transpose(hidden_bccd, (1, 0, 2, 3))
-    targets_cbc = jnp.transpose(targets_bcc, (1, 0, 2))
-    mask_cbc = jnp.transpose(mask_bcc, (1, 0, 2))
-
-    init_carry = (
-        jnp.array(0.0, dtype=jnp.float32),
-        jnp.array(0.0, dtype=jnp.float32),
-    )
+    init_carry = (jnp.array(0.0, dtype=jnp.float32), jnp.array(0.0, dtype=jnp.float32))
     (total_loss, total_count), _ = jax.lax.scan(
         process_chunk,
         init_carry,
-        (hidden_cbcd, targets_cbc, mask_cbc),
+        (hidden_ccd, targets_cc, mask_cc),
     )
 
     # Safe division - if no valid tokens, return 0
@@ -325,10 +355,10 @@ def chunked_cross_entropy_loss(
 
 
 def chunked_cross_entropy_acc(
-    hidden_btd: Array,
-    targets_bt: Array,
+    hidden_td: Array,
+    targets_t: Array,
     lm_head_weight: Array,
-    mask_bt: Array | None = None,
+    mask_t: Array | None = None,
     chunk_size: int = 1,
 ) -> Array:
     """Compute accuracy in chunks to save memory.
@@ -337,34 +367,34 @@ def chunked_cross_entropy_acc(
     the fraction of correctly predicted tokens without materializing full logits.
 
     Args:
-        hidden_btd: Hidden states from model.forward_hidden(), shape (batch, seq, hidden_dim)
-        targets_bt: Target token indices, shape (batch, seq)
+        hidden_td: Hidden states from model.forward_hidden(), shape (seq, hidden_dim)
+        targets_t: Target token indices, shape (seq,)
         lm_head_weight: The lm_head weight matrix, shape (vocab_size, hidden_dim)
-        mask_bt: Optional mask for valid positions, shape (batch, seq). If None, all positions are valid.
+        mask_t: Optional mask for valid positions, shape (seq,). If None, all positions are valid.
         chunk_size: Number of sequence positions to process at once.
 
     Returns:
         Scalar accuracy value (fraction of correct predictions) in float32.
     """
-    bsz, tsz, hidden_dim = hidden_btd.shape
+    tsz, hidden_dim = hidden_td.shape
 
-    if mask_bt is None:
-        mask_bt = jnp.ones((bsz, tsz), dtype=jnp.bool_)
+    if mask_t is None:
+        mask_t = jnp.ones((tsz), dtype=jnp.bool_)
 
     # Pad sequence to be divisible by chunk_size for static shapes
     pad_size = (chunk_size - tsz % chunk_size) % chunk_size
     if pad_size > 0:
-        hidden_btd = jnp.pad(hidden_btd, ((0, 0), (0, pad_size), (0, 0)))
-        targets_bt = jnp.pad(targets_bt, ((0, 0), (0, pad_size)))
-        mask_bt = jnp.pad(mask_bt, ((0, 0), (0, pad_size)), constant_values=False)
+        hidden_td = jnp.pad(hidden_td, ((0, pad_size), (0, 0)))
+        targets_t = jnp.pad(targets_t, ((0, pad_size)))
+        mask_t = jnp.pad(mask_t, ((0, pad_size)), constant_values=False)
 
     padded_tsz = tsz + pad_size
     num_chunks = padded_tsz // chunk_size
 
-    # Reshape to (batch, num_chunks, chunk_size, ...)
-    hidden_bccd = hidden_btd.reshape(bsz, num_chunks, chunk_size, hidden_dim)
-    targets_bcc = targets_bt.reshape(bsz, num_chunks, chunk_size)
-    mask_bcc = mask_bt.reshape(bsz, num_chunks, chunk_size)
+    # Reshape to (num_chunks, chunk_size, ...)
+    hidden_ccd = hidden_td.reshape(num_chunks, chunk_size, hidden_dim)
+    targets_cc = targets_t.reshape(num_chunks, chunk_size)
+    mask_cc = mask_t.reshape(num_chunks, chunk_size)
 
     def process_chunk(
         carry: tuple[Array, Array],
@@ -377,7 +407,7 @@ def chunked_cross_entropy_acc(
         chunk_hidden_f32 = chunk_hidden.astype(jnp.float32)
         lm_head_f32 = lm_head_weight.astype(jnp.float32)
 
-        # Compute logits: (batch, chunk, hidden) @ (hidden, vocab) -> (batch, chunk, vocab)
+        # Compute logits: (chunk, hidden) @ (hidden, vocab) -> (chunk, vocab)
         chunk_logits = chunk_hidden_f32 @ lm_head_f32.T
 
         # Compute accuracy: check if argmax matches target
@@ -391,11 +421,6 @@ def chunked_cross_entropy_acc(
 
         return (total_correct, total_count), None
 
-    # Transpose to (num_chunks, batch, chunk_size, ...) for scan
-    hidden_cbcd = jnp.transpose(hidden_bccd, (1, 0, 2, 3))
-    targets_cbc = jnp.transpose(targets_bcc, (1, 0, 2))
-    mask_cbc = jnp.transpose(mask_bcc, (1, 0, 2))
-
     init_carry = (
         jnp.array(0.0, dtype=jnp.float32),
         jnp.array(0.0, dtype=jnp.float32),
@@ -403,7 +428,7 @@ def chunked_cross_entropy_acc(
     (total_correct, total_count), _ = jax.lax.scan(
         process_chunk,
         init_carry,
-        (hidden_cbcd, targets_cbc, mask_cbc),
+        (hidden_ccd, targets_cc, mask_cc),
     )
 
     # Safe division - if no valid tokens, return 0
@@ -533,6 +558,10 @@ class HFConfig(BaseModel):
         default=None,
         validation_alias=AliasChoices("layer_types", "sliding_attention_map"),
     )
+    model_type: str | None = PydanticField(
+        default=None,
+        validation_alias=AliasChoices("model_type"),
+    )
 
 
 def _parse_rope_scaling(cfg: dict[str, object]) -> tuple[float, int | None, float, float]:
@@ -563,18 +592,11 @@ def _parse_rope_scaling(cfg: dict[str, object]) -> tuple[float, int | None, floa
     return factor, original_max_pos, beta_slow, beta_fast
 
 
-def hf_config_to_llm_config(
-    cfg: dict[str, object],
-    *,
-    use_remat: bool = False,
-    max_tsz: int = 32768,
-) -> LLMConfig:
+def hf_config_to_llm_config(cfg: dict[str, object]) -> LLMConfig:
     """Derive an LLMConfig from a HuggingFace config dict.
 
     Args:
         cfg: HuggingFace config dictionary (from load_hf_config).
-        use_remat: Whether to use gradient checkpointing (remat).
-        max_tsz: Maximum sequence length (not always in HF config).
 
     Returns:
         LLMConfig derived from the HuggingFace config.
@@ -615,6 +637,9 @@ def hf_config_to_llm_config(
     layer_attention_types = tuple(parsed.layer_types) if parsed.layer_types else None
     use_attention_sinks = layer_attention_types is not None
 
+    # Qwen3 models use QK normalization
+    use_qk_norm = parsed.model_type in ("qwen3", "qwen3_moe")
+
     return LLMConfig(
         vocab_size=vocab_size,
         embed_dim=embed_dim,
@@ -622,7 +647,6 @@ def hf_config_to_llm_config(
         kv_heads=kv_heads,
         head_dim=head_dim,
         num_layers=num_layers,
-        max_tsz=max_tsz,
         rope_theta=rope_theta,
         dropout_rate=0.0,
         mlp_mult=mlp_mult,
@@ -637,7 +661,7 @@ def hf_config_to_llm_config(
         sliding_window_size=sliding_window_size,
         layer_attention_types=layer_attention_types,
         use_attention_sinks=use_attention_sinks,
-        use_remat=use_remat,
+        use_qk_norm=use_qk_norm,
     )
 
 
@@ -673,16 +697,16 @@ def load_hf_weights_into_llm(
     if dtype is None:
         dtype = jnp.bfloat16
 
+    mesh = jax.sharding.get_mesh()
+    if mesh is None:
+        raise ValueError("Mesh is not set. Please set the mesh via jax.set_mesh() before loading weights.")
+
     config_dict, state = _fetch_state_dict(repo_id, revision)
 
     # Validate that model config matches the HF config
     hf_parsed = HFConfig.model_validate(config_dict)
     if hf_parsed.hidden_size is not None and hf_parsed.hidden_size != model.config.embed_dim:
         raise ValueError(f"HF hidden_size {hf_parsed.hidden_size} != model.embed_dim {model.config.embed_dim}")
-
-    mesh = jax.sharding.get_mesh()
-    if mesh is None:
-        raise ValueError("Mesh is not set. Please set the mesh via jax.set_mesh() before loading weights.")
 
     if mesh.devices.size > 1:
         # Replicate weights across all devices (no partitioning)
@@ -758,15 +782,19 @@ def load_hf_weights_into_llm(
         block = eqx.tree_at(lambda b: b.self_attn.v_proj, block, map_linear(block.self_attn.v_proj, v_w, v_b))
         block = eqx.tree_at(lambda b: b.self_attn.output_proj, block, map_linear(block.self_attn.output_proj, o_w, o_b))
 
-        # QK-Norm (Qwen3 style) - only create if weights are present
+        # QK-Norm (Qwen3 style) - only update if weights are present
         q_norm_w = state.get(f"{pfx_alt}.q_norm.weight")
         k_norm_w = state.get(f"{pfx_alt}.k_norm.weight")
+
+        def is_qk_norm_leaf(x: object) -> bool:
+            return isinstance(x, RMSNorm) or x is None
+
         if q_norm_w is not None:
             q_norm = RMSNorm(weight=to_dtype(q_norm_w), eps=model.config.rms_eps)
-            block = eqx.tree_at(lambda b: b.self_attn.q_norm, block, q_norm, is_leaf=lambda x: x is None)
+            block = eqx.tree_at(lambda b: b.self_attn.q_norm, block, q_norm, is_leaf=is_qk_norm_leaf)
         if k_norm_w is not None:
             k_norm = RMSNorm(weight=to_dtype(k_norm_w), eps=model.config.rms_eps)
-            block = eqx.tree_at(lambda b: b.self_attn.k_norm, block, k_norm, is_leaf=lambda x: x is None)
+            block = eqx.tree_at(lambda b: b.self_attn.k_norm, block, k_norm, is_leaf=is_qk_norm_leaf)
 
         # Layer norms
         pre_gamma = _get_weight(state, f"{blk_pfx}.input_layernorm.weight", f"{blk_pfx_alt}.input_layernorm.weight")
@@ -817,10 +845,51 @@ def llm_generate(
         top_p,
         jax.random.key(0),
     )
-    # Trim to actual generated length (excluding padding after EOS)
     return tokens_arr[: int(final_len)].tolist()
 
 
+@xax_filter_jit(donate="all")
+def _sample_next_token(
+    logits_tv: Array,
+    temperature: float,
+    top_p: float,
+    key: PRNGKeyArray,
+    num_samples: int = 1,
+) -> Array:
+    """Sample next token from logits using temperature and top-p sampling.
+
+    Args:
+        logits_tv: Logits for vocabulary, shape (tsz, vocab_size).
+        temperature: Sampling temperature (>0).
+        top_p: Top-p (nucleus) sampling probability.
+        key: PRNG key for sampling.
+        num_samples: The number of samples to draw from the logits.
+
+    Returns:
+        Next token, shape (tsz, num_samples).
+    """
+    logits_tv = logits_tv.astype(jnp.float32)
+
+    # Temperature scaling
+    logits_tv = jnp.where(temperature > 0, logits_tv / temperature, logits_tv)
+
+    # Top-p nucleus sampling
+    sort_idx_tv = jnp.argsort(logits_tv, axis=-1, descending=True)
+    sort_logits_tv = jnp.take_along_axis(logits_tv, sort_idx_tv, axis=-1)
+    sort_probs_tv = jax.nn.softmax(sort_logits_tv, axis=-1)
+    cum_probs_tv = jnp.cumsum(sort_probs_tv, axis=-1)
+    mask_tv = cum_probs_tv > top_p
+    mask_tv = mask_tv.at[..., 0].set(False)
+    masked_logits_tv = jnp.where(mask_tv, -jnp.inf, sort_logits_tv)
+
+    shape = masked_logits_tv.shape[:-1] + (num_samples,)
+    sampled_idx_tn = jax.random.categorical(key, masked_logits_tv, axis=-1, shape=shape)
+    next_token_tn = jnp.take_along_axis(sort_idx_tv, sampled_idx_tn, axis=-1)
+
+    return next_token_tn
+
+
+@xax_filter_jit()
 def llm_generate_jit(
     model: LLM,
     tokens_t: Array,
@@ -828,78 +897,114 @@ def llm_generate_jit(
     max_new_tokens: int,
     temperature: float,
     top_p: float,
-    key: Array,
+    key: PRNGKeyArray,
 ) -> tuple[Array, Array]:
-    """JIT-compilable sampling-based decoding.
-
-    Args:
-        model: The LLM model.
-        tokens_t: Initial token sequence, shape (seq_len,).
-        eos_id: End-of-sequence token ID (-1 to disable).
-        max_new_tokens: Maximum number of new tokens to generate.
-        temperature: Sampling temperature (>0).
-        top_p: Top-p (nucleus) sampling probability.
-        key: PRNG key for sampling.
-
-    Returns:
-        Tuple of (tokens, final_length):
-        - tokens: Generated token sequence including input tokens, shape (seq_len + max_new_tokens,).
-        - final_length: Number of valid tokens (excluding padding after EOS).
-    """
-    # Pad tokens to max possible length
-    initial_len = tokens_t.shape[0]
+    initial_len = tokens_t.shape[-1]
     max_len = initial_len + max_new_tokens
+
+    # Initialize output token buffer
     padded_tokens = jnp.zeros(max_len, dtype=jnp.int32)
     padded_tokens = padded_tokens.at[:initial_len].set(tokens_t)
 
-    # State: (tokens, current_position, key, done)
-    # current_position is where we're generating the next token
-    init_state = (padded_tokens, jnp.int32(initial_len), key, jnp.bool_(False))
+    dtype = model.embed.weight.dtype
+    init_caches = model.init_cache(max_len, dtype)
+    init_state = (padded_tokens, jnp.int32(initial_len), key, jnp.bool_(False), init_caches)
 
-    def cond_fn(state: tuple[Array, Array, Array, Array]) -> Array:
-        _, cur_pos, _, done = state
+    def cond_fn(state: tuple[Array, Array, Array, Array, list[TransformerBlockCache]]) -> Array:
+        _, cur_pos, _, done, _ = state
         return (cur_pos < max_len) & ~done
 
-    def body_fn(state: tuple[Array, Array, Array, Array]) -> tuple[Array, Array, Array, Array]:
-        tokens, cur_pos, key, _ = state
+    def body_fn(
+        state: tuple[Array, Array, Array, Array, list[TransformerBlockCache]],
+    ) -> tuple[Array, Array, Array, Array, list[TransformerBlockCache]]:
+        tokens_t, cur_pos, key, _, caches = state
 
-        # Forward pass on full buffer - model handles padding implicitly
-        # We pass all tokens and read logits at position (cur_pos - 1)
-        tokens_bt = tokens[None, :]  # Shape: (1, max_len)
-        logits_btv = model(tokens_bt, key=key, inference=True)
-
-        # Get logits at the last valid position (cur_pos - 1)
-        # Use dynamic indexing which is JIT-compatible
-        logits = logits_btv[0, cur_pos - 1, :].astype(jnp.float32)
-
-        # Temperature scaling
-        logits = jnp.where(temperature > 0, logits / temperature, logits)
-
-        # Top-p nucleus sampling
-        sort_idx = jnp.argsort(logits)[::-1]
-        sort_logits = logits[sort_idx]
-        sort_probs = jax.nn.softmax(sort_logits)
-        cum_probs = jnp.cumsum(sort_probs)
-        mask = cum_probs > top_p
-        mask = mask.at[0].set(False)
-        masked_logits = jnp.where(mask, -jnp.inf, sort_logits)
+        # Forward pass on full buffer - recompute everything each step
+        key, subkey = jax.random.split(key)
+        logits_tv, caches = model.forward(tokens_t, caches=caches)
+        logits = logits_tv[..., cur_pos - 1, :]
 
         key, subkey = jax.random.split(key)
-        sampled_idx = jax.random.categorical(subkey, masked_logits)
-        next_token = sort_idx[sampled_idx]
-
-        # Update tokens at current position
-        new_tokens = tokens.at[cur_pos].set(next_token)
-
-        # Check for EOS (use -1 to disable)
+        next_token = _sample_next_token(logits, temperature, top_p, subkey, num_samples=1)[..., 0]
+        new_tokens = tokens_t.at[cur_pos].set(next_token)
         done = jnp.bool_((eos_id >= 0) & (next_token == eos_id))
 
-        return (new_tokens, cur_pos + 1, key, done)
+        return (new_tokens, cur_pos + 1, key, done, caches)
 
-    final_tokens, final_pos, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_state)
-
-    # Return tokens and the final valid length
+    final_tokens, final_pos, _, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_state)
     return final_tokens, final_pos
+
+
+def llm_generate_stream(
+    model: LLM,
+    tokens: list[int],
+    eos_id: int | None,
+    max_new_tokens: int = 256,
+    *,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    key: PRNGKeyArray | None = None,
+) -> Iterator[int]:
+    """Streaming token generation that yields tokens one at a time.
+
+    This is a non-JIT generator function that uses KV caching for efficient
+    generation. Each token is yielded as soon as it's generated.
+
+    Args:
+        model: The LLM model.
+        tokens: Initial token sequence as a list of integers.
+        eos_id: End-of-sequence token ID (None to disable).
+        max_new_tokens: Maximum number of new tokens to generate.
+        temperature: Sampling temperature (>0).
+        top_p: Top-p (nucleus) sampling probability.
+        key: Optional PRNG key for sampling (defaults to key(0)).
+
+    Yields:
+        Generated tokens one at a time (does not include input tokens).
+    """
+    if key is None:
+        key = jax.random.key(0)
+    tokens_t = jnp.array(tokens, dtype=jnp.int32)
+
+    initial_len = len(tokens)
+    max_len = initial_len + max_new_tokens
+
+    # Initialize KV cache using model's dtype
+    model_dtype = model.embed.weight.dtype
+    caches = model.init_cache(max_len, dtype=model_dtype)
+
+    @xax_jit(donate_argnames=["caches", "key"])
+    def step(
+        tokens_t: Array,
+        caches: list[TransformerBlockCache],
+        key: PRNGKeyArray,
+    ) -> tuple[Array, list[TransformerBlockCache], PRNGKeyArray]:
+        logits_tv, caches = model.forward(tokens_t, caches=caches)
+        logits_1v = logits_tv[..., -1:, :]
+        key, subkey = jax.random.split(key)
+        next_token_1 = _sample_next_token(logits_1v, temperature, top_p, subkey, num_samples=1)[..., 0]
+        return next_token_1, caches, key
+
+    next_token_1, caches, key = step(tokens_t, caches, key)
+    next_token_int = int(next_token_1.item())
+
+    # Check EOS
+    if eos_id is not None and next_token_int == eos_id:
+        return
+
+    yield next_token_int
+
+    # Continue generating
+    for _ in range(max_new_tokens - 1):
+        # Forward with cache
+        next_token_1, caches, key = step(next_token_1, caches, key)
+        next_token_int = int(next_token_1.item())
+
+        # Check EOS
+        if eos_id is not None and next_token_int == eos_id:
+            return
+
+        yield next_token_int
 
 
 def main() -> None:
@@ -912,13 +1017,14 @@ def main() -> None:
     import argparse  # noqa: PLC0415
 
     parser = argparse.ArgumentParser(description="Run lightweight LLM with HuggingFace weights.")
-    parser.add_argument("--repo", type=str, required=True, help="HF repo id, e.g., Qwen/Qwen3-0.6B")
+    parser.add_argument("--repo", type=LLMRepo, required=True, help="LLM repository")
     parser.add_argument("--revision", type=str, default=None)
     parser.add_argument("--prompt", type=str, default="Hello world")
-    parser.add_argument("--max-new-tokens", type=int, default=20)
+    parser.add_argument("--max-new-tokens", type=int, default=1024, help="Max tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.9)
-    parser.add_argument("--chat-template", action="store_true", help="Apply chat template for chat models.")
+    parser.add_argument("--no-stream", action="store_true", help="Disable streaming (print all at once).")
+    parser.add_argument("--no-think", action="store_true", help="Disable thinking mode for Qwen3 models.")
     parser.add_argument("--dtype", choices=["float32", "bfloat16", "float16"], default="bfloat16")
     args = parser.parse_args()
 
@@ -926,44 +1032,64 @@ def main() -> None:
     dtype_map = {"float32": jnp.float32, "bfloat16": jnp.bfloat16, "float16": jnp.float16}
     dtype = dtype_map[args.dtype]
 
-    # Load config and build model
-    cfg_dict = load_hf_config(args.repo, revision=args.revision)
-    config = hf_config_to_llm_config(cfg_dict)
-    model = build_qwen3_model(config)
+    # Loads the model repository.
+    logger.info("Loading weights from %s...", args.repo.value)
+    model = build_pretrained_model(args.repo, dtype=dtype)
 
-    # Load weights
-    logger.info("Loading weights from %s...", args.repo)
-    model = load_hf_weights_into_llm(model, args.repo, revision=args.revision, dtype=dtype)
-    logger.info("Weights loaded successfully!")
+    # Load tokenizer.
+    tokenizer = AutoTokenizer.from_pretrained(args.repo.value, revision=args.revision)
 
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.repo, revision=args.revision)
+    # Prepare input tokens.
+    # For Qwen3 models, enable_thinking controls whether the model uses chain-of-thought reasoning.
+    # When disabled, the model behaves like Qwen2.5-Instruct without <think>...</think> blocks.
+    chat_template_kwargs: dict[str, object] = {"add_generation_prompt": True}
+    if args.no_think:
+        chat_template_kwargs["enable_thinking"] = False
 
-    # Prepare input tokens
-    if args.chat_template or ("chat" in args.repo.lower()):
-        tokens = tokenizer.apply_chat_template(
-            [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": args.prompt},
-            ],
-            add_generation_prompt=True,
-        )
-    else:
-        tokens = tokenizer.encode(args.prompt, return_tensors="np", add_special_tokens=False)[0].tolist()
-
-    # Generate
-    output_tokens = llm_generate(
-        model,
-        tokens=tokens,
-        eos_id=tokenizer.eos_token_id,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
+    tokens = tokenizer.apply_chat_template(
+        [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": args.prompt},
+        ],
+        **chat_template_kwargs,
     )
 
-    # Print result
-    text = tokenizer.decode(output_tokens, skip_special_tokens=True)
-    print(text)
+    # Generate with streaming or batch mode
+    if args.no_stream:
+        # Batch mode: generate all then print
+        output_tokens = llm_generate(
+            model,
+            tokens=tokens,
+            eos_id=tokenizer.eos_token_id,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+        )
+        text = tokenizer.decode(output_tokens, skip_special_tokens=True)
+        print(text)
+
+    else:
+        # Streaming mode: print tokens as they're generated
+        generated_tokens: list[int] = []
+        prev_text = ""
+        for token in llm_generate_stream(
+            model,
+            tokens=tokens,
+            eos_id=tokenizer.eos_token_id,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+        ):
+            generated_tokens.append(token)
+            # Decode all tokens and print only the new part
+            text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            if len(text) > len(prev_text):
+                new_text = text[len(prev_text) :]
+                sys.stdout.write(new_text)
+                sys.stdout.flush()
+                prev_text = text
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
 
 if __name__ == "__main__":
