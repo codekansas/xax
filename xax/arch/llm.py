@@ -391,7 +391,7 @@ def chunked_cross_entropy_acc(
     padded_tsz = tsz + pad_size
     num_chunks = padded_tsz // chunk_size
 
-    # Reshape to (batch, num_chunks, chunk_size, ...)
+    # Reshape to (num_chunks, chunk_size, ...)
     hidden_ccd = hidden_td.reshape(num_chunks, chunk_size, hidden_dim)
     targets_cc = targets_t.reshape(num_chunks, chunk_size)
     mask_cc = mask_t.reshape(num_chunks, chunk_size)
@@ -407,7 +407,7 @@ def chunked_cross_entropy_acc(
         chunk_hidden_f32 = chunk_hidden.astype(jnp.float32)
         lm_head_f32 = lm_head_weight.astype(jnp.float32)
 
-        # Compute logits: (batch, chunk, hidden) @ (hidden, vocab) -> (batch, chunk, vocab)
+        # Compute logits: (chunk, hidden) @ (hidden, vocab) -> (chunk, vocab)
         chunk_logits = chunk_hidden_f32 @ lm_head_f32.T
 
         # Compute accuracy: check if argmax matches target
