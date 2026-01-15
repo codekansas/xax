@@ -122,18 +122,19 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
         mask_bt = batch["attention_mask"][:, 1:] == 1
 
         # Memory-efficient forward pass: get hidden states without computing full logits
-        hidden_btd = model.forward_hidden(input_ids_bt, key=key, inference=False)
+        hidden_btd = jax.vmap(model.forward_hidden)(input_ids_bt)
 
         # Compute loss using chunked cross-entropy to avoid materializing full logits
         # This processes the sequence in chunks, computing logits for each chunk
         # and discarding them after computing the loss contribution
-        loss = xax.chunked_cross_entropy_loss(
+        loss = jax.vmap(xax.chunked_cross_entropy_loss, in_axes=(0, 0, None, 0, None))(
             hidden_btd,
             targets_bt,
             model.lm_head.weight,
             mask_bt,
-            chunk_size=256,
+            256,  # Chunk size
         )
+        loss = loss.mean()
 
         metrics: dict[str, xax.Metric] = {}
 

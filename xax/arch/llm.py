@@ -7,7 +7,7 @@ import sys
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, overload
 
 import chex
 import equinox as eqx
@@ -169,12 +169,23 @@ class LLM(eqx.Module):
             caches.append(block.init_cache(max_len=max_len, dtype=dtype))
         return caches
 
+    @overload
+    def forward_hidden(self, tokens_t: Array) -> Array: ...
+
+    @overload
+    def forward_hidden(
+        self,
+        tokens_t: Array,
+        *,
+        caches: list[TransformerBlockCache],
+    ) -> tuple[Array, list[TransformerBlockCache]]: ...
+
     def forward_hidden(
         self,
         tokens_t: Array,
         *,
         caches: list[TransformerBlockCache] | None = None,
-    ) -> tuple[Array, list[TransformerBlockCache]]:
+    ) -> tuple[Array, list[TransformerBlockCache]] | Array:
         """Forward pass returning hidden states shaped (bsz, tsz, embed_dim).
 
         This is useful for memory-efficient loss computation where you want to
@@ -189,29 +200,41 @@ class LLM(eqx.Module):
         """
         chex.assert_rank(tokens_t, 1)
         x_tn = jax.vmap(self.embed)(tokens_t)
-        caches_out: list[TransformerBlockCache] = []
-        for block, cache in zip(self.blocks, caches, strict=True):
-            x_tn, cache = block.forward(x_tn, cache=cache)
-            caches_out.append(cache)
-        return self.norm(x_tn), caches_out
+        if caches is None:
+            for block in self.blocks:
+                x_tn, cache = block.forward(x_tn, cache=None)
+            return self.norm(x_tn)
+        else:
+            caches_out: list[TransformerBlockCache] = []
+            for block, cache in zip(self.blocks, caches, strict=True):
+                x_tn, cache = block.forward(x_tn, cache=cache)
+                caches_out.append(cache)
+            return self.norm(x_tn), caches_out
+
+    @overload
+    def forward(self, tokens_t: Array) -> Array: ...
+
+    @overload
+    def forward(
+        self,
+        tokens_t: Array,
+        *,
+        caches: list[TransformerBlockCache],
+    ) -> tuple[Array, list[TransformerBlockCache]]: ...
 
     def forward(
         self,
         tokens_t: Array,
         *,
         caches: list[TransformerBlockCache] | None = None,
-    ) -> tuple[Array, list[TransformerBlockCache]]:
-        x_td, caches = self.forward_hidden(tokens_t, caches=caches)
-        logits_tv = apply_linear(x_td, self.lm_head)
-        return logits_tv, caches
-
-    def __call__(
-        self,
-        tokens_t: Array,
-        *,
-        cache: list[TransformerBlockCache] | None = None,
-    ) -> tuple[Array, list[TransformerBlockCache]]:
-        return self.forward(tokens_t, caches=cache)
+    ) -> tuple[Array, list[TransformerBlockCache]] | Array:
+        if caches is None:
+            x_td = self.forward_hidden(tokens_t)
+            return apply_linear(x_td, self.lm_head)
+        else:
+            x_td, cache = self.forward_hidden(tokens_t, caches=caches)
+            logits_tv = apply_linear(x_td, self.lm_head)
+            return logits_tv, cache
 
 
 class LLMRepo(Enum):
@@ -241,10 +264,10 @@ def tie_embedding_and_head(model: LLM) -> LLM:
 
 
 def chunked_cross_entropy_loss(
-    hidden_btd: Array,
-    targets_bt: Array,
+    hidden_td: Array,
+    targets_t: Array,
     lm_head_weight: Array,
-    mask_bt: Array | None = None,
+    mask_t: Array | None = None,
     chunk_size: int = 1,
 ) -> Array:
     """Compute cross-entropy loss in chunks to save memory.
@@ -263,34 +286,34 @@ def chunked_cross_entropy_loss(
     - Accumulates loss and count in float32 to avoid precision loss
 
     Args:
-        hidden_btd: Hidden states from model.forward_hidden(), shape (batch, seq, hidden_dim)
-        targets_bt: Target token indices, shape (batch, seq)
+        hidden_td: Hidden states from model.forward_hidden(), shape (seq, hidden_dim)
+        targets_t: Target token indices, shape (seq,)
         lm_head_weight: The lm_head weight matrix, shape (vocab_size, hidden_dim)
-        mask_bt: Optional mask for valid positions, shape (batch, seq). If None, all positions are valid.
+        mask_t: Optional mask for valid positions, shape (seq,). If None, all positions are valid.
         chunk_size: Number of sequence positions to process at once.
 
     Returns:
         Scalar loss value (mean cross-entropy over valid positions) in float32.
     """
-    bsz, tsz, hidden_dim = hidden_btd.shape
+    tsz, hidden_dim = hidden_td.shape
 
-    if mask_bt is None:
-        mask_bt = jnp.ones((bsz, tsz), dtype=jnp.bool_)
+    if mask_t is None:
+        mask_t = jnp.ones((tsz), dtype=jnp.bool_)
 
     # Pad sequence to be divisible by chunk_size for static shapes
     pad_size = (chunk_size - tsz % chunk_size) % chunk_size
     if pad_size > 0:
-        hidden_btd = jnp.pad(hidden_btd, ((0, 0), (0, pad_size), (0, 0)))
-        targets_bt = jnp.pad(targets_bt, ((0, 0), (0, pad_size)))
-        mask_bt = jnp.pad(mask_bt, ((0, 0), (0, pad_size)), constant_values=False)
+        hidden_td = jnp.pad(hidden_td, ((0, pad_size), (0, 0)))
+        targets_t = jnp.pad(targets_t, ((0, pad_size)))
+        mask_t = jnp.pad(mask_t, ((0, pad_size)), constant_values=False)
 
     padded_tsz = tsz + pad_size
     num_chunks = padded_tsz // chunk_size
 
-    # Reshape to (batch, num_chunks, chunk_size, ...)
-    hidden_bccd = hidden_btd.reshape(bsz, num_chunks, chunk_size, hidden_dim)
-    targets_bcc = targets_bt.reshape(bsz, num_chunks, chunk_size)
-    mask_bcc = mask_bt.reshape(bsz, num_chunks, chunk_size)
+    # Reshape to (num_chunks, chunk_size, ...)
+    hidden_ccd = hidden_td.reshape(num_chunks, chunk_size, hidden_dim)
+    targets_cc = targets_t.reshape(num_chunks, chunk_size)
+    mask_cc = mask_t.reshape(num_chunks, chunk_size)
 
     def process_chunk(
         carry: tuple[Array, Array],
@@ -320,19 +343,11 @@ def chunked_cross_entropy_loss(
 
         return (total_loss, total_count), None
 
-    # Transpose to (num_chunks, batch, chunk_size, ...) for scan
-    hidden_cbcd = jnp.transpose(hidden_bccd, (1, 0, 2, 3))
-    targets_cbc = jnp.transpose(targets_bcc, (1, 0, 2))
-    mask_cbc = jnp.transpose(mask_bcc, (1, 0, 2))
-
-    init_carry = (
-        jnp.array(0.0, dtype=jnp.float32),
-        jnp.array(0.0, dtype=jnp.float32),
-    )
+    init_carry = (jnp.array(0.0, dtype=jnp.float32), jnp.array(0.0, dtype=jnp.float32))
     (total_loss, total_count), _ = jax.lax.scan(
         process_chunk,
         init_carry,
-        (hidden_cbcd, targets_cbc, mask_cbc),
+        (hidden_ccd, targets_cc, mask_cc),
     )
 
     # Safe division - if no valid tokens, return 0
