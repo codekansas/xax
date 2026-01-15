@@ -15,7 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
-from jaxtyping import Array
+from jaxtyping import Array, PRNGKeyArray
 from omegaconf import MISSING
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field as PydanticField
 
@@ -72,7 +72,6 @@ class LLMConfig:
     sliding_window_size: int | None = field(None, help="Sliding window size (None = full attention)")
     layer_attention_types: tuple[str, ...] | None = field(None, help="Per-layer attention type ('sliding' or 'full')")
     use_attention_sinks: bool = field(False, help="Use learnable attention sinks for stability")
-    use_remat: bool = field(True, help="Recompute activations during backward to save memory")
     use_qk_norm: bool = field(False, help="Apply QK normalization in attention (Qwen3 style)")
 
     def with_vocab(self, vocab_size: int) -> "LLMConfig":
@@ -155,62 +154,6 @@ class LLM(eqx.Module):
         lm_head = eqx.nn.Linear(config.embed_dim, config.vocab_size, use_bias=False, key=k_head)
         return cls(embed=embed, blocks=tuple(blocks), norm=norm, lm_head=lm_head, config=config)
 
-    def forward_hidden(
-        self,
-        tokens_bt: Array,
-        *,
-        key: jax.Array | None = None,
-        inference: bool = True,
-    ) -> Array:
-        """Forward pass returning hidden states shaped (bsz, tsz, embed_dim).
-
-        This is useful for memory-efficient loss computation where you want to
-        avoid materializing the full (bsz, tsz, vocab_size) logits tensor.
-        """
-        chex.assert_rank(tokens_bt, 2)
-        bsz, tsz = tokens_bt.shape
-        positions_bt = jnp.broadcast_to(jnp.arange(tsz)[None, :], (bsz, tsz))
-
-        key_seq = None
-        if key is not None:
-            key_seq = jax.random.split(key, len(self.blocks))
-
-        x_btd = jnp.take(self.embed.weight, tokens_bt, axis=0)
-        for i, block in enumerate(self.blocks):
-            block_key = None if key_seq is None else key_seq[i]
-            if self.config.use_remat:
-                block_arrays, block_static = eqx.partition(block, eqx.is_array)
-
-                @jax.checkpoint
-                def remat_block(
-                    arrays: TransformerBlock,
-                    x: Array,
-                    pos: Array,
-                    k: jax.Array | None,
-                    inf: bool,
-                    *,
-                    static: TransformerBlock = block_static,
-                ) -> Array:
-                    b: TransformerBlock = eqx.combine(arrays, static)
-                    return b(x, pos, key=k, inference=inf)
-
-                x_btd = remat_block(block_arrays, x_btd, positions_bt, block_key, inference)
-            else:
-                x_btd = block(x_btd, positions_bt, key=block_key, inference=inference)
-        return self.norm(x_btd)
-
-    def __call__(
-        self,
-        tokens_bt: Array,
-        *,
-        key: jax.Array | None = None,
-        inference: bool = True,
-    ) -> Array:
-        """Forward pass returning logits shaped (bsz, tsz, vocab_size)."""
-        x_btd = self.forward_hidden(tokens_bt, key=key, inference=inference)
-        logits_btv = apply_linear(x_btd, self.lm_head)
-        return logits_btv
-
     def init_cache(self, max_len: int | None = None, dtype: jnp.dtype = jnp.bfloat16) -> list[TransformerBlockCache]:
         """Initialize KV cache for autoregressive generation.
 
@@ -226,34 +169,49 @@ class LLM(eqx.Module):
             caches.append(block.init_cache(max_len=max_len, dtype=dtype))
         return caches
 
-    def forward_with_cache(
+    def forward_hidden(
         self,
         tokens_t: Array,
-        caches: list[TransformerBlockCache],
+        *,
+        caches: list[TransformerBlockCache] | None = None,
     ) -> tuple[Array, list[TransformerBlockCache]]:
-        """Forward pass for a single token using KV cache.
+        """Forward pass returning hidden states shaped (bsz, tsz, embed_dim).
+
+        This is useful for memory-efficient loss computation where you want to
+        avoid materializing the full (bsz, tsz, vocab_size) logits tensor.
 
         Args:
             tokens_t: Tokens, shape (seq_len,).
             caches: List of KV caches, one per layer.
 
         Returns:
-            Tuple of (logits for next tokens, updated caches).
+            Tuple of (hidden states, updated caches).
         """
-        # Embed token
-        x_td = self.embed.weight[tokens_t]
-
-        # Process through transformer blocks
-        updated_caches = []
+        chex.assert_rank(tokens_t, 1)
+        x_tn = jax.vmap(self.embed)(tokens_t)
+        caches_out: list[TransformerBlockCache] = []
         for block, cache in zip(self.blocks, caches, strict=True):
-            x_td, updated_cache = block.forward(x_td, cache=cache)
-            updated_caches.append(updated_cache)
+            x_tn, cache = block.forward(x_tn, cache=cache)
+            caches_out.append(cache)
+        return self.norm(x_tn), caches_out
 
-        # Final norm and lm_head
-        x_td = self.norm(x_td)
+    def forward(
+        self,
+        tokens_t: Array,
+        *,
+        caches: list[TransformerBlockCache] | None = None,
+    ) -> tuple[Array, list[TransformerBlockCache]]:
+        x_td, caches = self.forward_hidden(tokens_t, caches=caches)
         logits_tv = apply_linear(x_td, self.lm_head)
+        return logits_tv, caches
 
-        return logits_tv, updated_caches
+    def __call__(
+        self,
+        tokens_t: Array,
+        *,
+        cache: list[TransformerBlockCache] | None = None,
+    ) -> tuple[Array, list[TransformerBlockCache]]:
+        return self.forward(tokens_t, caches=cache)
 
 
 class LLMRepo(Enum):
@@ -885,7 +843,7 @@ def _sample_next_token(
     logits_tv: Array,
     temperature: float,
     top_p: float,
-    key: Array,
+    key: PRNGKeyArray,
     num_samples: int = 1,
 ) -> Array:
     """Sample next token from logits using temperature and top-p sampling.
@@ -929,38 +887,41 @@ def llm_generate_jit(
     max_new_tokens: int,
     temperature: float,
     top_p: float,
-    key: Array,
+    key: PRNGKeyArray,
 ) -> tuple[Array, Array]:
-    initial_len = tokens_t.shape[0]
+    initial_len = tokens_t.shape[-1]
     max_len = initial_len + max_new_tokens
 
     # Initialize output token buffer
     padded_tokens = jnp.zeros(max_len, dtype=jnp.int32)
     padded_tokens = padded_tokens.at[:initial_len].set(tokens_t)
 
-    init_state = (padded_tokens, jnp.int32(initial_len), key, jnp.bool_(False))
+    dtype = model.embed.weight.dtype
+    init_caches = model.init_cache(max_len, dtype)
+    init_state = (padded_tokens, jnp.int32(initial_len), key, jnp.bool_(False), init_caches)
 
-    def cond_fn(state: tuple[Array, Array, Array, Array]) -> Array:
-        _, cur_pos, _, done = state
+    def cond_fn(state: tuple[Array, Array, Array, Array, list[TransformerBlockCache]]) -> Array:
+        _, cur_pos, _, done, _ = state
         return (cur_pos < max_len) & ~done
 
-    def body_fn(state: tuple[Array, Array, Array, Array]) -> tuple[Array, Array, Array, Array]:
-        tokens, cur_pos, key, _ = state
+    def body_fn(
+        state: tuple[Array, Array, Array, Array, list[TransformerBlockCache]],
+    ) -> tuple[Array, Array, Array, Array, list[TransformerBlockCache]]:
+        tokens_t, cur_pos, key, _, caches = state
 
         # Forward pass on full buffer - recompute everything each step
-        tokens_bt = tokens[None, :]
         key, subkey = jax.random.split(key)
-        logits_btv = model(tokens_bt, key=subkey, inference=True)
-        logits = logits_btv[0, cur_pos - 1, :]
+        logits_tv, caches = model.forward(tokens_t, caches=caches)
+        logits = logits_tv[..., cur_pos - 1, :]
 
         key, subkey = jax.random.split(key)
         next_token = _sample_next_token(logits, temperature, top_p, subkey, num_samples=1)[..., 0]
-        new_tokens = tokens.at[cur_pos].set(next_token)
+        new_tokens = tokens_t.at[cur_pos].set(next_token)
         done = jnp.bool_((eos_id >= 0) & (next_token == eos_id))
 
-        return (new_tokens, cur_pos + 1, key, done)
+        return (new_tokens, cur_pos + 1, key, done, caches)
 
-    final_tokens, final_pos, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_state)
+    final_tokens, final_pos, _, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_state)
     return final_tokens, final_pos
 
 
@@ -972,7 +933,7 @@ def llm_generate_stream(
     *,
     temperature: float = 0.7,
     top_p: float = 0.9,
-    key: Array | None = None,
+    key: PRNGKeyArray | None = None,
 ) -> Iterator[int]:
     """Streaming token generation that yields tokens one at a time.
 
@@ -1002,17 +963,19 @@ def llm_generate_stream(
     model_dtype = model.embed.weight.dtype
     caches = model.init_cache(max_len, dtype=model_dtype)
 
-    @xax_jit(donate_argnames=["caches"])
-    def step(tokens_t: Array, caches: list[TransformerBlockCache]) -> tuple[Array, list[TransformerBlockCache]]:
-        return model.forward_with_cache(tokens_t, caches)
+    @xax_jit(donate_argnames=["caches", "key"])
+    def step(
+        tokens_t: Array,
+        caches: list[TransformerBlockCache],
+        key: PRNGKeyArray,
+    ) -> tuple[Array, list[TransformerBlockCache], PRNGKeyArray]:
+        logits_tv, caches = model.forward(tokens_t, caches=caches)
+        logits_1v = logits_tv[..., -1:, :]
+        key, subkey = jax.random.split(key)
+        next_token_1 = _sample_next_token(logits_1v, temperature, top_p, subkey, num_samples=1)[..., 0]
+        return next_token_1, caches, key
 
-    logits_tv, caches = step(tokens_t, caches)
-    logits_1v = logits_tv[..., -1:, :]
-
-    # logits_v now contains logits for predicting the next token after the prompt
-    # Sample first token
-    key, subkey = jax.random.split(key)
-    next_token_1 = _sample_next_token(logits_1v, temperature, top_p, subkey, num_samples=1)[..., 0]
+    next_token_1, caches, key = step(tokens_t, caches, key)
     next_token_int = int(next_token_1.item())
 
     # Check EOS
@@ -1024,11 +987,7 @@ def llm_generate_stream(
     # Continue generating
     for _ in range(max_new_tokens - 1):
         # Forward with cache
-        logits_1v, caches = step(next_token_1, caches)
-
-        # Sample next token
-        key, subkey = jax.random.split(key)
-        next_token_1 = _sample_next_token(logits_1v, temperature, top_p, subkey)[..., 0]
+        next_token_1, caches, key = step(next_token_1, caches, key)
         next_token_int = int(next_token_1.item())
 
         # Check EOS
@@ -1051,7 +1010,7 @@ def main() -> None:
     parser.add_argument("--repo", type=LLMRepo, required=True, help="LLM repository")
     parser.add_argument("--revision", type=str, default=None)
     parser.add_argument("--prompt", type=str, default="Hello world")
-    parser.add_argument("--max-new-tokens", type=int, default=1024, help="Max tokens to generate (default: 256)")
+    parser.add_argument("--max-new-tokens", type=int, default=1024, help="Max tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--no-stream", action="store_true", help="Disable streaming (print all at once).")
@@ -1119,7 +1078,8 @@ def main() -> None:
                 sys.stdout.write(new_text)
                 sys.stdout.flush()
                 prev_text = text
-        print()  # Final newline
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
 
 if __name__ == "__main__":

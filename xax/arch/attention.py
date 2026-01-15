@@ -1384,40 +1384,15 @@ class TransformerBlock(eqx.Module):
 
     def __call__(
         self,
-        x_btd: Array,
-        positions_bt: Array | None = None,
+        x_tn: Array,
         *,
-        key: jax.Array | None = None,
-        inference: bool = True,
-    ) -> Array:
-        """Apply transformer block with batched input (for LLM training/inference).
+        context_sn: Array | None = None,
+        mask: Array | None = None,
+        cache: TransformerBlockCache | None = None,
+    ) -> tuple[Array, TransformerBlockCache]:
+        return self.forward(x_tn, context_sn=context_sn, mask=mask, cache=cache)
 
-        This is a simplified interface for the common case of batched input
-        without FP8 or caching. For caching/FP8, use the `forward` method.
-
-        Args:
-            x_btd: Input tensor of shape (batch, seq_len, embed_dim)
-            positions_bt: Position indices for RoPE, shape (batch, seq_len).
-                If None, uses sequential positions starting from 0.
-            key: PRNG key for dropout (if applicable)
-            inference: Whether in inference mode
-
-        Returns:
-            Output tensor of shape (batch, seq_len, embed_dim)
-        """
-        attn_key = None
-        if key is not None:
-            attn_key, _ = jax.random.split(key, 2)
-
-        # Self-attention with pre-norm
-        normed = self.attn_norm(x_btd)
-        y_btd = x_btd + self.self_attn(normed, positions_bt, key=attn_key, inference=inference)
-
-        # Feed-forward with pre-norm
-        y_btd = y_btd + self.feed_forward(self.mlp_norm(y_btd))
-
-        return y_btd
-
+    @jax.checkpoint
     def forward(
         self,
         x_tn: Array,
