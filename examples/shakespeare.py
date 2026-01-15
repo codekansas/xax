@@ -144,13 +144,14 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
 
         if heavy:
             # Compute prediction accuracy.
-            accuracy = xax.chunked_cross_entropy_acc(
+            accuracy = jax.vmap(xax.chunked_cross_entropy_acc, in_axes=(0, 0, None, 0, None))(
                 hidden_btd,
                 targets_bt,
                 model.lm_head.weight,
                 mask_bt,
-                chunk_size=256,
+                256,
             )
+            accuracy = accuracy.mean()
             metrics["accuracy"] = xax.Scalar(accuracy)
 
             # Generate text using JIT-compilable generation

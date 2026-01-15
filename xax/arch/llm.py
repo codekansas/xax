@@ -355,10 +355,10 @@ def chunked_cross_entropy_loss(
 
 
 def chunked_cross_entropy_acc(
-    hidden_btd: Array,
-    targets_bt: Array,
+    hidden_td: Array,
+    targets_t: Array,
     lm_head_weight: Array,
-    mask_bt: Array | None = None,
+    mask_t: Array | None = None,
     chunk_size: int = 1,
 ) -> Array:
     """Compute accuracy in chunks to save memory.
@@ -367,34 +367,34 @@ def chunked_cross_entropy_acc(
     the fraction of correctly predicted tokens without materializing full logits.
 
     Args:
-        hidden_btd: Hidden states from model.forward_hidden(), shape (batch, seq, hidden_dim)
-        targets_bt: Target token indices, shape (batch, seq)
+        hidden_td: Hidden states from model.forward_hidden(), shape (seq, hidden_dim)
+        targets_t: Target token indices, shape (seq,)
         lm_head_weight: The lm_head weight matrix, shape (vocab_size, hidden_dim)
-        mask_bt: Optional mask for valid positions, shape (batch, seq). If None, all positions are valid.
+        mask_t: Optional mask for valid positions, shape (seq,). If None, all positions are valid.
         chunk_size: Number of sequence positions to process at once.
 
     Returns:
         Scalar accuracy value (fraction of correct predictions) in float32.
     """
-    bsz, tsz, hidden_dim = hidden_btd.shape
+    tsz, hidden_dim = hidden_td.shape
 
-    if mask_bt is None:
-        mask_bt = jnp.ones((bsz, tsz), dtype=jnp.bool_)
+    if mask_t is None:
+        mask_t = jnp.ones((tsz), dtype=jnp.bool_)
 
     # Pad sequence to be divisible by chunk_size for static shapes
     pad_size = (chunk_size - tsz % chunk_size) % chunk_size
     if pad_size > 0:
-        hidden_btd = jnp.pad(hidden_btd, ((0, 0), (0, pad_size), (0, 0)))
-        targets_bt = jnp.pad(targets_bt, ((0, 0), (0, pad_size)))
-        mask_bt = jnp.pad(mask_bt, ((0, 0), (0, pad_size)), constant_values=False)
+        hidden_td = jnp.pad(hidden_td, ((0, pad_size), (0, 0)))
+        targets_t = jnp.pad(targets_t, ((0, pad_size)))
+        mask_t = jnp.pad(mask_t, ((0, pad_size)), constant_values=False)
 
     padded_tsz = tsz + pad_size
     num_chunks = padded_tsz // chunk_size
 
     # Reshape to (batch, num_chunks, chunk_size, ...)
-    hidden_bccd = hidden_btd.reshape(bsz, num_chunks, chunk_size, hidden_dim)
-    targets_bcc = targets_bt.reshape(bsz, num_chunks, chunk_size)
-    mask_bcc = mask_bt.reshape(bsz, num_chunks, chunk_size)
+    hidden_ccd = hidden_td.reshape(num_chunks, chunk_size, hidden_dim)
+    targets_cc = targets_t.reshape(num_chunks, chunk_size)
+    mask_cc = mask_t.reshape(num_chunks, chunk_size)
 
     def process_chunk(
         carry: tuple[Array, Array],
@@ -421,11 +421,6 @@ def chunked_cross_entropy_acc(
 
         return (total_correct, total_count), None
 
-    # Transpose to (num_chunks, batch, chunk_size, ...) for scan
-    hidden_cbcd = jnp.transpose(hidden_bccd, (1, 0, 2, 3))
-    targets_cbc = jnp.transpose(targets_bcc, (1, 0, 2))
-    mask_cbc = jnp.transpose(mask_bcc, (1, 0, 2))
-
     init_carry = (
         jnp.array(0.0, dtype=jnp.float32),
         jnp.array(0.0, dtype=jnp.float32),
@@ -433,7 +428,7 @@ def chunked_cross_entropy_acc(
     (total_correct, total_count), _ = jax.lax.scan(
         process_chunk,
         init_carry,
-        (hidden_cbcd, targets_cbc, mask_cbc),
+        (hidden_ccd, targets_cc, mask_cc),
     )
 
     # Safe division - if no valid tokens, return 0
