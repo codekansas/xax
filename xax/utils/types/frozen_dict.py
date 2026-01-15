@@ -56,7 +56,7 @@ class FrozenDict(Mapping[K, V]):
         self._hash: int | None = None
 
     def __getitem__(self, key: K) -> V:
-        v = self._dict[key]  # type: ignore[index]
+        v = self._dict[key]
         if isinstance(v, dict):
             return FrozenDict(v)  # type: ignore[return-value]
         return v

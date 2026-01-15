@@ -883,7 +883,7 @@ class SelfAttentionBlock(eqx.Module):
             new_position = p + seq_len
 
         else:
-            new_position = seq_len
+            new_position = jnp.asarray(seq_len)
 
         # Handle attention sinks via bias
         bias = None
@@ -900,7 +900,23 @@ class SelfAttentionBlock(eqx.Module):
         implementation = "cudnn" if use_cudnn else None
 
         if seq_len == 1:
-            attn_output = jax.nn.dot_product_attention(q, k, v, bias=bias, implementation=implementation)
+            # For single-token generation with cache, mask to only attend to valid positions
+            if cache is None:
+                attn_output = jax.nn.dot_product_attention(q, k, v, bias=bias, implementation=implementation)
+            else:
+                max_cache_len = k.shape[0]
+                # Mask: attend to positions 0 to new_position-1 (inclusive)
+                # new_position is p + 1 after adding the current token
+                valid_mask = jnp.arange(max_cache_len) < new_position
+                valid_mask = valid_mask[None, None, None, :]  # (1, 1, 1, max_cache_len)
+                attn_output = jax.nn.dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    mask=valid_mask,
+                    bias=bias,
+                    implementation=implementation,
+                )
 
         elif mask is not None:
             attn_output = jax.nn.dot_product_attention(q, k, v, mask=mask, bias=bias, implementation=implementation)
@@ -1062,7 +1078,7 @@ class CrossAttentionBlock(eqx.Module):
                 new_fp8["v_proj"] = new_v_scales
             updated_fp8_scales = new_fp8
 
-        return {"k": k, "v": v, "position": 0}, updated_fp8_scales
+        return {"k": k, "v": v, "position": jnp.asarray(0)}, updated_fp8_scales
 
     def forward(
         self,
@@ -1111,7 +1127,7 @@ class CrossAttentionBlock(eqx.Module):
             v, new_v_scales = _apply_linear_batched(self.v_proj, kv_sn, v_scales)
             k = self._reshape_for_multihead(k)
             v = self._reshape_for_multihead(v)
-            q_position = 0
+            q_position = jnp.asarray(0)
         else:
             raise ValueError("Either `cache` or `kv_sn` must be provided.")
 
@@ -1392,7 +1408,7 @@ class TransformerBlock(eqx.Module):
     ) -> tuple[Array, TransformerBlockCache]:
         return self.forward(x_tn, context_sn=context_sn, mask=mask, cache=cache)
 
-    @jax.checkpoint
+    @eqx.filter_checkpoint
     def forward(
         self,
         x_tn: Array,

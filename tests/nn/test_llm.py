@@ -21,7 +21,7 @@ def test_qwen3_forward_shape() -> None:
     key = jax.random.key(0)
     tokens_bt = jax.random.randint(key, (2, 5), minval=0, maxval=config.vocab_size)
     model = xax.LLM.build(config, key=key)
-    logits_btv = model(tokens_bt)
+    logits_btv = jax.vmap(model.forward)(tokens_bt)
     assert logits_btv.shape == (2, 5, config.vocab_size)
 
 
