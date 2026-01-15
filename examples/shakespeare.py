@@ -164,8 +164,6 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
                 temperature=0.8,
                 top_p=0.9,
                 key=gen_key,
-                use_cache=True,
-                return_cache=False,
             )
             generated_tokens = gen_result[0]
             metrics["generated"] = xax.Tokens(generated_tokens)

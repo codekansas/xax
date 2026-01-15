@@ -20,15 +20,15 @@ from omegaconf import MISSING
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field as PydanticField
 
 from xax.arch.attention import (
-    AttentionCache,
     RMSNorm,
     SelfAttentionBlock,
     SwiGLU,
     TransformerBlock,
+    TransformerBlockCache,
     apply_linear,
 )
 from xax.core.conf import field
-from xax.utils.jax import jit as xax_jit
+from xax.utils.jax import filter_jit as xax_filter_jit, jit as xax_jit
 
 try:
     from huggingface_hub import snapshot_download
@@ -211,133 +211,49 @@ class LLM(eqx.Module):
         logits_btv = apply_linear(x_btd, self.lm_head)
         return logits_btv
 
-    def init_cache(self, max_seq_len: int, dtype: jnp.dtype = jnp.bfloat16) -> list[AttentionCache]:
+    def init_cache(self, max_len: int | None = None, dtype: jnp.dtype = jnp.bfloat16) -> list[TransformerBlockCache]:
         """Initialize KV cache for autoregressive generation.
 
         Args:
-            max_seq_len: Maximum sequence length to cache.
+            max_len: Maximum sequence length to cache.
             dtype: Data type for cache arrays.
 
         Returns:
-            List of AttentionCache dictionaries, one per layer.
+            List of TransformerBlockCache dictionaries, one per layer.
         """
         caches = []
         for block in self.blocks:
-            k_cache = jnp.zeros(
-                (max_seq_len, block.self_attn.num_kv_heads, block.self_attn.head_dim),
-                dtype=dtype,
-            )
-            v_cache = jnp.zeros(
-                (max_seq_len, block.self_attn.num_kv_heads, block.self_attn.head_dim),
-                dtype=dtype,
-            )
-            caches.append({"k": k_cache, "v": v_cache, "position": 0})
+            caches.append(block.init_cache(max_len=max_len, dtype=dtype))
         return caches
 
     def forward_with_cache(
         self,
-        token: Array,
-        caches: list[AttentionCache],
-        position: Array | int,
-    ) -> tuple[Array, list[AttentionCache]]:
+        tokens_t: Array,
+        caches: list[TransformerBlockCache],
+    ) -> tuple[Array, list[TransformerBlockCache]]:
         """Forward pass for a single token using KV cache.
 
         Args:
-            token: Single token, shape () or (1,).
+            tokens_t: Tokens, shape (seq_len,).
             caches: List of KV caches, one per layer.
-            position: Current position in the sequence (can be traced).
 
         Returns:
-            Tuple of (logits for next token, updated caches).
+            Tuple of (logits for next tokens, updated caches).
         """
-        # Ensure token is scalar
-        token = token.reshape(())
-        position = jnp.asarray(position, dtype=jnp.int32)
+        # Embed token
+        x_td = self.embed.weight[tokens_t]
 
-        # Embed token - add batch dim for module compatibility
-        x_1d = self.embed.weight[token][None, :]  # Shape: (1, embed_dim)
-
-        # Get max cache length for masking (static)
-        max_cache_len = caches[0]["k"].shape[0]
-
+        # Process through transformer blocks
         updated_caches = []
         for block, cache in zip(self.blocks, caches, strict=True):
-            attn = block.self_attn
-
-            # Pre-norm for attention (modules expect 2D input)
-            normed_1d = block.attn_norm(x_1d)
-
-            # Project to Q, K, V from normed input
-            q_1qd = apply_linear(normed_1d, attn.q_proj)  # (1, q_heads * head_dim)
-            k_1kd = apply_linear(normed_1d, attn.k_proj)  # (1, kv_heads * head_dim)
-            v_1kd = apply_linear(normed_1d, attn.v_proj)  # (1, kv_heads * head_dim)
-
-            # Reshape to (num_heads, head_dim) - drop batch dim
-            q_hd = q_1qd[0].reshape(attn.num_heads, attn.head_dim)
-            k_hd = k_1kd[0].reshape(attn.num_kv_heads, attn.head_dim)
-            v_hd = v_1kd[0].reshape(attn.num_kv_heads, attn.head_dim)
-
-            # QK-Norm (expects 2D input)
-            if attn.q_norm is not None:
-                q_hd = attn.q_norm(q_hd[None, :])[0]
-            if attn.k_norm is not None:
-                k_hd = attn.k_norm(k_hd[None, :])[0]
-
-            # RoPE - use dynamic position
-            if attn.rotary_emb is not None:
-                pos_arr = position.reshape(1)
-                q_hd = attn.rotary_emb.apply_rotary_embeddings(q_hd[None, :, :], positions=pos_arr)[0]
-                k_hd = attn.rotary_emb.apply_rotary_embeddings(k_hd[None, :, :], positions=pos_arr)[0]
-
-            # Update cache at current position
-            k_cache = cache["k"].at[position].set(k_hd)
-            v_cache = cache["v"].at[position].set(v_hd)
-            updated_caches.append({"k": k_cache, "v": v_cache, "position": position + 1})
-
-            # Attention computation over full cache with masking
-            num_groups = attn.num_heads // attn.num_kv_heads
-
-            # GQA: expand Q to match KV head structure
-            # q_hd: (num_heads, head_dim) -> (kv_heads, groups, head_dim)
-            q_gkd = q_hd.reshape(attn.num_kv_heads, num_groups, attn.head_dim)
-
-            # Use full cache and mask invalid positions
-            # k_cache: (max_len, kv_heads, head_dim)
-            # Compute scores over all positions
-            scores = jnp.einsum("kgd,skd->kgs", q_gkd, k_cache)
-            scores = scores / jnp.sqrt(attn.head_dim).astype(scores.dtype)
-
-            # Create mask for valid positions (0 to position inclusive)
-            # positions > current position should be masked out
-            pos_indices = jnp.arange(max_cache_len)
-            mask = pos_indices <= position  # Shape: (max_len,)
-            mask = mask[None, None, :]  # Shape: (1, 1, max_len) for broadcasting
-
-            # Apply mask: set invalid positions to -inf before softmax
-            scores = jnp.where(mask, scores, jnp.finfo(scores.dtype).min)
-
-            # Softmax
-            attn_weights = jax.nn.softmax(scores, axis=-1)
-
-            # Context: (kv_heads, groups, head_dim)
-            ctx_kgd = jnp.einsum("kgs,skd->kgd", attn_weights, v_cache)
-            ctx_d = ctx_kgd.reshape(-1)
-
-            # Output projection and residual (add back batch dim)
-            attn_out = apply_linear(ctx_d[None, :], attn.output_proj)  # (1, embed_dim)
-            x_1d = x_1d + attn_out
-
-            # MLP with pre-norm (modules expect 2D input)
-            mlp_normed = block.mlp_norm(x_1d)
-            mlp_out = block.feed_forward(mlp_normed)
-            x_1d = x_1d + mlp_out
+            x_td, updated_cache = block.forward(x_td, cache=cache)
+            updated_caches.append(updated_cache)
 
         # Final norm and lm_head
-        x_1d = self.norm(x_1d)
-        logits_1v = apply_linear(x_1d, self.lm_head)
+        x_td = self.norm(x_td)
+        logits_tv = apply_linear(x_td, self.lm_head)
 
-        # Remove batch dimension for output
-        return logits_1v[0], updated_caches
+        return logits_tv, updated_caches
 
 
 class LLMRepo(Enum):
@@ -952,7 +868,7 @@ def llm_generate(
     top_p: float = 0.9,
 ) -> list[int]:
     """Sampling-based decoding for quick sanity checks (non-JIT version)."""
-    result = llm_generate_jit(
+    tokens_arr, final_len = llm_generate_jit(
         model,
         jnp.array(tokens, dtype=jnp.int32),
         eos_id if eos_id is not None else -1,
@@ -960,56 +876,52 @@ def llm_generate(
         temperature,
         top_p,
         jax.random.key(0),
-        use_cache=True,
-        return_cache=False,
     )
-    tokens_arr, final_len = result[0], result[1]
-    # Trim to actual generated length (excluding padding after EOS)
     return tokens_arr[: int(final_len)].tolist()
 
 
+@xax_filter_jit(donate="all")
 def _sample_next_token(
-    logits_v: Array,
+    logits_tv: Array,
     temperature: float,
     top_p: float,
     key: Array,
-) -> tuple[Array, Array]:
+    num_samples: int = 1,
+) -> Array:
     """Sample next token from logits using temperature and top-p sampling.
 
     Args:
-        logits_v: Logits for vocabulary, shape (vocab_size,).
+        logits_tv: Logits for vocabulary, shape (tsz, vocab_size).
         temperature: Sampling temperature (>0).
         top_p: Top-p (nucleus) sampling probability.
         key: PRNG key for sampling.
+        num_samples: The number of samples to draw from the logits.
 
     Returns:
-        Tuple of (next_token, new_key).
+        Next token, shape (tsz, num_samples).
     """
-    logits = logits_v.astype(jnp.float32)
+    logits_tv = logits_tv.astype(jnp.float32)
 
     # Temperature scaling
-    logits = jnp.where(temperature > 0, logits / temperature, logits)
+    logits_tv = jnp.where(temperature > 0, logits_tv / temperature, logits_tv)
 
     # Top-p nucleus sampling
-    sort_idx = jnp.argsort(logits)[::-1]
-    sort_logits = logits[sort_idx]
-    sort_probs = jax.nn.softmax(sort_logits)
-    cum_probs = jnp.cumsum(sort_probs)
-    mask = cum_probs > top_p
-    mask = mask.at[0].set(False)
-    masked_logits = jnp.where(mask, -jnp.inf, sort_logits)
+    sort_idx_tv = jnp.argsort(logits_tv, axis=-1, descending=True)
+    sort_logits_tv = jnp.take_along_axis(logits_tv, sort_idx_tv, axis=-1)
+    sort_probs_tv = jax.nn.softmax(sort_logits_tv, axis=-1)
+    cum_probs_tv = jnp.cumsum(sort_probs_tv, axis=-1)
+    mask_tv = cum_probs_tv > top_p
+    mask_tv = mask_tv.at[..., 0].set(False)
+    masked_logits_tv = jnp.where(mask_tv, -jnp.inf, sort_logits_tv)
 
-    key, subkey = jax.random.split(key)
-    sampled_idx = jax.random.categorical(subkey, masked_logits)
-    next_token = sort_idx[sampled_idx]
+    shape = masked_logits_tv.shape[:-1] + (num_samples,)
+    sampled_idx_tn = jax.random.categorical(key, masked_logits_tv, axis=-1, shape=shape)
+    next_token_tn = jnp.take_along_axis(sort_idx_tv, sampled_idx_tn, axis=-1)
 
-    return next_token, key
+    return next_token_tn
 
 
-@xax_jit(
-    static_argnames=["eos_id", "max_new_tokens", "temperature", "top_p", "return_cache"],
-    donate_argnames=["tokens_t", "key", "cache"],
-)
+@xax_filter_jit()
 def llm_generate_jit(
     model: LLM,
     tokens_t: Array,
@@ -1018,10 +930,7 @@ def llm_generate_jit(
     temperature: float,
     top_p: float,
     key: Array,
-    *,
-    cache: list[AttentionCache] | None = None,
-    return_cache: bool = False,
-) -> tuple[Array, Array] | tuple[Array, Array, list[AttentionCache]]:
+) -> tuple[Array, Array]:
     initial_len = tokens_t.shape[0]
     max_len = initial_len + max_new_tokens
 
@@ -1029,112 +938,6 @@ def llm_generate_jit(
     padded_tokens = jnp.zeros(max_len, dtype=jnp.int32)
     padded_tokens = padded_tokens.at[:initial_len].set(tokens_t)
 
-    if cache is None and return_cache:
-        cache = model.init_cache(max_len, dtype=model.embed.weight.dtype)
-
-    if cache is not None:
-        return _llm_generate_jit_cached(
-            model,
-            padded_tokens,
-            tokens_t,
-            initial_len,
-            max_len,
-            eos_id,
-            temperature,
-            top_p,
-            key,
-            return_cache,
-        )
-    else:
-        return _llm_generate_jit_no_cache(
-            model,
-            padded_tokens,
-            initial_len,
-            max_len,
-            eos_id,
-            temperature,
-            top_p,
-            key,
-        )
-
-
-def _llm_generate_jit_cached(
-    model: LLM,
-    padded_tokens: Array,
-    tokens_t: Array,
-    initial_len: int,
-    max_len: int,
-    eos_id: int,
-    temperature: float,
-    top_p: float,
-    key: Array,
-    return_cache: bool,
-) -> tuple[Array, Array] | tuple[Array, Array, list[AttentionCache]]:
-    """KV-cached generation implementation."""
-    # Initialize KV cache using model's dtype
-    model_dtype = model.embed.weight.dtype
-    caches = model.init_cache(max_len, dtype=model_dtype)
-
-    # Prefill: process the initial prompt to fill the cache
-    vocab_size = model.config.vocab_size
-
-    def prefill_step(
-        carry: tuple[Array, list[AttentionCache], Array],
-        token: Array,
-    ) -> tuple[tuple[Array, list[AttentionCache], Array], None]:
-        pos, caches, _ = carry
-        logits, new_caches = model.forward_with_cache(token, caches, pos)
-        return (pos + 1, new_caches, logits), None
-
-    # Dummy initial logits - match model's dtype
-    dummy_logits = jnp.zeros(vocab_size, dtype=model_dtype)
-    (_, caches, logits_v), _ = jax.lax.scan(
-        prefill_step,
-        (jnp.int32(0), caches, dummy_logits),
-        tokens_t,
-    )
-
-    # Sample first token
-    first_token, key = _sample_next_token(logits_v, temperature, top_p, key)
-    padded_tokens = padded_tokens.at[initial_len].set(first_token)
-    first_done = jnp.bool_((eos_id >= 0) & (first_token == eos_id))
-
-    # State for while loop
-    init_state = (padded_tokens, jnp.int32(initial_len + 1), caches, key, first_done)
-
-    def cond_fn(state: tuple[Array, Array, list[AttentionCache], Array, Array]) -> Array:
-        _, cur_pos, _, _, done = state
-        return (cur_pos < max_len) & ~done
-
-    def body_fn(
-        state: tuple[Array, Array, list[AttentionCache], Array, Array],
-    ) -> tuple[Array, Array, list[AttentionCache], Array, Array]:
-        tokens, cur_pos, caches, key, _ = state
-        prev_token = tokens[cur_pos - 1]
-        logits_v, new_caches = model.forward_with_cache(prev_token, caches, cur_pos - 1)
-        next_token, new_key = _sample_next_token(logits_v, temperature, top_p, key)
-        new_tokens = tokens.at[cur_pos].set(next_token)
-        done = jnp.bool_((eos_id >= 0) & (next_token == eos_id))
-        return (new_tokens, cur_pos + 1, new_caches, new_key, done)
-
-    final_tokens, final_pos, final_caches, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_state)
-
-    if return_cache:
-        return final_tokens, final_pos, final_caches
-    return final_tokens, final_pos
-
-
-def _llm_generate_jit_no_cache(
-    model: LLM,
-    padded_tokens: Array,
-    initial_len: int,
-    max_len: int,
-    eos_id: int,
-    temperature: float,
-    top_p: float,
-    key: Array,
-) -> tuple[Array, Array]:
-    """Non-cached generation implementation (O(n²) but simpler)."""
     init_state = (padded_tokens, jnp.int32(initial_len), key, jnp.bool_(False))
 
     def cond_fn(state: tuple[Array, Array, Array, Array]) -> Array:
@@ -1146,14 +949,16 @@ def _llm_generate_jit_no_cache(
 
         # Forward pass on full buffer - recompute everything each step
         tokens_bt = tokens[None, :]
-        logits_btv = model(tokens_bt, key=key, inference=True)
+        key, subkey = jax.random.split(key)
+        logits_btv = model(tokens_bt, key=subkey, inference=True)
         logits = logits_btv[0, cur_pos - 1, :]
 
-        next_token, new_key = _sample_next_token(logits, temperature, top_p, key)
+        key, subkey = jax.random.split(key)
+        next_token = _sample_next_token(logits, temperature, top_p, subkey, num_samples=1)[..., 0]
         new_tokens = tokens.at[cur_pos].set(next_token)
         done = jnp.bool_((eos_id >= 0) & (next_token == eos_id))
 
-        return (new_tokens, cur_pos + 1, new_key, done)
+        return (new_tokens, cur_pos + 1, key, done)
 
     final_tokens, final_pos, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_state)
     return final_tokens, final_pos
@@ -1188,6 +993,7 @@ def llm_generate_stream(
     """
     if key is None:
         key = jax.random.key(0)
+    tokens_t = jnp.array(tokens, dtype=jnp.int32)
 
     initial_len = len(tokens)
     max_len = initial_len + max_new_tokens
@@ -1196,15 +1002,18 @@ def llm_generate_stream(
     model_dtype = model.embed.weight.dtype
     caches = model.init_cache(max_len, dtype=model_dtype)
 
-    # Prefill: process the initial prompt to fill the cache
-    for pos, token in enumerate(tokens):
-        token_arr = jnp.array(token, dtype=jnp.int32)
-        logits_v, caches = model.forward_with_cache(token_arr, caches, pos)
+    @xax_jit(donate_argnames=["caches"])
+    def step(tokens_t: Array, caches: list[TransformerBlockCache]) -> tuple[Array, list[TransformerBlockCache]]:
+        return model.forward_with_cache(tokens_t, caches)
+
+    logits_tv, caches = step(tokens_t, caches)
+    logits_1v = logits_tv[..., -1:, :]
 
     # logits_v now contains logits for predicting the next token after the prompt
     # Sample first token
-    next_token, key = _sample_next_token(logits_v, temperature, top_p, key)
-    next_token_int = int(next_token)
+    key, subkey = jax.random.split(key)
+    next_token_1 = _sample_next_token(logits_1v, temperature, top_p, subkey, num_samples=1)[..., 0]
+    next_token_int = int(next_token_1.item())
 
     # Check EOS
     if eos_id is not None and next_token_int == eos_id:
@@ -1213,15 +1022,14 @@ def llm_generate_stream(
     yield next_token_int
 
     # Continue generating
-    cur_pos = initial_len
     for _ in range(max_new_tokens - 1):
         # Forward with cache
-        logits_v, caches = model.forward_with_cache(next_token, caches, cur_pos)
-        cur_pos += 1
+        logits_1v, caches = step(next_token_1, caches)
 
         # Sample next token
-        next_token, key = _sample_next_token(logits_v, temperature, top_p, key)
-        next_token_int = int(next_token)
+        key, subkey = jax.random.split(key)
+        next_token_1 = _sample_next_token(logits_1v, temperature, top_p, subkey)[..., 0]
+        next_token_int = int(next_token_1.item())
 
         # Check EOS
         if eos_id is not None and next_token_int == eos_id:
