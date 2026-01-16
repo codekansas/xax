@@ -26,6 +26,16 @@ from jaxtyping import Array, PRNGKeyArray
 
 from xax.arch.attention import RotaryEmbedding
 
+try:
+    from huggingface_hub import snapshot_download
+except ModuleNotFoundError as e:
+    raise ModuleNotFoundError("Please install huggingface_hub: pip install huggingface-hub") from e
+
+try:
+    from safetensors import safe_open
+except ModuleNotFoundError as e:
+    raise ModuleNotFoundError("Please install safetensors: pip install safetensors") from e
+
 logger = logging.getLogger(__name__)
 
 
@@ -61,7 +71,8 @@ class MimiConfig:
     codebook_dim: int = field(default=256)
     num_quantizers: int = field(default=32)
     num_semantic_quantizers: int = field(default=1)
-    upsample_groups: int = field(default=1)
+    upsample_groups: int = field(default=512)
+    use_conv_shortcut: bool = field(default=False)
 
     # Transformer parameters
     num_hidden_layers: int = field(default=8)
@@ -76,7 +87,7 @@ class MimiConfig:
 
     # Frame rates
     frame_rate: float = field(default=12.5)
-    encodec_frame_rate: float = field(default=75.0)
+    encodec_frame_rate: float = field(default=25.0)  # HF default is 25
 
     @property
     def num_codebooks(self) -> int:
@@ -86,10 +97,6 @@ class MimiConfig:
     def encoder_frame_rate(self) -> float:
         hop_length = math.prod(self.upsampling_ratios)
         return self.sampling_rate / hop_length
-
-
-# Default Mimi 1.5B configuration
-MIMI_DEFAULT_CONFIG = MimiConfig()
 
 
 class MimiLayerScale(eqx.Module):
@@ -278,9 +285,11 @@ class MimiConvTranspose1d(eqx.Module):
         x_1ct = x_ct[None, :, :]
 
         # Transposed convolution
+        # Note: JAX conv_transpose requires kernel flipped to match PyTorch ConvTranspose1d
+        weight_flipped = self.weight_oik[:, :, ::-1]
         out_1ot = jax.lax.conv_transpose(
             x_1ct,
-            self.weight_oik,
+            weight_flipped,
             strides=(self.stride,),
             padding="VALID",
             dimension_numbers=("NCH", "IOH", "NCH"),
@@ -399,10 +408,12 @@ class MimiEncoder(eqx.Module):
         key_idx += 1
 
         # Downsampling blocks
+        # Encoder uses reversed upsampling_ratios (from smallest to largest ratio)
         blocks = []
         in_channels = config.num_filters
+        encoder_ratios = config.upsampling_ratios[::-1]
 
-        for _idx, ratio in enumerate(config.upsampling_ratios):
+        for _idx, ratio in enumerate(encoder_ratios):
             out_channels = in_channels * 2
 
             # Residual layers with increasing dilation
@@ -494,21 +505,22 @@ class MimiDecoder(eqx.Module):
         channels = channels[::-1]  # Reverse for decoder
 
         # Initial convolution from hidden size
+        # Note: decoder init_conv uses kernel_size (7), not last_kernel_size (3)
         init_conv = MimiConv1d.build(
             config.hidden_size,
             channels[0],
-            config.last_kernel_size,
+            config.kernel_size,
             key=keys[key_idx],
             causal=config.use_causal_conv,
             pad_mode=config.pad_mode,
         )
         key_idx += 1
 
-        # Upsampling blocks (reverse order of encoder)
+        # Upsampling blocks - use upsampling_ratios directly (largest to smallest)
         blocks = []
-        ratios = config.upsampling_ratios[::-1]
+        decoder_ratios = config.upsampling_ratios  # (8, 6, 5, 4)
 
-        for idx, ratio in enumerate(ratios):
+        for idx, ratio in enumerate(decoder_ratios):
             in_channels = channels[idx]
             out_channels = channels[idx + 1]
 
@@ -544,10 +556,11 @@ class MimiDecoder(eqx.Module):
             blocks.append((up_conv, tuple(residual_layers)))
 
         # Final convolution to audio channels
+        # Note: decoder final_conv uses last_kernel_size (3), not kernel_size (7)
         final_conv = MimiConv1d.build(
             channels[-1],
             config.audio_channels,
-            config.kernel_size,
+            config.last_kernel_size,
             key=keys[key_idx],
             causal=config.use_causal_conv,
             pad_mode=config.pad_mode,
@@ -658,66 +671,51 @@ class MimiEuclideanCodebook(eqx.Module):
         return quantized_td, indices_t
 
 
-class MimiVectorQuantization(eqx.Module):
-    """Vector quantization with projection layers."""
+class MimiConv1dProj(eqx.Module):
+    """1D convolution with kernel_size=1 used for projection in quantizer."""
 
-    input_proj: eqx.nn.Linear
-    output_proj: eqx.nn.Linear
-    codebook: MimiEuclideanCodebook
+    weight_oik: Array  # (out_channels, in_channels, 1)
 
     @classmethod
-    def build(
-        cls,
-        input_dim: int,
-        codebook_size: int,
-        codebook_dim: int,
-        *,
-        key: PRNGKeyArray,
-    ) -> "MimiVectorQuantization":
-        k1, k2, k3 = jax.random.split(key, 3)
+    def build(cls, in_channels: int, out_channels: int, *, key: PRNGKeyArray) -> "MimiConv1dProj":
+        fan_in = in_channels
+        std = 1.0 / math.sqrt(fan_in)
+        weight_oik = jax.random.uniform(key, (out_channels, in_channels, 1), minval=-std, maxval=std)
+        return cls(weight_oik=weight_oik)
 
-        input_proj = eqx.nn.Linear(input_dim, codebook_dim, use_bias=False, key=k1)
-        output_proj = eqx.nn.Linear(codebook_dim, input_dim, use_bias=False, key=k2)
-        codebook = MimiEuclideanCodebook.build(codebook_size, codebook_dim, key=k3)
+    def __call__(self, x_td: Array) -> Array:
+        """Apply 1x1 convolution.
 
-        return cls(
-            input_proj=input_proj,
-            output_proj=output_proj,
-            codebook=codebook,
+        Args:
+            x_td: Input of shape (time, in_channels)
+
+        Returns:
+            Output of shape (time, out_channels)
+        """
+        # Transpose to (in_channels, time) for conv
+        x_ct = x_td.T
+        x_1ct = x_ct[None, :, :]
+        out_1ot = jax.lax.conv_general_dilated(
+            x_1ct,
+            self.weight_oik,
+            window_strides=(1,),
+            padding="VALID",
+            dimension_numbers=("NCH", "OIH", "NCH"),
         )
-
-    def encode(self, x_td: Array) -> Array:
-        """Encode to codebook indices.
-
-        Args:
-            x_td: Input of shape (time, input_dim)
-
-        Returns:
-            Indices of shape (time,)
-        """
-        x_proj_td = jax.vmap(self.input_proj)(x_td)
-        return self.codebook.quantize(x_proj_td)
-
-    def decode(self, indices_t: Array) -> Array:
-        """Decode from codebook indices.
-
-        Args:
-            indices_t: Indices of shape (time,)
-
-        Returns:
-            Output of shape (time, input_dim)
-        """
-        quantized_td = self.codebook.decode(indices_t)
-        return jax.vmap(self.output_proj)(quantized_td)
+        out_ot = out_1ot[0]
+        return out_ot.T  # Back to (time, out_channels)
 
 
 class MimiResidualVectorQuantizer(eqx.Module):
     """Residual Vector Quantization using multiple codebooks.
 
+    Has shared input/output projections and multiple codebook layers.
     Each successive quantizer operates on the residual from previous quantizers.
     """
 
-    layers: tuple[MimiVectorQuantization, ...]
+    input_proj: MimiConv1dProj
+    output_proj: MimiConv1dProj
+    layers: tuple[MimiEuclideanCodebook, ...]
     num_quantizers: int = eqx.field(static=True)
 
     @classmethod
@@ -730,9 +728,20 @@ class MimiResidualVectorQuantizer(eqx.Module):
         *,
         key: PRNGKeyArray,
     ) -> "MimiResidualVectorQuantizer":
-        keys = jax.random.split(key, num_quantizers)
-        layers = tuple(MimiVectorQuantization.build(input_dim, codebook_size, codebook_dim, key=k) for k in keys)
-        return cls(layers=layers, num_quantizers=num_quantizers)
+        keys = jax.random.split(key, num_quantizers + 2)
+
+        input_proj = MimiConv1dProj.build(input_dim, codebook_dim, key=keys[0])
+        output_proj = MimiConv1dProj.build(codebook_dim, input_dim, key=keys[1])
+        layers = tuple(
+            MimiEuclideanCodebook.build(codebook_size, codebook_dim, key=keys[i + 2]) for i in range(num_quantizers)
+        )
+
+        return cls(
+            input_proj=input_proj,
+            output_proj=output_proj,
+            layers=layers,
+            num_quantizers=num_quantizers,
+        )
 
     def encode(self, x_td: Array, num_quantizers: int | None = None) -> Array:
         """Encode using residual quantization.
@@ -747,15 +756,18 @@ class MimiResidualVectorQuantizer(eqx.Module):
         if num_quantizers is None:
             num_quantizers = self.num_quantizers
 
-        residual_td = x_td
+        # Project to codebook dimension
+        x_proj_td = self.input_proj(x_td)
+
+        residual_td = x_proj_td
         all_indices = []
 
-        for layer in self.layers[:num_quantizers]:
-            indices_t = layer.encode(residual_td)
+        for codebook in self.layers[:num_quantizers]:
+            indices_t = codebook.quantize(residual_td)
             all_indices.append(indices_t)
 
             # Update residual
-            quantized_td = layer.decode(indices_t)
+            quantized_td = codebook.decode(indices_t)
             residual_td = residual_td - quantized_td
 
         return jnp.stack(all_indices, axis=0)  # (num_quantizers, time)
@@ -779,7 +791,8 @@ class MimiResidualVectorQuantizer(eqx.Module):
             else:
                 output_td = output_td + quantized_td
 
-        return output_td
+        # Project back to input dimension
+        return self.output_proj(output_td)
 
 
 class MimiSplitResidualVectorQuantizer(eqx.Module):
@@ -824,6 +837,11 @@ class MimiSplitResidualVectorQuantizer(eqx.Module):
     ) -> Array:
         """Encode using split quantization.
 
+        Note: Both semantic and acoustic RVQs receive the same input. Each RVQ
+        internally computes residuals layer-by-layer. The semantic and acoustic
+        outputs are added during decoding (they represent different "subspaces"
+        of the signal due to different input/output projections).
+
         Args:
             x_td: Input of shape (time, input_dim)
             num_quantizers: Total number of quantizers to use
@@ -841,13 +859,10 @@ class MimiSplitResidualVectorQuantizer(eqx.Module):
         if num_quantizers <= self.num_semantic_quantizers:
             return semantic_codes_qt
 
-        # Compute semantic residual for acoustic quantization
-        semantic_output_td = self.semantic_rvq.decode(semantic_codes_qt)
-        residual_td = x_td - semantic_output_td
-
-        # Acoustic quantization
+        # Acoustic quantization - uses same input, not residual
+        # (each RVQ has its own input/output projections)
         num_acoustic = num_quantizers - self.num_semantic_quantizers
-        acoustic_codes_qt = self.acoustic_rvq.encode(residual_td, num_acoustic)
+        acoustic_codes_qt = self.acoustic_rvq.encode(x_td, num_acoustic)
 
         return jnp.concatenate([semantic_codes_qt, acoustic_codes_qt], axis=0)
 
@@ -1077,20 +1092,20 @@ class MimiTransformerLayer(eqx.Module):
 
 
 class MimiTransformer(eqx.Module):
-    """Transformer stack for Mimi."""
+    """Transformer stack for Mimi.
+
+    Note: HF Mimi does NOT have a final layer norm, unlike some other transformers.
+    """
 
     layers: tuple[MimiTransformerLayer, ...]
-    layer_norm: eqx.nn.LayerNorm
     num_layers: int = eqx.field(static=True)
 
     @classmethod
     def build(cls, config: MimiConfig, *, key: PRNGKeyArray) -> "MimiTransformer":
         keys = jax.random.split(key, config.num_hidden_layers)
         layers = tuple(MimiTransformerLayer.build(config, key=k) for k in keys)
-        layer_norm = eqx.nn.LayerNorm(config.hidden_size)
         return cls(
             layers=layers,
-            layer_norm=layer_norm,
             num_layers=config.num_hidden_layers,
         )
 
@@ -1105,8 +1120,136 @@ class MimiTransformer(eqx.Module):
         """
         for layer in self.layers:
             x_td = layer(x_td)
-        x_td = jax.vmap(self.layer_norm)(x_td)
         return x_td
+
+
+class MimiDownsampleConv(eqx.Module):
+    """Strided 1D convolution for downsampling with causal padding.
+
+    HF uses kernel_size = 2 * stride, with stride = int(encodec_frame_rate / frame_rate).
+    Matches HuggingFace's dynamic padding for proper frame alignment.
+    """
+
+    weight_oik: Array  # (out_channels, in_channels, kernel_size)
+    stride: int = eqx.field(static=True)
+    kernel_size: int = eqx.field(static=True)
+    padding_total: int = eqx.field(static=True)
+
+    @classmethod
+    def build(cls, channels: int, stride: int, *, key: PRNGKeyArray) -> "MimiDownsampleConv":
+        # HF uses kernel_size = 2 * stride
+        kernel_size = 2 * stride
+        fan_in = channels * kernel_size
+        std = 1.0 / math.sqrt(fan_in)
+        weight_oik = jax.random.uniform(key, (channels, channels, kernel_size), minval=-std, maxval=std)
+        # padding_total for "same" output size behavior
+        padding_total = kernel_size - stride
+        return cls(weight_oik=weight_oik, stride=stride, kernel_size=kernel_size, padding_total=padding_total)
+
+    def _get_extra_padding(self, length: int) -> int:
+        """Calculate extra padding needed for proper frame alignment (matches HF)."""
+        n_frames = (length - self.kernel_size + self.padding_total) / self.stride + 1
+        n_frames = math.ceil(n_frames) - 1
+        ideal_length = n_frames * self.stride + self.kernel_size - self.padding_total
+        return max(0, ideal_length - length)
+
+    def __call__(self, x_td: Array) -> Array:
+        """Apply strided convolution for downsampling.
+
+        Args:
+            x_td: Input of shape (time, channels)
+
+        Returns:
+            Output of shape (ceil(time / stride), channels)
+        """
+        tsz = x_td.shape[0]
+
+        # Calculate extra padding for frame alignment (HF's _get_extra_padding_for_conv1d)
+        extra_padding = self._get_extra_padding(tsz)
+
+        # Causal padding: all on left + extra on right
+        pad_left = self.padding_total
+        pad_right = extra_padding
+
+        x_ct = x_td.T  # (channels, time)
+        if pad_left > 0 or pad_right > 0:
+            # HF uses "replicate" padding for downsample
+            x_ct = jnp.pad(x_ct, ((0, 0), (pad_left, pad_right)), mode="edge")
+
+        x_1ct = x_ct[None, :, :]
+        out_1ot = jax.lax.conv_general_dilated(
+            x_1ct,
+            self.weight_oik,
+            window_strides=(self.stride,),
+            padding="VALID",
+            dimension_numbers=("NCH", "OIH", "NCH"),
+        )
+        return out_1ot[0].T
+
+
+class MimiUpsampleConv(eqx.Module):
+    """Transposed 1D convolution for upsampling using depthwise convolution.
+
+    HF uses kernel_size = 2 * stride, with stride = int(encodec_frame_rate / frame_rate).
+    Includes causal trimming to match HuggingFace output length.
+    """
+
+    weight_oik: Array  # (channels, 1, kernel_size)
+    stride: int = eqx.field(static=True)
+    kernel_size: int = eqx.field(static=True)
+    channels: int = eqx.field(static=True)
+    padding_right: int = eqx.field(static=True)
+
+    @classmethod
+    def build(cls, channels: int, stride: int, *, key: PRNGKeyArray) -> "MimiUpsampleConv":
+        # HF uses kernel_size = 2 * stride
+        kernel_size = 2 * stride
+        fan_in = kernel_size
+        std = 1.0 / math.sqrt(fan_in)
+        weight_oik = jax.random.uniform(key, (channels, 1, kernel_size), minval=-std, maxval=std)
+        # Causal trimming: trim_right_ratio=1.0 means all padding trimmed from right
+        padding_total = kernel_size - stride
+        padding_right = math.ceil(padding_total * 1.0)  # trim_right_ratio=1.0
+        return cls(
+            weight_oik=weight_oik,
+            stride=stride,
+            kernel_size=kernel_size,
+            channels=channels,
+            padding_right=padding_right,
+        )
+
+    def __call__(self, x_td: Array) -> Array:
+        """Apply transposed convolution for upsampling.
+
+        Args:
+            x_td: Input of shape (time, channels)
+
+        Returns:
+            Output of shape (time * stride, channels)
+        """
+
+        # Depthwise transpose conv: each channel independently
+        def conv_single_channel(x_t: Array, w_k: Array) -> Array:
+            x_11t = x_t[None, None, :]  # (1, 1, time)
+            # Note: JAX conv_transpose requires kernel flipped to match PyTorch ConvTranspose1d
+            w_11k = w_k[None, None, ::-1]  # (1, 1, kernel) flipped
+            out_11t = jax.lax.conv_transpose(
+                x_11t,
+                w_11k,
+                strides=(self.stride,),
+                padding="VALID",
+                dimension_numbers=("NCH", "OIH", "NCH"),
+            )
+            return out_11t[0, 0]  # (time',)
+
+        # x_td.T is (channels, time), weight_oik[:, 0, :] is (channels, kernel)
+        out_ct = jax.vmap(conv_single_channel)(x_td.T, self.weight_oik[:, 0, :])  # (channels, time')
+
+        # Apply causal trimming (trim from right side)
+        if self.padding_right > 0:
+            out_ct = out_ct[:, : -self.padding_right]
+
+        return out_ct.T
 
 
 class MimiModel(eqx.Module):
@@ -1127,8 +1270,8 @@ class MimiModel(eqx.Module):
     encoder_transformer: MimiTransformer
     decoder_transformer: MimiTransformer
     quantizer: MimiSplitResidualVectorQuantizer
-    downsample: eqx.nn.Linear | None
-    upsample: eqx.nn.Linear | None
+    downsample: MimiDownsampleConv | None
+    upsample: MimiUpsampleConv | None
     config: MimiConfig
 
     @classmethod
@@ -1150,23 +1293,14 @@ class MimiModel(eqx.Module):
         )
 
         # Compute frame rate ratio for down/up sampling
-        encoder_frame_rate = config.encoder_frame_rate
-        frame_rate = config.frame_rate
-        ratio = encoder_frame_rate / frame_rate
+        # HF formula: stride = int(encodec_frame_rate / frame_rate)
+        # kernel_size = 2 * stride is handled in the conv modules
+        downsample_stride = int(config.encodec_frame_rate / config.frame_rate)
 
-        if ratio != 1.0:
-            downsample_factor = int(ratio)
+        if config.frame_rate != config.encodec_frame_rate:
             k5, k6 = jax.random.split(keys[5])
-            downsample = eqx.nn.Linear(
-                config.hidden_size * downsample_factor,
-                config.hidden_size,
-                key=k5,
-            )
-            upsample = eqx.nn.Linear(
-                config.hidden_size,
-                config.hidden_size * downsample_factor,
-                key=k6,
-            )
+            downsample = MimiDownsampleConv.build(config.hidden_size, downsample_stride, key=k5)
+            upsample = MimiUpsampleConv.build(config.hidden_size, downsample_stride, key=k6)
         else:
             downsample = None
             upsample = None
@@ -1186,35 +1320,13 @@ class MimiModel(eqx.Module):
         """Downsample hidden states to match frame rate."""
         if self.downsample is None:
             return x_td
-
-        # Compute downsample factor from frame rates
-        ratio = int(self.config.encoder_frame_rate / self.config.frame_rate)
-        tsz, dim = x_td.shape
-
-        # Pad to multiple of ratio
-        pad_len = (ratio - tsz % ratio) % ratio
-        if pad_len > 0:
-            x_td = jnp.pad(x_td, ((0, pad_len), (0, 0)))
-
-        # Reshape and apply linear
-        new_tsz = (tsz + pad_len) // ratio
-        x_td = x_td.reshape(new_tsz, dim * ratio)
-        x_td = jax.vmap(self.downsample)(x_td)
-
-        return x_td
+        return self.downsample(x_td)
 
     def _upsample(self, x_td: Array) -> Array:
         """Upsample hidden states from frame rate."""
         if self.upsample is None:
             return x_td
-
-        ratio = int(self.config.encoder_frame_rate / self.config.frame_rate)
-        tsz, dim = x_td.shape
-
-        x_td = jax.vmap(self.upsample)(x_td)
-        x_td = x_td.reshape(tsz * ratio, dim)
-
-        return x_td
+        return self.upsample(x_td)
 
     def encode(
         self,
@@ -1289,11 +1401,6 @@ class MimiModel(eqx.Module):
 @functools.lru_cache(maxsize=16)
 def download_mimi_repo(repo_id: str = "kyutai/mimi") -> Path:
     """Download Mimi model from HuggingFace Hub."""
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError as e:
-        raise ImportError("Please install huggingface_hub: pip install huggingface-hub") from e
-
     return Path(snapshot_download(repo_id=repo_id))
 
 
@@ -1324,6 +1431,8 @@ def load_mimi_config(repo_id: str = "kyutai/mimi") -> MimiConfig:
         codebook_dim=cfg.get("codebook_dim", 256),
         num_quantizers=cfg.get("num_quantizers", 32),
         num_semantic_quantizers=cfg.get("num_semantic_quantizers", 1),
+        upsample_groups=cfg.get("upsample_groups", 512),
+        use_conv_shortcut=cfg.get("use_conv_shortcut", False),
         num_hidden_layers=cfg.get("num_hidden_layers", 8),
         num_attention_heads=cfg.get("num_attention_heads", 8),
         head_dim=cfg.get("head_dim", 64),
@@ -1334,7 +1443,7 @@ def load_mimi_config(repo_id: str = "kyutai/mimi") -> MimiConfig:
         layer_scale_initial_scale=cfg.get("layer_scale_initial_scale", 0.01),
         rope_theta=cfg.get("rope_theta", 10000.0),
         frame_rate=cfg.get("frame_rate", 12.5),
-        encodec_frame_rate=cfg.get("encodec_frame_rate", 75.0),
+        encodec_frame_rate=cfg.get("encodec_frame_rate", 25.0),
     )
 
 
@@ -1351,23 +1460,14 @@ def build_pretrained_mimi(
     Returns:
         Loaded MimiModel with pretrained weights
     """
-    try:
-        from safetensors import safe_open
-    except ImportError as e:
-        raise ImportError("Please install safetensors: pip install safetensors") from e
-
     if dtype is None:
         dtype = jnp.float32
 
     config = load_mimi_config(repo_id)
     path = download_mimi_repo(repo_id)
 
-    # Build model shape
-    model = eqx.filter_eval_shape(
-        MimiModel.build,
-        config,
-        key=jax.random.key(0),
-    )
+    # Build model with actual values (not just shapes)
+    model = MimiModel.build(config, key=jax.random.key(0))
 
     # Load weights from safetensors
     safetensor_files = list(path.glob("*.safetensors"))
@@ -1391,47 +1491,237 @@ def _load_weights_into_mimi(
     state: dict[str, np.ndarray],
     dtype: jnp.dtype,
 ) -> MimiModel:
-    """Map HuggingFace weights into Mimi model structure.
-
-    This is a simplified weight loading that attempts to match HuggingFace
-    naming conventions. For production use, you may need to adjust the
-    key mappings based on the specific checkpoint.
-    """
+    """Map HuggingFace weights into Mimi model structure."""
 
     def get_weight(key: str) -> jnp.ndarray | None:
         if key in state:
             return jnp.array(state[key], dtype=dtype)
         return None
 
-    def match_weight(*patterns: str) -> jnp.ndarray | None:
-        for pattern in patterns:
-            for key in state:
-                if pattern in key:
-                    return jnp.array(state[key], dtype=dtype)
-        return None
+    loaded_count = 0
+    total_keys = len(state)
 
-    # Load codebook embeddings
-    for q_idx in range(model.config.num_quantizers):
-        if q_idx < model.config.num_semantic_quantizers:
-            rvq = model.quantizer.semantic_rvq
-            local_idx = q_idx
-        else:
-            rvq = model.quantizer.acoustic_rvq
-            local_idx = q_idx - model.config.num_semantic_quantizers
+    # Helper to set weights using tree_at
+    def set_weight(get_leaf: object, weight: jnp.ndarray) -> None:  # noqa: ANN001
+        nonlocal model, loaded_count
+        model = eqx.tree_at(get_leaf, model, weight)
+        loaded_count += 1
 
-        embed_key = f"quantizer.layers.{q_idx}.codebook.embed"
-        embed = get_weight(embed_key)
-        if embed is not None:
-            layer = rvq.layers[local_idx]
-            model = eqx.tree_at(
-                lambda m: m.quantizer.semantic_rvq.layers[local_idx].codebook.embeddings_kd
-                if q_idx < model.config.num_semantic_quantizers
-                else m.quantizer.acoustic_rvq.layers[local_idx].codebook.embeddings_kd,
-                model,
-                embed,
-            )
+    # Load encoder weights
+    # Encoder structure: init_conv, then blocks of (resnet_layers, down_conv), then final_conv
+    # HF structure: encoder.layers.0 = init_conv, then flat indexing
 
-    logger.info("Loaded Mimi model weights")
+    # encoder.layers.0 = init_conv
+    w = get_weight("encoder.layers.0.conv.weight")
+    b = get_weight("encoder.layers.0.conv.bias")
+    if w is not None:
+        set_weight(lambda m: m.encoder.init_conv.weight_oik, w)
+    if b is not None:
+        set_weight(lambda m: m.encoder.init_conv.bias_o, b)
+
+    # Encoder blocks: layer indices 1, 3, 4, 6, 7, 9, 10, 12 for resnet, 3, 6, 9, 12 for down_conv
+    # Pattern: for each upsampling ratio, there's residual blocks then down conv
+    # HF indices: 1 (resnet), 3 (down), 4 (resnet), 6 (down), 7 (resnet), 9 (down), 10 (resnet), 12 (down), 14 (final)
+    enc_hf_indices = [
+        (1, 3),  # Block 0: resnet at 1, down at 3
+        (4, 6),  # Block 1: resnet at 4, down at 6
+        (7, 9),  # Block 2: resnet at 7, down at 9
+        (10, 12),  # Block 3: resnet at 10, down at 12
+    ]
+
+    for block_idx, (res_idx, down_idx) in enumerate(enc_hf_indices):
+        # Resnet block weights
+        w1 = get_weight(f"encoder.layers.{res_idx}.block.1.conv.weight")
+        b1 = get_weight(f"encoder.layers.{res_idx}.block.1.conv.bias")
+        w2 = get_weight(f"encoder.layers.{res_idx}.block.3.conv.weight")
+        b2 = get_weight(f"encoder.layers.{res_idx}.block.3.conv.bias")
+
+        if w1 is not None:
+            set_weight(lambda m, bi=block_idx: m.encoder.blocks[bi][0][0].conv1.weight_oik, w1)
+        if b1 is not None:
+            set_weight(lambda m, bi=block_idx: m.encoder.blocks[bi][0][0].conv1.bias_o, b1)
+        if w2 is not None:
+            set_weight(lambda m, bi=block_idx: m.encoder.blocks[bi][0][0].conv2.weight_oik, w2)
+        if b2 is not None:
+            set_weight(lambda m, bi=block_idx: m.encoder.blocks[bi][0][0].conv2.bias_o, b2)
+
+        # Down conv weights
+        dw = get_weight(f"encoder.layers.{down_idx}.conv.weight")
+        db = get_weight(f"encoder.layers.{down_idx}.conv.bias")
+        if dw is not None:
+            set_weight(lambda m, bi=block_idx: m.encoder.blocks[bi][1].weight_oik, dw)
+        if db is not None:
+            set_weight(lambda m, bi=block_idx: m.encoder.blocks[bi][1].bias_o, db)
+
+    # encoder.layers.14 = final_conv
+    w = get_weight("encoder.layers.14.conv.weight")
+    b = get_weight("encoder.layers.14.conv.bias")
+    if w is not None:
+        set_weight(lambda m: m.encoder.final_conv.weight_oik, w)
+    if b is not None:
+        set_weight(lambda m: m.encoder.final_conv.bias_o, b)
+
+    # Load decoder weights
+    # decoder.layers.0 = init_conv, then blocks of (up_conv, resnet_layers), then final_conv
+    w = get_weight("decoder.layers.0.conv.weight")
+    b = get_weight("decoder.layers.0.conv.bias")
+    if w is not None:
+        set_weight(lambda m: m.decoder.init_conv.weight_oik, w)
+    if b is not None:
+        set_weight(lambda m: m.decoder.init_conv.bias_o, b)
+
+    # Decoder blocks: up then resnet
+    # HF indices: 2 (up), 3 (resnet), 5 (up), 6 (resnet), 8 (up), 9 (resnet), 11 (up), 12 (resnet), 14 (final)
+    dec_hf_indices = [
+        (2, 3),  # Block 0: up at 2, resnet at 3
+        (5, 6),  # Block 1: up at 5, resnet at 6
+        (8, 9),  # Block 2: up at 8, resnet at 9
+        (11, 12),  # Block 3: up at 11, resnet at 12
+    ]
+
+    for block_idx, (up_idx, res_idx) in enumerate(dec_hf_indices):
+        # Up conv weights (transposed conv)
+        uw = get_weight(f"decoder.layers.{up_idx}.conv.weight")
+        ub = get_weight(f"decoder.layers.{up_idx}.conv.bias")
+        if uw is not None:
+            set_weight(lambda m, bi=block_idx: m.decoder.blocks[bi][0].weight_oik, uw)
+        if ub is not None:
+            set_weight(lambda m, bi=block_idx: m.decoder.blocks[bi][0].bias_o, ub)
+
+        # Resnet block weights
+        w1 = get_weight(f"decoder.layers.{res_idx}.block.1.conv.weight")
+        b1 = get_weight(f"decoder.layers.{res_idx}.block.1.conv.bias")
+        w2 = get_weight(f"decoder.layers.{res_idx}.block.3.conv.weight")
+        b2 = get_weight(f"decoder.layers.{res_idx}.block.3.conv.bias")
+
+        if w1 is not None:
+            set_weight(lambda m, bi=block_idx: m.decoder.blocks[bi][1][0].conv1.weight_oik, w1)
+        if b1 is not None:
+            set_weight(lambda m, bi=block_idx: m.decoder.blocks[bi][1][0].conv1.bias_o, b1)
+        if w2 is not None:
+            set_weight(lambda m, bi=block_idx: m.decoder.blocks[bi][1][0].conv2.weight_oik, w2)
+        if b2 is not None:
+            set_weight(lambda m, bi=block_idx: m.decoder.blocks[bi][1][0].conv2.bias_o, b2)
+
+    # decoder.layers.14 = final_conv
+    w = get_weight("decoder.layers.14.conv.weight")
+    b = get_weight("decoder.layers.14.conv.bias")
+    if w is not None:
+        set_weight(lambda m: m.decoder.final_conv.weight_oik, w)
+    if b is not None:
+        set_weight(lambda m: m.decoder.final_conv.bias_o, b)
+
+    # Load transformer weights (encoder and decoder)
+    for prefix, _get_transformer in [
+        ("encoder_transformer", lambda m: m.encoder_transformer),
+        ("decoder_transformer", lambda m: m.decoder_transformer),
+    ]:
+        for layer_idx in range(model.config.num_hidden_layers):
+            layer_prefix = f"{prefix}.layers.{layer_idx}"
+
+            # Self-attention projections
+            for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+                w = get_weight(f"{layer_prefix}.self_attn.{proj}.weight")
+                if w is not None:
+                    # JAX Linear uses (out, in), HF also uses (out, in)
+                    set_weight(
+                        lambda m, p=prefix, li=layer_idx, pj=proj: getattr(
+                            getattr(m, p.split("_")[0] + "_transformer").layers[li].self_attn, pj
+                        ).weight,
+                        w,
+                    )
+
+            # Layer norms (HF: input_layernorm, post_attention_layernorm)
+            for hf_name, our_name in [
+                ("input_layernorm", "self_attn_layer_norm"),
+                ("post_attention_layernorm", "mlp_layer_norm"),
+            ]:
+                w = get_weight(f"{layer_prefix}.{hf_name}.weight")
+                b = get_weight(f"{layer_prefix}.{hf_name}.bias")
+                if w is not None:
+                    set_weight(
+                        lambda m, p=prefix, li=layer_idx, on=our_name: getattr(
+                            getattr(m, p.split("_")[0] + "_transformer").layers[li], on
+                        ).weight,
+                        w,
+                    )
+                if b is not None:
+                    set_weight(
+                        lambda m, p=prefix, li=layer_idx, on=our_name: getattr(
+                            getattr(m, p.split("_")[0] + "_transformer").layers[li], on
+                        ).bias,
+                        b,
+                    )
+
+            # MLP
+            for fc in ["fc1", "fc2"]:
+                w = get_weight(f"{layer_prefix}.mlp.{fc}.weight")
+                if w is not None:
+                    set_weight(
+                        lambda m, p=prefix, li=layer_idx, f=fc: getattr(
+                            getattr(m, p.split("_")[0] + "_transformer").layers[li].mlp, f
+                        ).weight,
+                        w,
+                    )
+
+            # Layer scales
+            for scale_name in ["self_attn_layer_scale", "mlp_layer_scale"]:
+                s = get_weight(f"{layer_prefix}.{scale_name}.scale")
+                if s is not None:
+                    set_weight(
+                        lambda m, p=prefix, li=layer_idx, sn=scale_name: getattr(
+                            getattr(m, p.split("_")[0] + "_transformer").layers[li], sn
+                        ).scale,
+                        s,
+                    )
+
+    # Load downsample/upsample conv weights
+    dw = get_weight("downsample.conv.weight")
+    if dw is not None and model.downsample is not None:
+        set_weight(lambda m: m.downsample.weight_oik, dw)
+
+    uw = get_weight("upsample.conv.weight")
+    if uw is not None and model.upsample is not None:
+        set_weight(lambda m: m.upsample.weight_oik, uw)
+
+    # Load quantizer weights
+    # Semantic RVQ
+    w = get_weight("quantizer.semantic_residual_vector_quantizer.input_proj.weight")
+    if w is not None:
+        set_weight(lambda m: m.quantizer.semantic_rvq.input_proj.weight_oik, w)
+
+    w = get_weight("quantizer.semantic_residual_vector_quantizer.output_proj.weight")
+    if w is not None:
+        set_weight(lambda m: m.quantizer.semantic_rvq.output_proj.weight_oik, w)
+
+    # Acoustic RVQ
+    w = get_weight("quantizer.acoustic_residual_vector_quantizer.input_proj.weight")
+    if w is not None:
+        set_weight(lambda m: m.quantizer.acoustic_rvq.input_proj.weight_oik, w)
+
+    w = get_weight("quantizer.acoustic_residual_vector_quantizer.output_proj.weight")
+    if w is not None:
+        set_weight(lambda m: m.quantizer.acoustic_rvq.output_proj.weight_oik, w)
+
+    # Codebook embeddings - HF uses embed = embed_sum / cluster_usage for inference
+    sem_prefix = "quantizer.semantic_residual_vector_quantizer.layers"
+    for layer_idx in range(model.config.num_semantic_quantizers):
+        embed_sum = get_weight(f"{sem_prefix}.{layer_idx}.codebook.embed_sum")
+        cluster_usage = get_weight(f"{sem_prefix}.{layer_idx}.codebook.cluster_usage")
+        if embed_sum is not None and cluster_usage is not None:
+            embed = embed_sum / cluster_usage[:, None]
+            set_weight(lambda m, li=layer_idx: m.quantizer.semantic_rvq.layers[li].embeddings_kd, embed)
+
+    acou_prefix = "quantizer.acoustic_residual_vector_quantizer.layers"
+    num_acoustic = model.config.num_quantizers - model.config.num_semantic_quantizers
+    for layer_idx in range(num_acoustic):
+        embed_sum = get_weight(f"{acou_prefix}.{layer_idx}.codebook.embed_sum")
+        cluster_usage = get_weight(f"{acou_prefix}.{layer_idx}.codebook.cluster_usage")
+        if embed_sum is not None and cluster_usage is not None:
+            embed = embed_sum / cluster_usage[:, None]
+            set_weight(lambda m, li=layer_idx: m.quantizer.acoustic_rvq.layers[li].embeddings_kd, embed)
+
+    logger.info("Loaded %d/%d weight tensors", loaded_count, total_keys)
     return model
 
 
@@ -1480,7 +1770,7 @@ def main() -> None:
 
     # Import audio libraries
     try:
-        import soundfile as sf
+        import soundfile as sf  # noqa: PLC0415
     except ImportError:
         logger.error("Please install soundfile: pip install soundfile")
         sys.exit(1)

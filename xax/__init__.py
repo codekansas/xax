@@ -45,7 +45,7 @@ __all__ = [
     "LLM",
     "LLMConfig",
     "LLMRepo",
-    "build_pretrained_model",
+    "build_pretrained_llm",
     "chunked_cross_entropy_acc",
     "chunked_cross_entropy_loss",
     "hf_config_to_llm_config",
@@ -54,6 +54,8 @@ __all__ = [
     "load_hf_config",
     "load_hf_weights_into_llm",
     "tie_embedding_and_head",
+    "MimiModel",
+    "build_pretrained_mimi",
     "BaseSSMBlock",
     "DiagSSMBlock",
     "SSM",
@@ -316,7 +318,7 @@ NAME_MAP: dict[str, str] = {
     "LLM": "arch.llm",
     "LLMConfig": "arch.llm",
     "LLMRepo": "arch.llm",
-    "build_pretrained_model": "arch.llm",
+    "build_pretrained_llm": "arch.llm",
     "chunked_cross_entropy_acc": "arch.llm",
     "chunked_cross_entropy_loss": "arch.llm",
     "hf_config_to_llm_config": "arch.llm",
@@ -325,6 +327,8 @@ NAME_MAP: dict[str, str] = {
     "load_hf_config": "arch.llm",
     "load_hf_weights_into_llm": "arch.llm",
     "tie_embedding_and_head": "arch.llm",
+    "MimiModel": "arch.mimi",
+    "build_pretrained_mimi": "arch.mimi",
     "BaseSSMBlock": "arch.ssm",
     "DiagSSMBlock": "arch.ssm",
     "SSM": "arch.ssm",
@@ -584,7 +588,7 @@ if IMPORT_ALL or TYPE_CHECKING:
         LLM,
         LLMConfig,
         LLMRepo,
-        build_pretrained_model,
+        build_pretrained_llm,
         chunked_cross_entropy_acc,
         chunked_cross_entropy_loss,
         hf_config_to_llm_config,
@@ -594,6 +598,7 @@ if IMPORT_ALL or TYPE_CHECKING:
         load_hf_weights_into_llm,
         tie_embedding_and_head,
     )
+    from xax.arch.mimi import MimiModel, build_pretrained_mimi
     from xax.arch.ssm import SSM, BaseSSMBlock, DiagSSMBlock, SSMBlock
     from xax.arch.unet import UNet
     from xax.core.conf import (
