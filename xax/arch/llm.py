@@ -33,16 +33,12 @@ from xax.utils.jax import filter_jit as xax_filter_jit
 try:
     from huggingface_hub import snapshot_download
 except ModuleNotFoundError as e:
-    raise ModuleNotFoundError(
-        "Please install huggingface_hub to access pre-trained LLM weights: `pip install huggingface-hub`"
-    ) from e
+    raise ModuleNotFoundError("Please install huggingface_hub: pip install huggingface-hub") from e
 
 try:
     from safetensors import safe_open
 except ModuleNotFoundError as e:
-    raise ModuleNotFoundError(
-        "Please install safetensors to access pre-trained LLM weights: `pip install safetensors`"
-    ) from e
+    raise ModuleNotFoundError("Please install safetensors: pip install safetensors") from e
 
 logger = logging.getLogger(__name__)
 
@@ -246,7 +242,7 @@ class LLMRepo(Enum):
     QWEN3_32B = "Qwen/Qwen3-32B"
 
 
-def build_pretrained_model(repo: LLMRepo, dtype: jnp.dtype | None = None) -> LLM:
+def build_pretrained_llm(repo: LLMRepo, dtype: jnp.dtype | None = None) -> LLM:
     """Loads a pretrained model.
 
     For tensor parallelism, set up a mesh with a 'model' axis before calling:
@@ -1182,7 +1178,7 @@ def main() -> None:
 
     # Loads the model repository.
     logger.info("Loading weights from %s...", args.repo.value)
-    model = build_pretrained_model(args.repo, dtype=dtype)
+    model = build_pretrained_llm(args.repo, dtype=dtype)
 
     # Load tokenizer.
     tokenizer = AutoTokenizer.from_pretrained(args.repo.value, revision=args.revision)

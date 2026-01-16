@@ -70,7 +70,7 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
     @override
     def get_model(self, params: xax.InitParams) -> xax.LLM:
         # Build model with correct config
-        model = xax.build_pretrained_model(self.config.llm_repo)
+        model = xax.build_pretrained_llm(self.config.llm_repo)
 
         # Apply LoRA selectively to specified layers (e.g., q_proj, v_proj)
         return xax.loraize_by_path(

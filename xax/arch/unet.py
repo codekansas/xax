@@ -1,8 +1,7 @@
 """Defines a general-purpose UNet model."""
 
 import math
-from collections.abc import Callable
-from typing import Sequence
+from typing import Callable, Sequence
 
 import chex
 import equinox as eqx

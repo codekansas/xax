@@ -2,8 +2,7 @@
 
 import socket
 from collections import deque
-from collections.abc import Iterable, Mapping
-from typing import Any, Callable, Deque
+from typing import Any, Callable, Deque, Iterable, Mapping
 
 import jax
 import jax.numpy as jnp
