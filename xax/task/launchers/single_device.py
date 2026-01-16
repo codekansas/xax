@@ -96,7 +96,7 @@ def configure_gpu_devices(logger: logging.Logger | None = None) -> None:
 
             # Configure JAX to use the selected device
             try:
-                devices = jax.devices("gpu")
+                devices = jax.local_devices(backend="gpu")
                 if devices:
                     jax.config.update("jax_default_device", devices[0])
                     logger.info("Configured JAX to use device: %s", devices[0])

@@ -64,7 +64,7 @@ class ParallelMixin(BaseTask[Config], Generic[Config], ABC):
 
             # For model parallelism, create a mesh with 'model' axis
             # This shards model weights across GPUs
-            devices = np.array(jax.devices()[:mp_size])
+            devices = np.array(jax.local_devices()[:mp_size])
             return jax.sharding.Mesh(devices, axis_names=("model",))
         else:
             # Standard data parallelism with 'batch' axis

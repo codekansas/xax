@@ -28,7 +28,7 @@ def configure_cpu_devices(num_cpus: int | None = None, logger: logging.Logger | 
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
     # Configure the default device.
-    devices = jax.devices("cpu")
+    devices = jax.local_devices(backend="cpu")
     jax.config.update("jax_default_device", devices[0])
 
     # Configure number of CPU devices if specified.
@@ -43,7 +43,7 @@ def configure_cpu_devices(num_cpus: int | None = None, logger: logging.Logger | 
         logger.info("Using default CPU device configuration")
 
     jax.config.update("jax_platform_name", "cpu")
-    cpu_devices = jax.devices("cpu")
+    cpu_devices = jax.local_devices(backend="cpu")
     logger.info("JAX configured to use %d CPU device(s): %s", len(cpu_devices), cpu_devices)
 
 

@@ -473,7 +473,7 @@ def setup_model_parallel_mesh(mp_size: int | None = None) -> Mesh:
     Returns:
         A JAX mesh configured for model parallelism.
     """
-    devices = jax.devices()
+    devices = jax.local_devices()
     if mp_size is None:
         mp_size = len(devices)
     if mp_size > len(devices):
@@ -1177,7 +1177,7 @@ def main() -> None:
         jax.set_mesh(mesh)
     else:
         # Single device: still need a mesh for weight loading
-        mesh = Mesh(np.array(jax.devices()[:1]), axis_names=("batch",))
+        mesh = Mesh(np.array(jax.local_devices()[:1]), axis_names=("batch",))
         jax.set_mesh(mesh)
 
     # Loads the model repository.
