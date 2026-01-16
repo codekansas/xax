@@ -14,7 +14,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import NamedSharding, PartitionSpec as P
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jaxtyping import Array, PRNGKeyArray
 from omegaconf import MISSING
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field as PydanticField
@@ -28,7 +28,7 @@ from xax.arch.attention import (
     apply_linear,
 )
 from xax.core.conf import field
-from xax.utils.jax import filter_jit as xax_filter_jit, jit as xax_jit
+from xax.utils.jax import filter_jit as xax_filter_jit
 
 try:
     from huggingface_hub import snapshot_download
@@ -249,13 +249,22 @@ class LLMRepo(Enum):
 def build_pretrained_model(repo: LLMRepo, dtype: jnp.dtype | None = None) -> LLM:
     """Loads a pretrained model.
 
+    For tensor parallelism, set up a mesh with a 'model' axis before calling:
+
+        mesh = setup_tensor_parallel_mesh()
+        jax.set_mesh(mesh)
+        model = build_pretrained_model(repo)
+
     Args:
         repo: Pretrained model repository.
         dtype: Optional dtype for the model.
+
+    Returns:
+        LLM model with loaded weights, sharded according to the mesh.
     """
     config = hf_config_to_llm_config(cfg=load_hf_config(repo.value))
-    model = LLM.build(config, key=jax.random.key(0))
-    return load_hf_weights_into_llm(model, repo.value, dtype=dtype)
+    model_shape = eqx.filter_eval_shape(LLM.build, config, key=jax.random.key(0))
+    return load_hf_weights_into_llm(model_shape, repo.value, dtype=dtype)
 
 
 def tie_embedding_and_head(model: LLM) -> LLM:
@@ -450,6 +459,77 @@ def load_hf_config(repo_id: str, revision: str | None = None) -> dict[str, objec
     path = download_repo(repo_id, revision=revision)
     with open(path / "config.json", "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def setup_model_parallel_mesh(mp_size: int | None = None) -> Mesh:
+    """Set up a mesh for model parallelism.
+
+    For model parallelism, we shard the model weights across GPUs along the
+    'model' axis. This allows running models that don't fit on a single GPU.
+
+    Args:
+        mp_size: Number of GPUs for model parallelism. If None, uses all GPUs.
+
+    Returns:
+        A JAX mesh configured for model parallelism.
+    """
+    devices = jax.devices()
+    if mp_size is None:
+        mp_size = len(devices)
+    if mp_size > len(devices):
+        raise ValueError(f"mp_size ({mp_size}) > available devices ({len(devices)})")
+
+    # Use the first mp_size devices for model parallelism
+    mp_devices = devices[:mp_size]
+    mesh = Mesh(np.array(mp_devices), axis_names=("model",))
+    return mesh
+
+
+def get_model_parallel_sharding_spec(
+    weight_shape: tuple[int, ...],
+    weight_name: str,
+    mesh: Mesh,
+) -> NamedSharding:
+    """Get sharding spec for a weight tensor in tensor parallel mode.
+
+    For transformer models, we use the following sharding strategy:
+    - Attention Q/K/V projections: Column parallel (shard output dim)
+    - Attention O projection: Row parallel (shard input dim)
+    - MLP gate/up projections: Column parallel (shard output dim)
+    - MLP down projection: Row parallel (shard input dim)
+    - Embeddings and norms: Replicated
+
+    Args:
+        weight_shape: Shape of the weight tensor
+        weight_name: Name of the weight (used to determine sharding strategy)
+        mesh: The tensor parallel mesh
+
+    Returns:
+        NamedSharding for the weight
+    """
+    # Determine sharding based on weight name and shape
+    if len(weight_shape) == 1:
+        # 1D tensors (biases, norm weights) are replicated
+        return NamedSharding(mesh, P())
+
+    # 2D weight matrices
+    if len(weight_shape) == 2:
+        # Column parallel: shard output dimension (first dim of weight matrix)
+        # Used for Q, K, V projections and MLP gate/up projections
+        if any(weight_name.endswith(name) for name in ["q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"]):
+            return NamedSharding(mesh, P("model", None))
+
+        # Row parallel: shard input dimension (second dim of weight matrix)
+        # Used for O projection and MLP down projection
+        if any(weight_name.endswith(name) for name in ["o_proj", "down_proj"]):
+            return NamedSharding(mesh, P(None, "model"))
+
+        # LM head: column parallel
+        if "lm_head" in weight_name:
+            return NamedSharding(mesh, P("model", None))
+
+    # Default: replicate
+    return NamedSharding(mesh, P())
 
 
 def _fetch_state_dict(repo_id: str, revision: str | None = None) -> tuple[dict[str, object], dict[str, np.ndarray]]:
@@ -681,6 +761,13 @@ def load_hf_weights_into_llm(
     - Norms: `input_layernorm` and `post_attention_layernorm`
     - Final norm: `norm` or `ln_f`
 
+    Supports tensor parallelism when the mesh has a 'model' axis:
+    - Q/K/V projections: column parallel (shard output dim)
+    - O projection: row parallel (shard input dim)
+    - Gate/Up: column parallel
+    - Down: row parallel
+    - Embeddings and norms: replicated
+
     Args:
         model: The LLM model to load weights into.
         repo_id: HuggingFace repository ID.
@@ -708,53 +795,63 @@ def load_hf_weights_into_llm(
     if hf_parsed.hidden_size is not None and hf_parsed.hidden_size != model.config.embed_dim:
         raise ValueError(f"HF hidden_size {hf_parsed.hidden_size} != model.embed_dim {model.config.embed_dim}")
 
-    if mesh.devices.size > 1:
-        # Replicate weights across all devices (no partitioning)
-        sharding = NamedSharding(mesh, P())
+    # Check if we're using model parallelism (mesh has 'model' axis)
+    use_mp = "model" in mesh.axis_names
 
-        def to_dtype(arr: np.ndarray | jnp.ndarray) -> jnp.ndarray:
-            # Create JAX array with proper sharding in one step
-            # Using jax.make_array_from_callback ensures proper replication
-            shape = arr.shape
-            arr_np = np.asarray(arr, dtype=dtype)
+    def make_sharded_array(arr: np.ndarray, weight_name: str) -> jnp.ndarray:
+        """Create a JAX array with proper sharding based on weight name."""
+        arr_np = np.asarray(arr, dtype=dtype)
+        shape = arr_np.shape
 
-            def callback(idx: tuple[slice, ...] | None) -> np.ndarray:
-                # Each device gets the full array (replicated)
-                return arr_np
+        if use_mp:
+            sharding = get_model_parallel_sharding_spec(shape, weight_name, mesh)
+        else:
+            # Replicate across all devices
+            sharding = NamedSharding(mesh, P())
 
-            return jax.make_array_from_callback(shape, sharding, callback)
+        if mesh.devices.size == 1:
+            return jnp.asarray(arr_np)
 
-    else:
+        # For sharded arrays, we need to provide the correct shard for each device
+        def callback(idx: tuple[slice, ...]) -> np.ndarray:
+            # idx tells us which slice this device needs
+            return arr_np[idx]
 
-        def to_dtype(arr: np.ndarray | jnp.ndarray) -> jnp.ndarray:
-            return jnp.asarray(arr, dtype=dtype)
+        return jax.make_array_from_callback(shape, sharding, callback)
+
+    def to_dtype_replicated(arr: np.ndarray | jnp.ndarray) -> jnp.ndarray:
+        """Convert array to target dtype with replicated sharding."""
+        return make_sharded_array(np.asarray(arr), "replicated")
 
     def map_linear(
         eq_lin: eqx.nn.Linear,
         w: np.ndarray | jnp.ndarray,
         b: np.ndarray | jnp.ndarray | None,
+        weight_name: str,
     ) -> eqx.nn.Linear:
-        """Map weight/bias to linear layer, handling shape transposition if needed."""
+        """Map weight/bias to linear layer with model parallel sharding."""
         w_mapped = w if w.shape == eq_lin.weight.shape else w.T
         chex.assert_shape(w_mapped, eq_lin.weight.shape)
-        eq_lin = eqx.tree_at(lambda lin: lin.weight, eq_lin, to_dtype(w_mapped))
+        w_sharded = make_sharded_array(np.asarray(w_mapped), weight_name)
+        eq_lin = eqx.tree_at(lambda lin: lin.weight, eq_lin, w_sharded)
         if b is not None:
+            b_sharded = make_sharded_array(np.asarray(b), weight_name + ".bias")
             if eq_lin.bias is not None:
                 chex.assert_shape(b, eq_lin.bias.shape)
-                eq_lin = eqx.tree_at(lambda lin: lin.bias, eq_lin, to_dtype(b))
+                eq_lin = eqx.tree_at(lambda lin: lin.bias, eq_lin, b_sharded)
             else:
-                eq_lin = eqx.tree_at(lambda lin: lin.bias, eq_lin, to_dtype(b), is_leaf=lambda x: x is None)
+                eq_lin = eqx.tree_at(lambda lin: lin.bias, eq_lin, b_sharded, is_leaf=lambda x: x is None)
         return eq_lin
 
-    # Load embedding
+    # Load embedding (always replicated)
     embed_w = _get_weight(state, "embed_tokens.weight", "wte.weight")
-    model = eqx.tree_at(lambda m: m.embed.weight, model, to_dtype(embed_w))
+    model = eqx.tree_at(lambda m: m.embed.weight, model, to_dtype_replicated(embed_w))
 
-    # Load lm_head (may be tied to embeddings)
+    # Load lm_head (may be tied to embeddings) - can be sharded for TP
     has_separate_lm_head = any("lm_head.weight" in k for k in state)
     if has_separate_lm_head:
         lm_head_w = _get_weight(state, "lm_head.weight")
-        model = eqx.tree_at(lambda m: m.lm_head.weight, model, to_dtype(lm_head_w))
+        model = eqx.tree_at(lambda m: m.lm_head.weight, model, make_sharded_array(lm_head_w, "lm_head"))
     elif model.lm_head.weight.shape == embed_w.shape:
         model = tie_embedding_and_head(model)
 
@@ -767,7 +864,7 @@ def load_hf_weights_into_llm(
         blk_pfx = f"layers.{idx}"
         blk_pfx_alt = f"model.layers.{idx}"
 
-        # Attention projections
+        # Attention projections - use model parallel sharding
         q_w = _get_weight(state, f"{pfx}.q_proj.weight", f"{pfx_alt}.q_proj.weight")
         k_w = _get_weight(state, f"{pfx}.k_proj.weight", f"{pfx_alt}.k_proj.weight")
         v_w = _get_weight(state, f"{pfx}.v_proj.weight", f"{pfx_alt}.v_proj.weight")
@@ -777,12 +874,28 @@ def load_hf_weights_into_llm(
         v_b = _get_bias(state, f"{pfx}.v_proj.bias", f"{pfx_alt}.v_proj.bias")
         o_b = _get_bias(state, f"{pfx}.o_proj.bias", f"{pfx_alt}.o_proj.bias")
 
-        block = eqx.tree_at(lambda b: b.self_attn.q_proj, block, map_linear(block.self_attn.q_proj, q_w, q_b))
-        block = eqx.tree_at(lambda b: b.self_attn.k_proj, block, map_linear(block.self_attn.k_proj, k_w, k_b))
-        block = eqx.tree_at(lambda b: b.self_attn.v_proj, block, map_linear(block.self_attn.v_proj, v_w, v_b))
-        block = eqx.tree_at(lambda b: b.self_attn.output_proj, block, map_linear(block.self_attn.output_proj, o_w, o_b))
+        block = eqx.tree_at(
+            lambda b: b.self_attn.q_proj,
+            block,
+            map_linear(block.self_attn.q_proj, q_w, q_b, "q_proj"),
+        )
+        block = eqx.tree_at(
+            lambda b: b.self_attn.k_proj,
+            block,
+            map_linear(block.self_attn.k_proj, k_w, k_b, "k_proj"),
+        )
+        block = eqx.tree_at(
+            lambda b: b.self_attn.v_proj,
+            block,
+            map_linear(block.self_attn.v_proj, v_w, v_b, "v_proj"),
+        )
+        block = eqx.tree_at(
+            lambda b: b.self_attn.output_proj,
+            block,
+            map_linear(block.self_attn.output_proj, o_w, o_b, "o_proj"),
+        )
 
-        # QK-Norm (Qwen3 style) - only update if weights are present
+        # QK-Norm (Qwen3 style) - only update if weights are present (always replicated)
         q_norm_w = state.get(f"{pfx_alt}.q_norm.weight")
         k_norm_w = state.get(f"{pfx_alt}.k_norm.weight")
 
@@ -790,21 +903,27 @@ def load_hf_weights_into_llm(
             return isinstance(x, RMSNorm) or x is None
 
         if q_norm_w is not None:
-            q_norm = RMSNorm(weight=to_dtype(q_norm_w), eps=model.config.rms_eps)
+            q_norm = RMSNorm(weight=to_dtype_replicated(q_norm_w), eps=model.config.rms_eps)
             block = eqx.tree_at(lambda b: b.self_attn.q_norm, block, q_norm, is_leaf=is_qk_norm_leaf)
         if k_norm_w is not None:
-            k_norm = RMSNorm(weight=to_dtype(k_norm_w), eps=model.config.rms_eps)
+            k_norm = RMSNorm(weight=to_dtype_replicated(k_norm_w), eps=model.config.rms_eps)
             block = eqx.tree_at(lambda b: b.self_attn.k_norm, block, k_norm, is_leaf=is_qk_norm_leaf)
 
-        # Layer norms
-        pre_gamma = _get_weight(state, f"{blk_pfx}.input_layernorm.weight", f"{blk_pfx_alt}.input_layernorm.weight")
-        post_gamma = _get_weight(
-            state, f"{blk_pfx}.post_attention_layernorm.weight", f"{blk_pfx_alt}.post_attention_layernorm.weight"
+        # Layer norms (always replicated)
+        pre_gamma = _get_weight(
+            state,
+            f"{blk_pfx}.input_layernorm.weight",
+            f"{blk_pfx_alt}.input_layernorm.weight",
         )
-        block = eqx.tree_at(lambda b: b.attn_norm.weight, block, to_dtype(pre_gamma))
-        block = eqx.tree_at(lambda b: b.mlp_norm.weight, block, to_dtype(post_gamma))
+        post_gamma = _get_weight(
+            state,
+            f"{blk_pfx}.post_attention_layernorm.weight",
+            f"{blk_pfx_alt}.post_attention_layernorm.weight",
+        )
+        block = eqx.tree_at(lambda b: b.attn_norm.weight, block, to_dtype_replicated(pre_gamma))
+        block = eqx.tree_at(lambda b: b.mlp_norm.weight, block, to_dtype_replicated(post_gamma))
 
-        # MLP projections (SwiGLU)
+        # MLP projections (SwiGLU) - use model parallel sharding
         gate_w = _get_weight(state, f"{mlp_pfx}.gate_proj.weight", f"{mlp_pfx_alt}.gate_proj.weight")
         up_w = _get_weight(state, f"{mlp_pfx}.up_proj.weight", f"{mlp_pfx_alt}.up_proj.weight")
         down_w = _get_weight(state, f"{mlp_pfx}.down_proj.weight", f"{mlp_pfx_alt}.down_proj.weight")
@@ -812,16 +931,28 @@ def load_hf_weights_into_llm(
         up_b = _get_bias(state, f"{mlp_pfx}.up_proj.bias", f"{mlp_pfx_alt}.up_proj.bias")
         down_b = _get_bias(state, f"{mlp_pfx}.down_proj.bias", f"{mlp_pfx_alt}.down_proj.bias")
 
-        block = eqx.tree_at(lambda b: b.feed_forward.gate, block, map_linear(block.feed_forward.gate, gate_w, gate_b))
-        block = eqx.tree_at(lambda b: b.feed_forward.up, block, map_linear(block.feed_forward.up, up_w, up_b))
-        block = eqx.tree_at(lambda b: b.feed_forward.down, block, map_linear(block.feed_forward.down, down_w, down_b))
+        block = eqx.tree_at(
+            lambda b: b.feed_forward.gate,
+            block,
+            map_linear(block.feed_forward.gate, gate_w, gate_b, "gate_proj"),
+        )
+        block = eqx.tree_at(
+            lambda b: b.feed_forward.up,
+            block,
+            map_linear(block.feed_forward.up, up_w, up_b, "up_proj"),
+        )
+        block = eqx.tree_at(
+            lambda b: b.feed_forward.down,
+            block,
+            map_linear(block.feed_forward.down, down_w, down_b, "down_proj"),
+        )
 
         model = eqx.tree_at(lambda mod, i=idx: mod.blocks[i], model, block)
 
-    # Final norm
+    # Final norm (always replicated)
     final_gamma = _get_bias(state, "norm.weight", "model.norm.weight", "ln_f.weight")
     if final_gamma is not None:
-        model = eqx.tree_at(lambda m: m.norm.weight, model, to_dtype(final_gamma))
+        model = eqx.tree_at(lambda m: m.norm.weight, model, to_dtype_replicated(final_gamma))
 
     return model
 
@@ -836,7 +967,7 @@ def llm_generate(
     top_p: float = 0.9,
 ) -> list[int]:
     """Sampling-based decoding for quick sanity checks (non-JIT version)."""
-    tokens_arr, final_len = llm_generate_jit(
+    tokens_arr, final_len = xax_filter_jit(llm_generate_jit)(
         model,
         jnp.array(tokens, dtype=jnp.int32),
         eos_id if eos_id is not None else -1,
@@ -889,7 +1020,6 @@ def _sample_next_token(
     return next_token_tn
 
 
-@xax_filter_jit()
 def llm_generate_jit(
     model: LLM,
     tokens_t: Array,
@@ -973,8 +1103,11 @@ def llm_generate_stream(
     model_dtype = model.embed.weight.dtype
     caches = model.init_cache(max_len, dtype=model_dtype)
 
-    @xax_jit(donate_argnames=["caches", "key"])
+    # Use eqx.filter_jit to properly handle equinox modules without capturing
+    # model weights as constants (which would cause OOM for large models).
+    @eqx.filter_jit(donate="all-except-first")
     def step(
+        model: LLM,
         tokens_t: Array,
         caches: list[TransformerBlockCache],
         key: PRNGKeyArray,
@@ -985,7 +1118,7 @@ def llm_generate_stream(
         next_token_1 = _sample_next_token(logits_1v, temperature, top_p, subkey, num_samples=1)[..., 0]
         return next_token_1, caches, key
 
-    next_token_1, caches, key = step(tokens_t, caches, key)
+    next_token_1, caches, key = step(model, tokens_t, caches, key)
     next_token_int = int(next_token_1.item())
 
     # Check EOS
@@ -997,7 +1130,7 @@ def llm_generate_stream(
     # Continue generating
     for _ in range(max_new_tokens - 1):
         # Forward with cache
-        next_token_1, caches, key = step(next_token_1, caches, key)
+        next_token_1, caches, key = step(model, next_token_1, caches, key)
         next_token_int = int(next_token_1.item())
 
         # Check EOS
@@ -1026,11 +1159,24 @@ def main() -> None:
     parser.add_argument("--no-stream", action="store_true", help="Disable streaming (print all at once).")
     parser.add_argument("--no-think", action="store_true", help="Disable thinking mode for Qwen3 models.")
     parser.add_argument("--dtype", choices=["float32", "bfloat16", "float16"], default="bfloat16")
+    parser.add_argument("--mp", type=int, default=None, help="Enable model parallelism with N GPUs (default: auto)")
     args = parser.parse_args()
 
     # Parse dtype
     dtype_map = {"float32": jnp.float32, "bfloat16": jnp.bfloat16, "float16": jnp.float16}
     dtype = dtype_map[args.dtype]
+
+    # Set up tensor parallelism if multiple GPUs are available or explicitly requested
+    num_devices = jax.local_device_count()
+    if args.mp is not None or num_devices > 1:
+        mp_size = args.mp if args.mp is not None else num_devices
+        logger.info("Setting up tensor parallelism with %d GPUs", mp_size)
+        mesh = setup_model_parallel_mesh(mp_size)
+        jax.set_mesh(mesh)
+    else:
+        # Single device: still need a mesh for weight loading
+        mesh = Mesh(np.array(jax.devices()[:1]), axis_names=("batch",))
+        jax.set_mesh(mesh)
 
     # Loads the model repository.
     logger.info("Loading weights from %s...", args.repo.value)

@@ -46,6 +46,9 @@ class Config(xax.SupervisedConfig):
 
 
 class ShakespeareLora(xax.SupervisedTask[Config]):
+    # Large models that require tensor parallelism
+    LARGE_MODELS = (xax.LLMRepo.QWEN3_14B, xax.LLMRepo.QWEN3_32B)
+
     def __init__(self, config: Config) -> None:
         super().__init__(config)
 
@@ -59,6 +62,10 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
             ),
             dtype=jnp.int32,
         )
+
+    @override
+    def should_do_model_parallel(self) -> bool:
+        return self.config.llm_repo in self.LARGE_MODELS
 
     @override
     def get_model(self, params: xax.InitParams) -> xax.LLM:
