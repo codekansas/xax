@@ -330,7 +330,11 @@ def format_datetime(dt: datetime.datetime) -> str:
 
 
 def camelcase_to_snakecase(s: str) -> str:
-    return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s).lower()
+    # Handle consecutive uppercase letters before uppercase+lowercase (e.g., "TTS" before "Model")
+    s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", s)
+    # Handle lowercase/digit before uppercase.
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s)
+    return s.lower()
 
 
 def snakecase_to_camelcase(s: str) -> str:
