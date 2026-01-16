@@ -1,8 +1,7 @@
 """Defines a general-purpose API for activation functions."""
 
 import math
-from collections.abc import Callable
-from typing import Literal, cast, get_args
+from typing import Callable, Literal, cast, get_args
 
 import jax
 import jax.numpy as jnp

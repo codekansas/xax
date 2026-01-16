@@ -16,6 +16,7 @@ import math
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import chex
 import equinox as eqx
@@ -792,6 +793,7 @@ class MimiResidualVectorQuantizer(eqx.Module):
                 output_td = output_td + quantized_td
 
         # Project back to input dimension
+        assert output_td is not None, "No quantizer layers to decode"
         return self.output_proj(output_td)
 
 
@@ -1502,7 +1504,7 @@ def _load_weights_into_mimi(
     total_keys = len(state)
 
     # Helper to set weights using tree_at
-    def set_weight(get_leaf: object, weight: jnp.ndarray) -> None:  # noqa: ANN001
+    def set_weight(get_leaf: Callable[[MimiModel], Array], weight: jnp.ndarray) -> None:
         nonlocal model, loaded_count
         model = eqx.tree_at(get_leaf, model, weight)
         loaded_count += 1
