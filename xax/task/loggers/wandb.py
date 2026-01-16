@@ -238,6 +238,17 @@ class WandbLogger(LoggerImpl):
                 frames = video_value.frames.transpose(0, 3, 1, 2)  # (T, H, W, C) -> (T, C, H, W)
                 metrics[key] = self._wandb.Video(frames, fps=video_value.fps, format="mp4")
 
+        # Log audio
+        for namespace, audios in line.audios.items():
+            for audio_key, audio_value in audios.items():
+                key = sanitize_metric_name(f"{namespace}/{audio_key}")
+                # wandb.Audio expects numpy array of shape (samples,) or (samples, channels)
+                # Our format is (T,) or (C, T), so transpose multi-channel to (T, C)
+                audio_data = audio_value.audio
+                if audio_data.ndim == 2:
+                    audio_data = audio_data.T  # (C, T) -> (T, C)
+                metrics[key] = self._wandb.Audio(audio_data, sample_rate=audio_value.sample_rate)
+
         # Log meshes (3D objects)
         for namespace, meshes in line.meshes.items():
             for mesh_key, mesh_value in meshes.items():
