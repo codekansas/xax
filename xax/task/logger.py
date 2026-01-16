@@ -298,6 +298,16 @@ class Video:
     fps: int = field(value=DEFAULT_VIDEO_FPS)
 
 
+DEFAULT_AUDIO_SAMPLE_RATE = 44100
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class Audio:
+    audio: Array
+    sample_rate: int = field(value=DEFAULT_AUDIO_SAMPLE_RATE)
+
+
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class Mesh:
@@ -307,7 +317,7 @@ class Mesh:
     config_dict: dict[str, Any] | None = field(value=None)
 
 
-Metric = Scalar | Distribution | Histogram | Tokens | Image | Images | LabeledImages | Video | Mesh
+Metric = Scalar | Distribution | Histogram | Tokens | Image | Images | LabeledImages | Video | Audio | Mesh
 
 
 @dataclass(kw_only=True)
@@ -332,6 +342,19 @@ class LogVideo:
 
     frames: np.ndarray
     fps: int
+
+
+@dataclass(kw_only=True)
+class LogAudio:
+    """Container for audio data and metadata.
+
+    Attributes:
+        audio: Audio samples as a numpy array of shape (T,) or (C, T) where C is channels
+        sample_rate: Audio sample rate in Hz
+    """
+
+    audio: np.ndarray
+    sample_rate: int
 
 
 @dataclass(kw_only=True)
@@ -380,6 +403,7 @@ class LogLine:
     strings: dict[str, dict[str, LogString]]
     images: dict[str, dict[str, LogImage]]
     videos: dict[str, dict[str, LogVideo]]
+    audios: dict[str, dict[str, LogAudio]]
     meshes: dict[str, dict[str, LogMesh]]
 
 
@@ -531,6 +555,53 @@ def get_video(video: np.ndarray | Array, fps: int = 30) -> LogVideo:
     return LogVideo(frames=video, fps=fps)
 
 
+def get_audio(audio: np.ndarray | Array, sample_rate: int = DEFAULT_AUDIO_SAMPLE_RATE) -> LogAudio:
+    """Converts audio data to standard format.
+
+    Args:
+        audio: The audio samples. Can be:
+            - A 1D array of shape (T,) for mono audio
+            - A 2D array of shape (C, T) for multi-channel audio where C is channels
+        sample_rate: Audio sample rate in Hz
+
+    Returns:
+        LogAudio containing standardized audio samples
+    """
+    if isinstance(audio, Array):
+        audio = as_numpy(audio)
+
+    if not isinstance(audio, np.ndarray):
+        raise ValueError(f"Unsupported audio type: {type(audio)}")
+
+    # Handle different dimension orderings
+    if audio.ndim == 1:
+        # Mono audio (T,) - keep as is
+        pass
+    elif audio.ndim == 2:
+        # Multi-channel (C, T) - keep as is
+        pass
+    else:
+        raise ValueError(f"Expected audio array of shape (T,) or (C, T), got shape {audio.shape}")
+
+    # Normalize to float32 in range [-1, 1] if needed
+    if np.issubdtype(audio.dtype, np.integer):
+        # Convert integer audio to float32
+        if audio.dtype == np.int16:
+            audio = audio.astype(np.float32) / 32768.0
+        elif audio.dtype == np.int32:
+            audio = audio.astype(np.float32) / 2147483648.0
+        elif audio.dtype == np.uint8:
+            audio = (audio.astype(np.float32) - 128.0) / 128.0
+        else:
+            audio = audio.astype(np.float32)
+    elif not np.issubdtype(audio.dtype, np.floating):
+        raise ValueError(f"Unsupported audio dtype: {audio.dtype}")
+    else:
+        audio = audio.astype(np.float32)
+
+    return LogAudio(audio=audio, sample_rate=sample_rate)
+
+
 class LoggerImpl(ABC):
     def __init__(self, log_interval_seconds: float = 1.0) -> None:
         """Defines some default behavior for loggers.
@@ -661,6 +732,7 @@ class Logger:
         self.strings: dict[str, dict[str, Callable[[], LogString]]] = defaultdict(dict)
         self.images: dict[str, dict[str, Callable[[], LogImage]]] = defaultdict(dict)
         self.videos: dict[str, dict[str, Callable[[], LogVideo]]] = defaultdict(dict)
+        self.audios: dict[str, dict[str, Callable[[], LogAudio]]] = defaultdict(dict)
         self.meshes: dict[str, dict[str, Callable[[], LogMesh]]] = defaultdict(dict)
         self.default_namespace = default_namespace
         self.loggers: list[LoggerImpl] = []
@@ -690,6 +762,7 @@ class Logger:
             strings={k: {kk: v() for kk, v in v.items()} for k, v in self.strings.items()},
             images={k: {kk: v() for kk, v in v.items()} for k, v in self.images.items()},
             videos={k: {kk: v() for kk, v in v.items()} for k, v in self.videos.items()},
+            audios={k: {kk: v() for kk, v in v.items()} for k, v in self.audios.items()},
             meshes={k: {kk: v() for kk, v in v.items()} for k, v in self.meshes.items()},
         )
 
@@ -700,6 +773,7 @@ class Logger:
         self.strings.clear()
         self.images.clear()
         self.videos.clear()
+        self.audios.clear()
         self.meshes.clear()
 
     def write(self, state: State, heavy: bool) -> None:
@@ -1271,6 +1345,38 @@ class Logger:
             return video
 
         self.videos[namespace][key] = video_future
+
+    def log_audio(
+        self,
+        key: str,
+        value: Callable[[], np.ndarray | Array] | np.ndarray | Array,
+        *,
+        sample_rate: int = DEFAULT_AUDIO_SAMPLE_RATE,
+        namespace: str | None = None,
+    ) -> None:
+        """Logs audio data.
+
+        Args:
+            key: The key being logged
+            value: The audio samples. Can be:
+                - A 1D array of shape (T,) for mono audio
+                - A 2D array of shape (C, T) for multi-channel audio
+            sample_rate: Audio sample rate in Hz
+            namespace: An optional logging namespace
+        """
+        if not self.active:
+            raise RuntimeError("The logger is not active")
+        namespace = self.resolve_namespace(namespace)
+
+        @functools.lru_cache(maxsize=None)
+        def audio_future() -> LogAudio:
+            with ContextTimer() as timer:
+                audio = get_audio(value() if callable(value) else value, sample_rate=sample_rate)
+
+            logger.debug("Audio Key: %s, Time: %s", key, timer.elapsed_time)
+            return audio
+
+        self.audios[namespace][key] = audio_future
 
     def log_mesh(
         self,

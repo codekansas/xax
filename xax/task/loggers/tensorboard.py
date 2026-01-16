@@ -242,6 +242,16 @@ class TensorboardLogger(LoggerImpl):
                     walltime=walltime,
                 )
 
+        for namespace, audios in line.audios.items():
+            for audio_key, audio_value in audios.items():
+                writer.add_audio(
+                    f"{namespace}/{audio_key}",
+                    audio_value.audio,
+                    sample_rate=audio_value.sample_rate,
+                    global_step=global_step,
+                    walltime=walltime,
+                )
+
         for namespace, meshes in line.meshes.items():
             for mesh_key, mesh_value in meshes.items():
                 writer.add_mesh(

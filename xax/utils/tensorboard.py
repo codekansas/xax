@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import time
+import wave
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
@@ -380,6 +381,67 @@ class TensorboardWriter:
                             width=value.shape[2],
                             colorspace=value.shape[3],
                             encoded_image_string=video_string,
+                        ),
+                    ),
+                ],
+            ),
+            global_step=global_step,
+            walltime=walltime,
+        )
+
+    def add_audio(
+        self,
+        tag: str,
+        value: np.ndarray,
+        sample_rate: int,
+        global_step: int | None = None,
+        walltime: float | None = None,
+    ) -> None:
+        """Add audio data to TensorBoard.
+
+        Args:
+            tag: Name for the audio
+            value: Audio samples as float32 array of shape (T,) or (C, T)
+            sample_rate: Audio sample rate in Hz
+            global_step: Training step
+            walltime: Wall clock time
+        """
+        # Ensure we have (T,) or (C, T) format
+        if value.ndim == 1:
+            num_channels = 1
+            length_frames = value.shape[0]
+            audio_data = value
+        elif value.ndim == 2:
+            num_channels = value.shape[0]
+            length_frames = value.shape[1]
+            # Interleave channels for WAV format: (C, T) -> (T, C) -> flatten
+            audio_data = value.T.flatten()
+        else:
+            raise ValueError(f"Expected audio array of shape (T,) or (C, T), got shape {value.shape}")
+
+        # Convert to int16 for WAV encoding
+        audio_int16 = (np.clip(audio_data, -1.0, 1.0) * 32767).astype(np.int16)
+
+        # Encode as WAV
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, "wb") as wav_file:
+            wav_file.setnchannels(num_channels)
+            wav_file.setsampwidth(2)  # 16-bit audio
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(audio_int16.tobytes())
+        encoded_audio = wav_buffer.getvalue()
+
+        self.pb_writer.add_summary(
+            Summary(
+                value=[
+                    Summary.Value(  # type: ignore[attr-defined]
+                        tag=tag,
+                        audio=Summary.Audio(  # type: ignore[attr-defined]
+                            sample_rate=float(sample_rate),
+                            num_channels=num_channels,
+                            length_frames=length_frames,
+                            encoded_audio_string=encoded_audio,
+                            content_type="audio/wav",
                         ),
                     ),
                 ],
