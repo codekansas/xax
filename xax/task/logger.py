@@ -896,6 +896,8 @@ class Logger:
                 centered=value.centered,
                 sep=value.sep,
             )
+        elif isinstance(value, Audio):
+            self.log_audio(key, value.audio, namespace=namespace, sample_rate=value.sample_rate)
         elif isinstance(value, Video):
             self.log_video(key, value.video, namespace=namespace, fps=value.fps)
         elif isinstance(value, Mesh):
