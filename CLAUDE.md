@@ -73,7 +73,7 @@ Launch with `MyTask.launch(Config(...))`.
 ### Key Directories
 
 - `xax/task/` - Training framework (task.py, mixins/, launchers/, loggers/)
-- `xax/arch/` - Neural architectures (attention, diffusion, llm, ssm, unet)
+- `xax/arch/` - Neural architectures (attention.py, diffusion.py, llm.py, ssm.py, unet.py)
 - `xax/nn/` - Neural network modules (embeddings, distributions, losses, lora, etc.)
 - `xax/utils/` - Utilities (JAX helpers, logging, profiling, pytree manipulation)
 - `xax/core/` - Core utilities (conf.py for OmegaConf, state.py for training state)
@@ -99,6 +99,20 @@ Launchers in `xax/task/launchers/`:
 ### Logging
 
 Abstract `Logger` interface with backends: TensorBoard, W&B, JSON, stdout. Log types include scalars, histograms, images, distributions, meshes.
+
+### LLM Architecture (xax/arch/llm.py)
+
+The LLM module provides decoder-only transformer models with:
+- `LLM` class built on `TransformerBlock` from attention.py
+- KV caching for autoregressive generation via `forward_with_cache`
+- LoRA fine-tuning support via `loraize_by_path` and `lora_filter_spec`
+- Pretrained model loading from HuggingFace (Qwen3 models)
+- JIT-compatible generation with `llm_generate_jit`
+
+Key patterns:
+- Use `forward_hidden` for training (returns hidden states, avoids materializing full logits)
+- Use `chunked_cross_entropy_loss` for memory-efficient loss computation
+- For Equinox modules with activation functions, use `@eqx.filter_checkpoint` instead of `@jax.checkpoint`
 
 ### Coding Style
 
