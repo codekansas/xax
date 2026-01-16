@@ -239,9 +239,9 @@ class LLM(eqx.Module):
 
 class LLMRepo(Enum):
     QWEN3_600M = "Qwen/Qwen3-0.6B"
-    QWEN3_1_5B = "Qwen/Qwen3-1.5B"
-    QWEN3_3B = "Qwen/Qwen3-3B"
-    QWEN3_7B = "Qwen/Qwen3-7B"
+    QWEN3_1_7B = "Qwen/Qwen3-1.7B"
+    QWEN3_4B = "Qwen/Qwen3-4B"
+    QWEN3_8B = "Qwen/Qwen3-8B"
     QWEN3_14B = "Qwen/Qwen3-14B"
     QWEN3_32B = "Qwen/Qwen3-32B"
 
@@ -813,8 +813,10 @@ def load_hf_weights_into_llm(
             return jnp.asarray(arr_np)
 
         # For sharded arrays, we need to provide the correct shard for each device
-        def callback(idx: tuple[slice, ...]) -> np.ndarray:
+        def callback(idx: tuple[slice, ...] | None) -> np.ndarray:
             # idx tells us which slice this device needs
+            if idx is None:
+                return arr_np
             return arr_np[idx]
 
         return jax.make_array_from_callback(shape, sharding, callback)
