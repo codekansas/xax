@@ -731,10 +731,7 @@ class MimiResidualVectorQuantizer(eqx.Module):
         key: PRNGKeyArray,
     ) -> "MimiResidualVectorQuantizer":
         keys = jax.random.split(key, num_quantizers)
-        layers = tuple(
-            MimiVectorQuantization.build(input_dim, codebook_size, codebook_dim, key=k)
-            for k in keys
-        )
+        layers = tuple(MimiVectorQuantization.build(input_dim, codebook_size, codebook_dim, key=k) for k in keys)
         return cls(layers=layers, num_quantizers=num_quantizers)
 
     def encode(self, x_td: Array, num_quantizers: int | None = None) -> Array:
@@ -811,9 +808,7 @@ class MimiSplitResidualVectorQuantizer(eqx.Module):
         semantic_rvq = MimiResidualVectorQuantizer.build(
             input_dim, codebook_size, codebook_dim, num_semantic_quantizers, key=k1
         )
-        acoustic_rvq = MimiResidualVectorQuantizer.build(
-            input_dim, codebook_size, codebook_dim, num_acoustic, key=k2
-        )
+        acoustic_rvq = MimiResidualVectorQuantizer.build(input_dim, codebook_size, codebook_dim, num_acoustic, key=k2)
 
         return cls(
             semantic_rvq=semantic_rvq,
@@ -873,7 +868,7 @@ class MimiSplitResidualVectorQuantizer(eqx.Module):
 
         if num_q > self.num_semantic_quantizers:
             # Decode acoustic
-            acoustic_td = self.acoustic_rvq.decode(codes_qt[self.num_semantic_quantizers:])
+            acoustic_td = self.acoustic_rvq.decode(codes_qt[self.num_semantic_quantizers :])
             output_td = output_td + acoustic_td
 
         return output_td
@@ -1091,10 +1086,7 @@ class MimiTransformer(eqx.Module):
     @classmethod
     def build(cls, config: MimiConfig, *, key: PRNGKeyArray) -> "MimiTransformer":
         keys = jax.random.split(key, config.num_hidden_layers)
-        layers = tuple(
-            MimiTransformerLayer.build(config, key=k)
-            for k in keys
-        )
+        layers = tuple(MimiTransformerLayer.build(config, key=k) for k in keys)
         layer_norm = eqx.nn.LayerNorm(config.hidden_size)
         return cls(
             layers=layers,
@@ -1300,9 +1292,7 @@ def download_mimi_repo(repo_id: str = "kyutai/mimi") -> Path:
     try:
         from huggingface_hub import snapshot_download
     except ImportError as e:
-        raise ImportError(
-            "Please install huggingface_hub: pip install huggingface-hub"
-        ) from e
+        raise ImportError("Please install huggingface_hub: pip install huggingface-hub") from e
 
     return Path(snapshot_download(repo_id=repo_id))
 
@@ -1364,9 +1354,7 @@ def build_pretrained_mimi(
     try:
         from safetensors import safe_open
     except ImportError as e:
-        raise ImportError(
-            "Please install safetensors: pip install safetensors"
-        ) from e
+        raise ImportError("Please install safetensors: pip install safetensors") from e
 
     if dtype is None:
         dtype = jnp.float32
@@ -1447,113 +1435,9 @@ def _load_weights_into_mimi(
     return model
 
 
-def _verify_with_transformers(
-    audio: np.ndarray,
-    sampling_rate: int,
-    num_quantizers: int | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Verify our implementation against HuggingFace transformers Mimi.
-
-    Args:
-        audio: Audio waveform as numpy array
-        sampling_rate: Audio sample rate
-        num_quantizers: Number of quantizers to use
-
-    Returns:
-        Tuple of (jax_codes, hf_codes) for comparison
-    """
-    try:
-        from transformers import MimiModel as HFMimiModel
-        from transformers import AutoFeatureExtractor
-        import torch
-    except ImportError as e:
-        raise ImportError(
-            "Please install transformers and torch: pip install transformers torch"
-        ) from e
-
-    logger.info("Loading HuggingFace Mimi model for verification...")
-
-    # Load HF model
-    hf_model = HFMimiModel.from_pretrained("kyutai/mimi")
-    hf_model.eval()
-
-    # Prepare input for HF model
-    audio_tensor = torch.tensor(audio).unsqueeze(0).unsqueeze(0).float()  # (1, 1, time)
-
-    # Encode with HF model
-    with torch.no_grad():
-        if num_quantizers is not None:
-            hf_codes = hf_model.encode(audio_tensor, num_quantizers=num_quantizers)
-        else:
-            hf_codes = hf_model.encode(audio_tensor)
-        hf_codes_np = hf_codes.audio_codes.squeeze(0).numpy()  # (num_q, time)
-
-    logger.info("HF model encoded to shape: %s", hf_codes_np.shape)
-
-    # Now encode with our JAX model
-    config = load_mimi_config("kyutai/mimi")
-    jax_model = MimiModel.build(config, key=jax.random.key(0))
-
-    # For a fair comparison, we need pretrained weights
-    # For now, just demonstrate the encoding pipeline
-    audio_ct = jnp.array(audio[None, :], dtype=jnp.float32)
-    jax_codes = jax_model.encode(audio_ct, num_quantizers)
-    jax_codes_np = np.array(jax_codes)
-
-    logger.info("JAX model encoded to shape: %s", jax_codes_np.shape)
-
-    return jax_codes_np, hf_codes_np
-
-
-def _verify_with_rustymimi(
-    audio: np.ndarray,
-    sampling_rate: int,
-    num_quantizers: int | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Verify our implementation against rustymimi.
-
-    Args:
-        audio: Audio waveform as numpy array
-        sampling_rate: Audio sample rate
-        num_quantizers: Number of quantizers to use
-
-    Returns:
-        Tuple of (jax_codes, rusty_codes) for comparison
-    """
-    try:
-        import rustymimi
-    except ImportError as e:
-        raise ImportError(
-            "Please install rustymimi: pip install rustymimi"
-        ) from e
-
-    logger.info("Loading rustymimi for verification...")
-
-    # Create rustymimi encoder
-    encoder = rustymimi.StreamEncoder()
-
-    # Encode with rustymimi - expects float32 audio at 24kHz
-    rusty_codes = encoder.encode(audio.astype(np.float32))
-    rusty_codes_np = np.array(rusty_codes)
-
-    logger.info("rustymimi encoded to shape: %s", rusty_codes_np.shape)
-
-    # Encode with our JAX model
-    config = MimiConfig(sampling_rate=sampling_rate)
-    jax_model = MimiModel.build(config, key=jax.random.key(0))
-
-    audio_ct = jnp.array(audio[None, :], dtype=jnp.float32)
-    jax_codes = jax_model.encode(audio_ct, num_quantizers)
-    jax_codes_np = np.array(jax_codes)
-
-    logger.info("JAX model encoded to shape: %s", jax_codes_np.shape)
-
-    return jax_codes_np, rusty_codes_np
-
-
 def main() -> None:
     """CLI for Mimi audio codec encoding/decoding."""
-    import argparse
+    import argparse  # noqa: PLC0415
 
     parser = argparse.ArgumentParser(
         description="Mimi neural audio codec - encode audio to tokens or decode tokens to audio"
@@ -1586,37 +1470,6 @@ def main() -> None:
         type=str,
         default="kyutai/mimi",
         help="HuggingFace repo for pretrained model",
-    )
-
-    # Demo command (roundtrip)
-    demo_parser = subparsers.add_parser("demo", help="Demo: encode and decode audio")
-    demo_parser.add_argument("input", type=str, help="Input audio file (WAV)")
-    demo_parser.add_argument("output", type=str, help="Output audio file (WAV)")
-    demo_parser.add_argument(
-        "--num-quantizers",
-        type=int,
-        default=None,
-        help="Number of quantizers to use",
-    )
-
-    # Verify command - compare with reference implementations
-    verify_parser = subparsers.add_parser(
-        "verify",
-        help="Verify JAX implementation against reference (transformers or rustymimi)",
-    )
-    verify_parser.add_argument("input", type=str, help="Input audio file (WAV)")
-    verify_parser.add_argument(
-        "--backend",
-        type=str,
-        choices=["transformers", "rustymimi"],
-        default="transformers",
-        help="Reference backend to compare against",
-    )
-    verify_parser.add_argument(
-        "--num-quantizers",
-        type=int,
-        default=8,
-        help="Number of quantizers to use",
     )
 
     args = parser.parse_args()
@@ -1661,8 +1514,8 @@ def main() -> None:
                 audio,
             )
 
-        # Build model (random weights for demo - use build_pretrained_mimi for real use)
-        model = MimiModel.build(config, key=jax.random.key(0))
+        # Build model.
+        model = build_pretrained_mimi()
 
         # Encode
         audio_ct = jnp.array(audio[None, :], dtype=jnp.float32)
@@ -1684,7 +1537,7 @@ def main() -> None:
         # Build model
         logger.info("Loading Mimi model from %s", args.repo)
         config = load_mimi_config(args.repo)
-        model = MimiModel.build(config, key=jax.random.key(0))
+        model = build_pretrained_mimi(args.repo)
 
         # Decode
         logger.info("Decoding codes of shape %s", codes_qt.shape)
@@ -1696,126 +1549,8 @@ def main() -> None:
         sf.write(args.output, audio, config.sampling_rate)
         logger.info("Saved audio to %s", args.output)
 
-    elif args.command == "demo":
-        # Load audio
-        logger.info("Loading audio from %s", args.input)
-        audio, sr = sf.read(args.input)
-
-        if audio.ndim > 1:
-            audio = audio.mean(axis=1)
-
-        # Build model with default config
-        config = MimiConfig()
-
-        # Resample if needed
-        if sr != config.sampling_rate:
-            logger.warning(
-                "Resampling from %d Hz to %d Hz",
-                sr,
-                config.sampling_rate,
-            )
-            ratio = config.sampling_rate / sr
-            new_len = int(len(audio) * ratio)
-            audio = np.interp(
-                np.linspace(0, len(audio) - 1, new_len),
-                np.arange(len(audio)),
-                audio,
-            )
-
-        logger.info("Building Mimi model with random weights (demo mode)")
-        model = MimiModel.build(config, key=jax.random.key(42))
-
-        # Roundtrip
-        audio_ct = jnp.array(audio[None, :], dtype=jnp.float32)
-        logger.info("Input audio shape: %s", audio_ct.shape)
-
-        # JIT compile for efficiency
-        encode_fn = jax.jit(lambda m, x: m.encode(x, args.num_quantizers))
-        decode_fn = jax.jit(lambda m, c: m.decode(c))
-
-        codes_qt = encode_fn(model, audio_ct)
-        logger.info("Encoded to codes shape: %s", codes_qt.shape)
-
-        reconstructed_ct = decode_fn(model, codes_qt)
-        logger.info("Decoded to audio shape: %s", reconstructed_ct.shape)
-
-        # Save output
-        output_audio = np.array(reconstructed_ct[0])
-        sf.write(args.output, output_audio, config.sampling_rate)
-        logger.info("Saved reconstructed audio to %s", args.output)
-
-    elif args.command == "verify":
-        # Load audio
-        logger.info("Loading audio from %s", args.input)
-        audio, sr = sf.read(args.input)
-
-        if audio.ndim > 1:
-            audio = audio.mean(axis=1)
-
-        # Resample to 24kHz if needed (Mimi's native sample rate)
-        target_sr = 24000
-        if sr != target_sr:
-            logger.warning(
-                "Resampling from %d Hz to %d Hz",
-                sr,
-                target_sr,
-            )
-            ratio = target_sr / sr
-            new_len = int(len(audio) * ratio)
-            audio = np.interp(
-                np.linspace(0, len(audio) - 1, new_len),
-                np.arange(len(audio)),
-                audio,
-            )
-            sr = target_sr
-
-        # Run verification
-        if args.backend == "transformers":
-            jax_codes, ref_codes = _verify_with_transformers(
-                audio, sr, args.num_quantizers
-            )
-        else:
-            jax_codes, ref_codes = _verify_with_rustymimi(
-                audio, sr, args.num_quantizers
-            )
-
-        # Compare results
-        logger.info("JAX codes shape: %s", jax_codes.shape)
-        logger.info("Reference codes shape: %s", ref_codes.shape)
-
-        # Check if shapes match
-        if jax_codes.shape != ref_codes.shape:
-            logger.warning(
-                "Shape mismatch: JAX %s vs Reference %s",
-                jax_codes.shape,
-                ref_codes.shape,
-            )
-            # Truncate to minimum length for comparison
-            min_q = min(jax_codes.shape[0], ref_codes.shape[0])
-            min_t = min(jax_codes.shape[1], ref_codes.shape[1])
-            jax_codes = jax_codes[:min_q, :min_t]
-            ref_codes = ref_codes[:min_q, :min_t]
-
-        # Compute accuracy (exact match rate)
-        matches = (jax_codes == ref_codes).astype(np.float32)
-        total_accuracy = matches.mean()
-        per_quantizer_accuracy = matches.mean(axis=1)
-
-        logger.info("Total token match accuracy: %.2f%%", total_accuracy * 100)
-        for q_idx, acc in enumerate(per_quantizer_accuracy):
-            logger.info("  Quantizer %d accuracy: %.2f%%", q_idx, acc * 100)
-
-        # Summary
-        if total_accuracy == 1.0:
-            logger.info("SUCCESS: JAX implementation matches reference exactly!")
-        elif total_accuracy > 0.99:
-            logger.info("GOOD: JAX implementation is very close to reference (>99%% match)")
-        elif total_accuracy > 0.9:
-            logger.warning("PARTIAL: JAX implementation differs from reference (%.1f%% match)", total_accuracy * 100)
-        else:
-            logger.error("MISMATCH: JAX implementation significantly differs from reference")
-
-        sys.exit(0 if total_accuracy > 0.9 else 1)
+    else:
+        raise ValueError(f"Unknown command: {args.command}")
 
 
 if __name__ == "__main__":
