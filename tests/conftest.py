@@ -36,7 +36,7 @@ def has_gpu() -> bool:
         platforms = os.environ["JAX_PLATFORMS"].lower()
         if "cuda" in platforms or "gpu" in platforms:
             try:
-                return len(jax.devices("gpu")) > 0
+                return len(jax.local_devices(backend="gpu")) > 0
             except RuntimeError:
                 return False
 
@@ -52,7 +52,7 @@ def has_gpu() -> bool:
 def has_mps() -> bool:
     """Check if an MPS device is available."""
     try:
-        jax.devices("xla_mps")
+        jax.local_devices(backend="xla_mps")
         return True
     except RuntimeError:
         return False

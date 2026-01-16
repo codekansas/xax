@@ -41,11 +41,13 @@ class Config(xax.SupervisedConfig):
     min_learning_rate: float = xax.field(1e-5, help="Minimum learning rate for cosine decay")
     warmup_steps: int = xax.field(50, help="Number of warmup steps")
     sequence_length: int = xax.field(1025, help="Maximum sequence length (N - 1 should be a multiple of 64 for cuDNN)")
-    use_gradient_checkpointing: bool = xax.field(True, help="Recompute activations to save memory")
     eval_prompt: str = xax.field("To be or not to be", help="Prompt to use for evaluation")
 
 
 class ShakespeareLora(xax.SupervisedTask[Config]):
+    # Large models that require tensor parallelism
+    LARGE_MODELS = (xax.LLMRepo.QWEN3_8B, xax.LLMRepo.QWEN3_14B, xax.LLMRepo.QWEN3_32B)
+
     def __init__(self, config: Config) -> None:
         super().__init__(config)
 
@@ -59,6 +61,11 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
             ),
             dtype=jnp.int32,
         )
+
+    @override
+    def should_do_model_parallel(self) -> bool:
+        # Only enable model parallelism for models that won't easily fit on a single GPU.
+        return self.config.llm_repo in self.LARGE_MODELS
 
     @override
     def get_model(self, params: xax.InitParams) -> xax.LLM:
