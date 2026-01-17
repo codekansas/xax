@@ -329,8 +329,8 @@ NAME_MAP: dict[str, str] = {
     "load_hf_config": "arch.llm",
     "load_hf_weights_into_llm": "arch.llm",
     "tie_embedding_and_head": "arch.llm",
-    "MimiModel": "arch.mimi",
-    "build_pretrained_mimi": "arch.mimi",
+    "MimiModel": "arch.speech.codec",
+    "build_pretrained_mimi": "arch.speech.codec",
     "BaseSSMBlock": "arch.ssm",
     "DiagSSMBlock": "arch.ssm",
     "SSM": "arch.ssm",
@@ -602,7 +602,7 @@ if IMPORT_ALL or TYPE_CHECKING:
         load_hf_weights_into_llm,
         tie_embedding_and_head,
     )
-    from xax.arch.mimi import MimiModel, build_pretrained_mimi
+    from xax.arch.speech.codec import MimiModel, build_pretrained_mimi
     from xax.arch.ssm import SSM, BaseSSMBlock, DiagSSMBlock, SSMBlock
     from xax.arch.unet import UNet
     from xax.core.conf import (

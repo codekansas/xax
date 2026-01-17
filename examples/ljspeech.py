@@ -135,7 +135,10 @@ class Config(xax.SupervisedConfig):
 
     # Data settings
     processed_data_path: str | None = xax.field(None, help="Path to pre-processed data")
-    max_examples: int | None = xax.field(500, help="Max examples to use (None for all)")
+    max_examples: int | None = xax.field(None, help="Max examples to use (None for all)")
+
+    # Eval settings
+    eval_prompt: str = xax.field("Hello world, this is a test of the text to speech system.", help="Text for eval")
 
 
 class LJSpeechTTS(xax.SupervisedTask[Config]):
@@ -159,6 +162,11 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         self.audio_end_id = self.tokenizer.convert_tokens_to_ids(AUDIO_END_TOKEN)
         self.text_vocab_size = len(self.tokenizer)
         self.audio_token_offset = self.text_vocab_size
+
+        # Pre-tokenize evaluation prompt for audio generation
+        prompt_tokens = self.tokenizer.encode(config.eval_prompt, add_special_tokens=True)
+        prompt_tokens.append(self.audio_start_id)  # Add audio start token
+        self._eval_prompt_tokens = jnp.array(prompt_tokens, dtype=jnp.int32)
 
     @override
     def get_model(self, params: xax.InitParams) -> TTSModel:
@@ -298,93 +306,75 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         }
 
         if heavy:
-            gen_key, key = jax.random.split(key)
-            generated_audio = self._generate_audio(model, batch, gen_key)
-            metrics["generated_audio"] = xax.Audio(generated_audio, sample_rate=MIMI_SAMPLE_RATE)
+            gen_key, _ = jax.random.split(key)
+            audio_t = self._generate_audio_jit(model, batch, gen_key)
+            metrics["generated_audio"] = xax.Audio(audio_t, sample_rate=MIMI_SAMPLE_RATE)
 
         return loss, metrics
 
-    def _generate_audio(self, model: TTSModel, batch: Batch, key: PRNGKeyArray) -> Array | None:
-        """Generate complete audio from first example in batch."""
-        # Get text prompt from first example
-        first_input = batch["input_ids"][0]
-        text_end_idx = jnp.argmax(first_input == self.audio_start_id) + 1
+    def _generate_audio_jit(self, model: TTSModel, batch: Batch, key: PRNGKeyArray) -> Array:
+        """Generate audio in a JIT-compatible way.
 
-        prompt_tokens = first_input[:text_end_idx]
-        prompt_tokens = jnp.where(prompt_tokens == 0, self.tokenizer.pad_token_id, prompt_tokens)
+        Uses a fixed pre-tokenized prompt and fixed shapes throughout.
+        """
+        max_len = self.config.max_audio_length
 
-        # Step 1: Generate semantic codes (Q0) with Qwen
+        # Use pre-tokenized evaluation prompt
+        prompt_tokens = self._eval_prompt_tokens
+
+        # Generate semantic codes with LLM
         gen_key, acoustic_key = jax.random.split(key)
         gen_result = xax.llm_generate_jit(
             model.llm,
             prompt_tokens,
             eos_id=self.audio_end_id,
-            max_new_tokens=self.config.max_audio_length,
+            max_new_tokens=max_len,
             temperature=0.8,
             top_p=0.95,
             key=gen_key,
         )
         generated = gen_result[0]
 
-        # Extract semantic codes
-        semantic_codes = self._extract_semantic_codes(generated)
-        if semantic_codes is None or len(semantic_codes) == 0:
-            return None
+        # Find audio region in generated sequence (start after audio_start token)
+        gen_audio_start = jnp.argmax(generated == self.audio_start_id) + 1
 
-        semantic_codes_t = jnp.array(semantic_codes)
-        num_frames = len(semantic_codes)
+        # Extract semantic codes (Q0) - they are offset by audio_token_offset
+        audio_region = jax.lax.dynamic_slice(generated, (gen_audio_start,), (max_len,))
+        semantic_codes = audio_region - self.audio_token_offset
+        # Clamp to valid range
+        semantic_codes = jnp.clip(semantic_codes, 0, MIMI_CODEBOOK_SIZE - 1)
 
-        # Step 2: Generate acoustic codes (Q1-Qn) using acoustic head
-        # Get hidden states for the generated sequence
+        # Get hidden states for acoustic generation
         hidden_td = model.llm.forward_hidden(generated)
+        hidden_dim = hidden_td.shape[-1]
 
-        # Find positions of audio tokens
-        audio_start = int(jnp.argmax(generated == self.audio_start_id)) + 1
-        audio_hidden = hidden_td[audio_start : audio_start + num_frames]
+        # Extract hidden states for audio region
+        audio_hidden = jax.lax.dynamic_slice(hidden_td, (gen_audio_start, 0), (max_len, hidden_dim))
 
-        # Generate each acoustic layer
-        all_codes = [semantic_codes_t]
+        # Generate acoustic codes layer by layer
+        all_codes = [semantic_codes]
+        prev_codes = semantic_codes
 
-        prev_codes = semantic_codes_t
         for q_idx in range(self.config.num_acoustic_quantizers):
             layer_key = jax.random.fold_in(acoustic_key, q_idx)
 
-            def sample_code(hidden_d: Array, prev_code: Array, key: PRNGKeyArray) -> Array:
+            def sample_code(hidden_d: Array, prev_code: Array, sample_key: PRNGKeyArray) -> Array:
                 logits = model.acoustic_head(hidden_d, prev_code)
-                return jax.random.categorical(key, logits / 0.8)
+                return jax.random.categorical(sample_key, logits / 0.8)
 
-            keys = jax.random.split(layer_key, num_frames)
+            keys = jax.random.split(layer_key, max_len)
             next_codes = jax.vmap(sample_code)(audio_hidden, prev_codes, keys)
             all_codes.append(next_codes)
             prev_codes = next_codes
 
-        # Stack all quantizer codes: (num_quantizers, time)
+        # Stack codes: (num_quantizers, max_len)
         codes_qt = jnp.stack(all_codes, axis=0)
 
-        # Decode with Mimi
+        # Decode with Mimi - decode full sequence
+        # The audio will be longer than needed but that's OK for evaluation
         audio_ct = model.mimi.decode(codes_qt)
+
         return audio_ct[0]  # Return first channel
-
-    def _extract_semantic_codes(self, tokens: Array) -> list[int] | None:
-        """Extract semantic (Q0) codes from generated sequence."""
-        tokens_list = tokens.tolist()
-
-        try:
-            start_idx = tokens_list.index(self.audio_start_id) + 1
-        except ValueError:
-            return None
-
-        try:
-            end_idx = tokens_list.index(self.audio_end_id)
-        except ValueError:
-            end_idx = len(tokens_list)
-
-        codes = []
-        for t in tokens_list[start_idx:end_idx]:
-            if self.audio_token_offset <= t < self.audio_token_offset + MIMI_CODEBOOK_SIZE:
-                codes.append(t - self.audio_token_offset)
-
-        return codes if codes else None
 
     @override
     def decode_tokens(self, tokens: Array | np.ndarray) -> str:
@@ -588,8 +578,8 @@ if __name__ == "__main__":
             max_grad_norm=1.0,
             gradient_accumulation_steps=2,
             log_heavy_every_n_seconds=60,
-            max_steps=60 * 10,  # 10 minutes for testing
+            # max_steps=60 * 10,  # 10 minutes for testing
             step_kind="second",
-            max_examples=50,  # Use 50 examples for quick testing
+            # max_examples=50,  # Use 50 examples for quick testing
         ),
     )
