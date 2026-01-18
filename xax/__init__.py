@@ -66,6 +66,8 @@ __all__ = [
     "load_whisper_config",
     "log_mel_spectrogram",
     "transcribe_with_whisper",
+    "MIMI_CODEBOOK_SIZE",
+    "MIMI_SAMPLE_RATE",
     "MimiModel",
     "build_pretrained_mimi",
     "BaseSSMBlock",
@@ -346,6 +348,8 @@ NAME_MAP: dict[str, str] = {
     "load_whisper_config": "arch.speech.asr",
     "log_mel_spectrogram": "arch.speech.asr",
     "transcribe_with_whisper": "arch.speech.asr",
+    "MIMI_CODEBOOK_SIZE": "arch.speech.codec",
+    "MIMI_SAMPLE_RATE": "arch.speech.codec",
     "MimiModel": "arch.speech.codec",
     "build_pretrained_mimi": "arch.speech.codec",
     "BaseSSMBlock": "arch.ssm",
@@ -618,7 +622,7 @@ if IMPORT_ALL or TYPE_CHECKING:
         log_mel_spectrogram,
         transcribe_with_whisper,
     )
-    from xax.arch.speech.codec import MimiModel, build_pretrained_mimi
+    from xax.arch.speech.codec import MIMI_CODEBOOK_SIZE, MIMI_SAMPLE_RATE, MimiModel, build_pretrained_mimi
     from xax.arch.ssm import SSM, BaseSSMBlock, DiagSSMBlock, SSMBlock
     from xax.arch.unet import UNet
     from xax.core.conf import (

@@ -39,6 +39,9 @@ except ModuleNotFoundError as e:
 
 logger = logging.getLogger(__name__)
 
+MIMI_SAMPLE_RATE = 24000
+MIMI_CODEBOOK_SIZE = 2048
+
 
 @dataclass(frozen=True)
 class MimiConfig:

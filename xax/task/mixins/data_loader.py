@@ -38,6 +38,7 @@ class DataloadersConfig(ProcessConfig, BaseConfig):
     dataset_workers: int = field(II("xax.num_workers:-1"), help="Number of workers for loading training samples")
     shuffle_seed: int = field(1337, help="Seed for the shuffle")
     debug_dataloader: bool = field(False, help="Debug dataloaders")
+    overwrite_dataset: bool = field(False, help="Don't prompt user to overwrite a cached preprocessed dataset")
 
 
 Config = TypeVar("Config", bound=DataloadersConfig)

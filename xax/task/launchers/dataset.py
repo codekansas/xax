@@ -24,7 +24,7 @@ def run_dataset_processing(
     task_obj.add_logger_handlers(logger)
 
     cache_path = task_obj.preprocessed_dataset_path
-    if cache_path.exists():
+    if cache_path.exists() and not task_obj.config.overwrite_dataset:
         response: str = ""
         while response.lower() not in ["y", "n"]:
             response = input(f"Dataset already exists at {cache_path}. Overwrite? (y/n): ")
