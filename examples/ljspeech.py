@@ -46,7 +46,8 @@ class Batch(TypedDict):
     input_ids: Array
     attention_mask: Array
     labels: Array
-    acoustic_codes: Array  # (batch, num_acoustic_quantizers, seq_len)
+    audio_codes: Array  # (batch, num_mimi_codes, seq_len)
+    audio_codes_mask: Array  # (batch, seq_len)
 
 
 class AcousticHead(eqx.Module):
@@ -253,8 +254,8 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         ).mean()
 
         # Acoustic loss (Q1-Qn prediction with acoustic head)
-        acoustic_codes_bqt = batch["acoustic_codes"]  # (B, Q, T)
-        bsz, num_q, tsz = acoustic_codes_bqt.shape
+        acoustic_codes_bqt = batch["audio_codes"][:, 1:]  # Remove semantic codes.
+        _, num_q, tsz = acoustic_codes_bqt.shape
 
         # Find audio region in sequence (where labels are audio tokens)
         # We need to align hidden states with acoustic codes
@@ -312,8 +313,9 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
         if heavy:
             gen_key, _ = jax.random.split(key)
-            audio_t = self._generate_audio_jit(model, batch, gen_key)
+            audio_t, decoded_audio_t = self._generate_audio_jit(model, batch, gen_key)
             metrics["generated_audio"] = xax.Audio(audio_t, sample_rate=xax.MIMI_SAMPLE_RATE)
+            metrics["real_audio"] = xax.Audio(decoded_audio_t, sample_rate=xax.MIMI_SAMPLE_RATE)
 
             # Transcribe generated audio with Whisper for evaluation
             transcript_tokens, _, _ = xax.transcribe_with_whisper(
@@ -326,7 +328,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
         return loss, metrics
 
-    def _generate_audio_jit(self, model: TTSModel, batch: Batch, key: PRNGKeyArray) -> Array:
+    def _generate_audio_jit(self, model: TTSModel, batch: Batch, key: PRNGKeyArray) -> tuple[Array, Array]:
         """Generate audio in a JIT-compatible way.
 
         Uses a fixed pre-tokenized prompt and fixed shapes throughout.
@@ -388,7 +390,11 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         # The audio will be longer than needed but that's OK for evaluation
         audio_ct = model.mimi.decode(codes_qt)
 
-        return audio_ct[0]  # Return first channel
+        # Also decode the true audio sequence, for reference.
+        audio_codes = batch["audio_codes"][0]
+        decoded_audio_ct = model.mimi.decode(audio_codes)
+
+        return audio_ct[0], decoded_audio_ct[0]
 
     @override
     def decode_tokens(self, tokens: np.ndarray, token_type: str) -> str:
@@ -417,121 +423,125 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
     @override
     def preprocess_dataset(self) -> Dataset:
-        columns = ["input_ids", "attention_mask", "labels", "acoustic_codes"]
+        columns = ["input_ids", "attention_mask", "labels", "audio_codes", "audio_codes_mask"]
 
-        # Loads the pre-trained Mimi model.
-        mimi = xax.build_pretrained_mimi()
-
-        # Create batched encode function using vmap
-        batched_encode = jax.jit(
-            jax.vmap(
-                lambda audio_ct: mimi.encode(
-                    audio_ct,
-                    num_quantizers=self.config.num_acoustic_quantizers + 1,
-                )
-            )
-        )
-
-        # Load and process dataset
-        logger.info("Processing LJSpeech dataset...")
+        # Load raw dataset
+        logger.info("Loading LJSpeech dataset...")
         raw_ds = load_dataset("keithito/lj_speech", split="train")
 
-        def process_batch(
-            examples: dict[str, list],
-        ) -> dict[str, list]:
+        # Stage 1: CPU-parallel audio resampling and normalization
+        # This runs on multiple CPU cores simultaneously
+        max_audio_seconds = self.config.max_audio_seconds
+
+        def resample_audio(example: dict) -> dict:
+            """Resample and normalize audio (CPU-bound, parallelized)."""
+            audio = example["audio"]["array"]
+            sr = example["audio"]["sampling_rate"]
+
+            # Check duration - mark invalid samples
+            duration = len(audio) / sr
+            if duration > max_audio_seconds:
+                return {"resampled_audio": None, "audio_length": 0}
+
+            # Resample to Mimi sample rate
+            if sr != xax.MIMI_SAMPLE_RATE:
+                audio = librosa.resample(audio, orig_sr=sr, target_sr=xax.MIMI_SAMPLE_RATE)
+
+            # Normalize
+            audio = audio.astype(np.float32)
+            max_val = max(abs(audio.max()), abs(audio.min()), 1e-8)
+            audio = audio / max_val
+
+            return {"resampled_audio": audio, "audio_length": len(audio)}
+
+        # TODO: We make the dataset much shorter here just to test the code.
+        raw_ds = raw_ds.select(range(500))
+
+        logger.info("Stage 1: Resampling audio on CPU (parallel)...")
+        resampled_ds = raw_ds.map(
+            resample_audio,
+            num_proc=32,
+            desc="Resampling audio",
+        )
+
+        # Filter out invalid samples (too long)
+        resampled_ds = resampled_ds.filter(
+            lambda x: x["audio_length"] > 0,
+            num_proc=32,
+            desc="Filtering invalid samples",
+        )
+
+        # Stage 2: GPU-batched Mimi encoding
+        # Load Mimi model and create batched encode function
+        logger.info("Stage 2: Encoding audio with Mimi on GPU (batched)...")
+        mimi = xax.build_pretrained_mimi(dtype=jnp.bfloat16)
+        num_quantizers = self.config.num_acoustic_quantizers + 1
+
+        @jax.jit
+        def batch_encode(audio_bct: Array) -> Array:
+            return jax.vmap(lambda audio_ct: mimi.encode(audio_ct, num_quantizers=num_quantizers))(audio_bct)
+
+        # Pre-cache tokenizer settings
+        max_text_length = self.config.max_text_length
+        max_audio_length = self.config.max_audio_length
+        audio_token_offset = self.audio_token_offset
+        audio_start_id = self.audio_start_id
+        audio_end_id = self.audio_end_id
+        pad_token_id = self.tokenizer.pad_token_id
+
+        max_audio_samples = round(self.config.max_audio_seconds * xax.MIMI_SAMPLE_RATE)
+
+        def encode_and_tokenize_batch(examples: dict[str, list]) -> dict[str, list]:
+            """Encode audio with Mimi and create final tokenized sequences."""
             outputs: dict[str, list] = {column: [] for column in columns}
-            bsz = len(examples["id"])
-
-            # First pass: preprocess audio and filter invalid samples
-            preprocessed_audio: list[tuple[int, np.ndarray]] = []  # (index, audio)
-            valid_indices: list[int] = []
-
-            for idx in range(bsz):
-                audio = examples["audio"][idx]["array"]
-                sr = examples["audio"][idx]["sampling_rate"]
-
-                # Check duration
-                duration = len(audio) / sr
-                if duration > self.config.max_audio_seconds:
-                    continue
-
-                # Resample to Mimi sample rate
-                if sr != xax.MIMI_SAMPLE_RATE:
-                    audio = librosa.resample(audio, orig_sr=sr, target_sr=xax.MIMI_SAMPLE_RATE)
-
-                # Normalize
-                audio = audio.astype(np.float32)
-                max_val = max(abs(audio.max()), abs(audio.min()), 1e-8)
-                audio = audio / max_val
-
-                preprocessed_audio.append((idx, audio))
-                valid_indices.append(idx)
-
-            if not preprocessed_audio:
-                return outputs
-
-            # Find max audio length in this batch for padding
-            max_audio_samples = max(len(audio) for _, audio in preprocessed_audio)
+            audio_list = examples["resampled_audio"]
 
             # Pad all audio to the same length and stack into batch
-            audio_batch: list[np.ndarray] = []
-            audio_lengths: list[int] = []
-            for _, audio in preprocessed_audio:
-                audio_lengths.append(len(audio))
-                padded = np.zeros(max_audio_samples, dtype=np.float32)
-                padded[: len(audio)] = audio
-                audio_batch.append(padded[None, :])  # Add channel dim: (1, time)
-
-            audio_batch_bct = np.stack(audio_batch, axis=0)  # (batch, channels, time)
+            audio_batch_np = np.zeros(shape=(len(audio_list), max_audio_samples))
+            for idx, audio in enumerate(audio_list):
+                audio_batch_np[idx, : len(audio)] = audio[:max_audio_samples]
+            audio_batch = jnp.array(audio_batch_np, dtype=jnp.bfloat16)
 
             # Batch encode with Mimi on GPU
-            audio_batch_jax = jnp.array(audio_batch_bct)
-            codes_batch_bqt = batched_encode(audio_batch_jax)  # (batch, num_quantizers, time')
+            codes_batch_bqt = batch_encode(audio_batch[:, None, :])
             codes_batch_np = np.array(codes_batch_bqt)
 
-            # Process each valid sample
-            for batch_idx, orig_idx in enumerate(valid_indices):
-                audio_codes = codes_batch_np[batch_idx]  # (num_quantizers, time')
-                num_frames = audio_codes.shape[1]
-
-                # Calculate actual number of valid frames based on original audio length
-                # Mimi downsamples by a factor (typically 320 for 24kHz -> 75Hz frame rate)
-                orig_audio_len = audio_lengths[batch_idx]
+            # Process each sample
+            for idx in range(len(audio_list)):
+                audio_codes = codes_batch_np[idx]  # (num_quantizers, time')
+                orig_audio_len = examples["audio_length"][idx]
 
                 # Estimate valid frames (Mimi has ~320x downsampling)
                 valid_frames = (orig_audio_len + 319) // 320
 
-                if valid_frames > self.config.max_audio_length:
+                if valid_frames > max_audio_length:
                     continue
 
                 # Trim to valid frames
                 audio_codes = audio_codes[:, :valid_frames]
-                num_frames = valid_frames
 
                 # Get semantic codes (Q0) and acoustic codes (Q1+)
                 semantic_codes = audio_codes[0]  # (T',)
-                num_quantizers = self.config.num_acoustic_quantizers + 1
-                acoustic_codes = audio_codes[1:] if num_quantizers > 1 else np.zeros((0, num_frames), dtype=np.int32)
 
                 # Tokenize text
-                text = examples["normalized_text"][orig_idx]
+                text = examples["normalized_text"][idx]
                 text_tokens = self.tokenizer.encode(text, add_special_tokens=True)
-                if len(text_tokens) > self.config.max_text_length:
+                if len(text_tokens) > max_text_length:
                     continue
 
                 # Create sequence: [TEXT] [AUDIO_START] [SEMANTIC_CODES] [AUDIO_END]
-                audio_tokens = [self.audio_token_offset + int(c) for c in semantic_codes]
-                full_sequence = text_tokens + [self.audio_start_id] + audio_tokens + [self.audio_end_id]
+                audio_tokens = [audio_token_offset + int(c) for c in semantic_codes]
+                full_sequence = text_tokens + [audio_start_id] + audio_tokens + [audio_end_id]
 
                 # Labels: -100 for text, actual tokens for audio
-                labels = [-100] * len(text_tokens) + [-100] + audio_tokens + [self.audio_end_id]
+                labels = [-100] * len(text_tokens) + [-100] + audio_tokens + [audio_end_id]
 
                 # Pad to fixed length
-                max_length = self.config.max_text_length + self.config.max_audio_length + 3
+                max_length = max_text_length + max_audio_length + 3
                 pad_length = max_length - len(full_sequence)
 
                 if pad_length > 0:
-                    full_sequence = full_sequence + [self.tokenizer.pad_token_id] * pad_length
+                    full_sequence = full_sequence + [pad_token_id] * pad_length
                     labels = labels + [-100] * pad_length
                     attention_mask = [1] * (max_length - pad_length) + [0] * pad_length
                 else:
@@ -540,26 +550,32 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
                     attention_mask = [1] * max_length
 
                 # Pad acoustic codes
-                if acoustic_codes.shape[0] > 0:
-                    acoustic_padded = np.zeros((acoustic_codes.shape[0], self.config.max_audio_length), dtype=np.int32)
-                    actual_frames = acoustic_codes.shape[1]
-                    acoustic_padded[:, :actual_frames] = acoustic_codes
+                if audio_codes.shape[0] > 0:
+                    audio_padded = np.zeros((audio_codes.shape[0], max_audio_length), dtype=np.int32)
+                    actual_frames = audio_codes.shape[1]
+                    audio_padded[:, :actual_frames] = audio_codes
+
+                    audio_codes_mask = np.zeros((max_audio_length,), dtype=np.bool_)
+                    audio_codes_mask[:valid_frames] = True
                 else:
-                    acoustic_padded = np.zeros((0, self.config.max_audio_length), dtype=np.int32)
+                    audio_padded = np.zeros((0, max_audio_length), dtype=np.int32)
+                    audio_codes_mask = np.zeros((max_audio_length,), dtype=np.bool_)
 
                 outputs["input_ids"].append(full_sequence)
                 outputs["attention_mask"].append(attention_mask)
                 outputs["labels"].append(labels)
-                outputs["acoustic_codes"].append(acoustic_padded)
+                outputs["audio_codes"].append(audio_padded)
+                outputs["audio_codes_mask"].append(audio_codes_mask)
 
             return outputs
 
-        ds = raw_ds.map(
-            process_batch,
+        ds = resampled_ds.map(
+            encode_and_tokenize_batch,
             batched=True,
-            batch_size=32,  # Process 32 samples at a time on GPU
-            remove_columns=raw_ds.column_names,
-            desc="Processing LJSpeech",
+            batch_size=64,
+            num_proc=32,
+            remove_columns=resampled_ds.column_names,
+            desc="Encoding with Mimi",
         )
 
         ds.set_format(type="numpy", columns=columns)

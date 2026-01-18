@@ -70,6 +70,8 @@ __all__ = [
     "MIMI_SAMPLE_RATE",
     "MimiModel",
     "build_pretrained_mimi",
+    "download_mimi_repo",
+    "load_mimi_config",
     "BaseSSMBlock",
     "DiagSSMBlock",
     "SSM",
@@ -352,6 +354,8 @@ NAME_MAP: dict[str, str] = {
     "MIMI_SAMPLE_RATE": "arch.speech.codec",
     "MimiModel": "arch.speech.codec",
     "build_pretrained_mimi": "arch.speech.codec",
+    "download_mimi_repo": "arch.speech.codec",
+    "load_mimi_config": "arch.speech.codec",
     "BaseSSMBlock": "arch.ssm",
     "DiagSSMBlock": "arch.ssm",
     "SSM": "arch.ssm",
@@ -622,7 +626,14 @@ if IMPORT_ALL or TYPE_CHECKING:
         log_mel_spectrogram,
         transcribe_with_whisper,
     )
-    from xax.arch.speech.codec import MIMI_CODEBOOK_SIZE, MIMI_SAMPLE_RATE, MimiModel, build_pretrained_mimi
+    from xax.arch.speech.codec import (
+        MIMI_CODEBOOK_SIZE,
+        MIMI_SAMPLE_RATE,
+        MimiModel,
+        build_pretrained_mimi,
+        download_mimi_repo,
+        load_mimi_config,
+    )
     from xax.arch.ssm import SSM, BaseSSMBlock, DiagSSMBlock, SSMBlock
     from xax.arch.unet import UNet
     from xax.core.conf import (
