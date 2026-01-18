@@ -1221,7 +1221,7 @@ def main() -> None:
 
     # Transcribe
     logger.info("Transcribing...")
-    tokens, token_len, _ = transcribe_with_whisper(
+    tokens, _, _ = transcribe_with_whisper(
         model,
         audio_t,
         config.eos_token_id,
