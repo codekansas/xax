@@ -54,6 +54,11 @@ __all__ = [
     "load_hf_config",
     "load_hf_weights_into_llm",
     "tie_embedding_and_head",
+    "WhisperConfig",
+    "WhisperModel",
+    "build_pretrained_whisper",
+    "load_whisper_config",
+    "log_mel_spectrogram",
     "MimiModel",
     "build_pretrained_mimi",
     "BaseSSMBlock",
@@ -329,6 +334,11 @@ NAME_MAP: dict[str, str] = {
     "load_hf_config": "arch.llm",
     "load_hf_weights_into_llm": "arch.llm",
     "tie_embedding_and_head": "arch.llm",
+    "WhisperConfig": "arch.speech.asr",
+    "WhisperModel": "arch.speech.asr",
+    "build_pretrained_whisper": "arch.speech.asr",
+    "load_whisper_config": "arch.speech.asr",
+    "log_mel_spectrogram": "arch.speech.asr",
     "MimiModel": "arch.speech.codec",
     "build_pretrained_mimi": "arch.speech.codec",
     "BaseSSMBlock": "arch.ssm",
@@ -601,6 +611,14 @@ if IMPORT_ALL or TYPE_CHECKING:
         load_hf_config,
         load_hf_weights_into_llm,
         tie_embedding_and_head,
+    )
+    from xax.arch.speech.asr import (
+        WHISPER_SAMPLE_RATE,
+        WhisperConfig,
+        WhisperModel,
+        build_pretrained_whisper,
+        load_whisper_config,
+        log_mel_spectrogram,
     )
     from xax.arch.speech.codec import MimiModel, build_pretrained_mimi
     from xax.arch.ssm import SSM, BaseSSMBlock, DiagSSMBlock, SSMBlock

@@ -13,6 +13,7 @@ import functools
 import json
 import logging
 import math
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -23,6 +24,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, PRNGKeyArray
+
+from xax.utils.jax import jit as xax_jit
 
 try:
     from huggingface_hub import snapshot_download
@@ -670,9 +673,6 @@ class WhisperModel(eqx.Module):
         return self.decode(token_ids_t, encoder_out_td)
 
 
-# Mel spectrogram extraction
-
-
 @functools.lru_cache(maxsize=1)
 def mel_filters(
     n_mels: int = WHISPER_N_MELS,
@@ -797,9 +797,6 @@ def log_mel_spectrogram(
     log_mel_tf = (log_mel_tf + 4.0) / 4.0
 
     return log_mel_tf.T  # (n_mels, time)
-
-
-# Pretrained model loading
 
 
 @functools.lru_cache(maxsize=16)
@@ -1075,64 +1072,19 @@ def _load_weights_into_whisper(
     return model
 
 
-def load_whisper_tokenizer(repo_id: str = "openai/whisper-large-v3-turbo") -> dict:
-    """Load Whisper tokenizer from HuggingFace Hub.
-
-    Returns a dictionary with encode/decode functions.
-    """
-    try:
-        from tokenizers import Tokenizer  # noqa: PLC0415
-    except ImportError:
-        try:
-            from transformers import WhisperTokenizer  # noqa: PLC0415
-
-            path = download_whisper_repo(repo_id)
-            tokenizer = WhisperTokenizer.from_pretrained(str(path))
-            return {
-                "encode": tokenizer.encode,
-                "decode": tokenizer.decode,
-                "tokenizer": tokenizer,
-            }
-        except ImportError as e:
-            raise ImportError("Please install transformers: pip install transformers") from e
-
-    path = download_whisper_repo(repo_id)
-    tokenizer_path = path / "tokenizer.json"
-
-    if tokenizer_path.exists():
-        tokenizer = Tokenizer.from_file(str(tokenizer_path))
-        return {
-            "encode": lambda text: tokenizer.encode(text).ids,
-            "decode": lambda ids: tokenizer.decode(ids),
-            "tokenizer": tokenizer,
-        }
-
-    # Fall back to transformers
-    try:
-        from transformers import WhisperTokenizer  # noqa: PLC0415
-
-        tokenizer = WhisperTokenizer.from_pretrained(str(path))
-        return {
-            "encode": tokenizer.encode,
-            "decode": tokenizer.decode,
-            "tokenizer": tokenizer,
-        }
-    except ImportError as e:
-        raise ImportError("Please install transformers: pip install transformers") from e
-
-
-def transcribe(
+@xax_jit(static_argnames=("eos_token_id", "max_tokens"))
+def transcribe_with_whisper(
     model: WhisperModel,
     audio_t: Array,
-    config: WhisperConfig,
-    max_tokens: int = 224,
-) -> tuple[Array, Array]:
+    eos_token_id: int,
+    max_tokens: int,
+) -> tuple[Array, Array, Array]:
     """Transcribe audio using greedy decoding.
 
     Args:
         model: Whisper model
         audio_t: Audio waveform of shape (time,)
-        config: Model configuration
+        eos_token_id: EOS token ID
         max_tokens: Maximum number of tokens to generate
 
     Returns:
@@ -1158,20 +1110,40 @@ def transcribe(
     task_token = 50360  # <|transcribe|>
     notimestamps_token = 50364  # <|notimestamps|>
 
-    tokens = jnp.array([sot_token, lang_token, task_token, notimestamps_token], dtype=jnp.int32)
+    tokens_t = jnp.array([sot_token, lang_token, task_token, notimestamps_token], dtype=jnp.int32)
 
-    # Greedy decoding
-    for _ in range(max_tokens):
-        logits_tv = model.decode(tokens, encoder_out_td)
-        next_token = jnp.argmax(logits_tv[-1])
+    # Greedy decoding using lax.scan
+    max_len = tokens_t.shape[0] + max_tokens
+    tokens_full_t = jnp.full((max_len,), eos_token_id, dtype=tokens_t.dtype)
+    tokens_full_t = tokens_full_t.at[: tokens_t.shape[0]].set(tokens_t)
+    init_len_s = jnp.array(tokens_t.shape[0], dtype=jnp.int32)
+    init_done_s = jnp.array(False)
 
-        # Check for EOS
-        if next_token == config.eos_token_id:
-            break
+    def decode_step(
+        carry: tuple[Array, Array, Array],
+        _: None,
+    ) -> tuple[tuple[Array, Array, Array], None]:
+        tokens_full_t, cur_len_s, done_s = carry
+        logits_tv = model.decode(tokens_full_t, encoder_out_td)
+        next_token_s = jnp.argmax(logits_tv[cur_len_s - 1]).astype(tokens_full_t.dtype)
+        is_eos_s = next_token_s == eos_token_id
+        should_write_s = ~done_s
 
-        tokens = jnp.concatenate([tokens, next_token[None]])
+        def write_token(tokens_full_t: Array) -> Array:
+            return tokens_full_t.at[cur_len_s].set(next_token_s)
 
-    return tokens, encoder_out_td
+        tokens_full_t = jax.lax.cond(should_write_s, write_token, lambda t: t, tokens_full_t)
+        new_len_s = jnp.minimum(cur_len_s + should_write_s.astype(cur_len_s.dtype), max_len)
+        new_done_s = done_s | is_eos_s
+        return (tokens_full_t, new_len_s, new_done_s), None
+
+    (tokens_full_t, final_len_s, _), _ = jax.lax.scan(
+        decode_step,
+        (tokens_full_t, init_len_s, init_done_s),
+        length=max_tokens,
+    )
+
+    return tokens_full_t, final_len_s, encoder_out_td
 
 
 def main() -> None:
@@ -1199,31 +1171,39 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    try:
+        from transformers import WhisperTokenizerFast  # noqa: PLC0415
+    except ImportError:
+        logger.error("Please install transformers: pip install transformers")
+        sys.exit(1)
+
+    # Import audio libraries
+    try:
+        import soundfile as sf  # noqa: PLC0415
+    except ImportError:
+        logger.error("Please install soundfile: pip install soundfile")
+        sys.exit(1)
+
     # Load audio
     logger.info("Loading audio from %s", args.input)
     try:
-        import librosa  # noqa: PLC0415
+        import soundfile as sf  # noqa: PLC0415
 
-        audio, sr = librosa.load(args.input, sr=WHISPER_SAMPLE_RATE, mono=True)
-    except ImportError:
-        try:
-            import soundfile as sf  # noqa: PLC0415
-
-            audio, sr = sf.read(args.input)
-            if audio.ndim > 1:
-                audio = audio.mean(axis=1)
-            # Resample if needed
-            if sr != WHISPER_SAMPLE_RATE:
-                ratio = WHISPER_SAMPLE_RATE / sr
-                new_len = int(len(audio) * ratio)
-                audio = np.interp(
-                    np.linspace(0, len(audio) - 1, new_len),
-                    np.arange(len(audio)),
-                    audio,
-                )
-        except ImportError as e:
-            logger.error("Please install librosa or soundfile: pip install librosa soundfile")
-            raise e
+        audio, sr = sf.read(args.input)
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        # Resample if needed
+        if sr != WHISPER_SAMPLE_RATE:
+            ratio = WHISPER_SAMPLE_RATE / sr
+            new_len = int(len(audio) * ratio)
+            audio = np.interp(
+                np.linspace(0, len(audio) - 1, new_len),
+                np.arange(len(audio)),
+                audio,
+            )
+    except ImportError as e:
+        logger.error("Please install librosa or soundfile: pip install librosa soundfile")
+        raise e
 
     audio_t = jnp.array(audio, dtype=jnp.float32)
     logger.info("Audio loaded: %.2f seconds", len(audio) / WHISPER_SAMPLE_RATE)
@@ -1236,15 +1216,20 @@ def main() -> None:
 
     # Load tokenizer
     logger.info("Loading tokenizer")
-    tokenizer = load_whisper_tokenizer(args.repo)
+    path = download_whisper_repo(args.repo)
+    tokenizer: WhisperTokenizerFast = WhisperTokenizerFast.from_pretrained(str(path))
 
     # Transcribe
     logger.info("Transcribing...")
-    tokens, _ = transcribe(model, audio_t, config, args.max_tokens)
+    tokens, token_len, _ = transcribe_with_whisper(
+        model,
+        audio_t,
+        config.eos_token_id,
+        max_tokens=args.max_tokens,
+    )
 
     # Decode tokens
-    token_ids = [int(t) for t in tokens[4:]]  # Skip special tokens
-    text = tokenizer["decode"](token_ids)
+    text = tokenizer.decode(tokens, skip_special_tokens=True)
 
     print(f"\nTranscription:\n{text}")
 

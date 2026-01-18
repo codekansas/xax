@@ -27,6 +27,7 @@ from datasets import Dataset, load_dataset
 from jaxtyping import Array, PRNGKeyArray
 from transformers import AutoTokenizer
 from transformers.models.qwen2.tokenization_qwen2_fast import Qwen2TokenizerFast
+from transformers.models.whisper.tokenization_whisper_fast import WhisperTokenizerFast
 
 import xax
 
@@ -99,6 +100,7 @@ class TTSModel(eqx.Module):
     llm: xax.LLM  # Qwen for semantic codes
     acoustic_head: AcousticHead  # MLP for acoustic codes
     mimi: xax.MimiModel
+    whisper: xax.WhisperModel
 
     @staticmethod
     def build(llm: xax.LLM, num_acoustic_layers: int, key: PRNGKeyArray) -> "TTSModel":
@@ -108,6 +110,7 @@ class TTSModel(eqx.Module):
             llm=llm,
             acoustic_head=acoustic_head,
             mimi=xax.build_pretrained_mimi(),
+            whisper=xax.build_pretrained_whisper(),
         )
 
 
@@ -145,6 +148,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
     """Fine-tune Qwen3 for text-to-speech with hierarchical codec prediction."""
 
     tokenizer: Qwen2TokenizerFast
+    whisper_tokenizer: WhisperTokenizerFast
     mimi: xax.MimiModel
     audio_start_id: int
     audio_end_id: int
@@ -167,6 +171,11 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         prompt_tokens = self.tokenizer.encode(config.eval_prompt, add_special_tokens=True)
         prompt_tokens.append(self.audio_start_id)  # Add audio start token
         self._eval_prompt_tokens = jnp.array(prompt_tokens, dtype=jnp.int32)
+
+        # Load Whisper model for ASR evaluation (frozen)
+        logger.info("Loading Whisper model for ASR evaluation")
+        self.whisper_model = xax.build_pretrained_whisper()
+        self.whisper_tokenizer = xax.load_whisper_tokenizer()
 
     @override
     def get_model(self, params: xax.InitParams) -> TTSModel:
@@ -310,6 +319,10 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             audio_t = self._generate_audio_jit(model, batch, gen_key)
             metrics["generated_audio"] = xax.Audio(audio_t, sample_rate=MIMI_SAMPLE_RATE)
 
+            # Transcribe generated audio with Whisper for evaluation
+            transcript_tokens = self._transcribe_audio_jit(audio_t)
+            metrics["transcript"] = xax.Tokens(transcript_tokens)
+
         return loss, metrics
 
     def _generate_audio_jit(self, model: TTSModel, batch: Batch, key: PRNGKeyArray) -> Array:
@@ -376,9 +389,66 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
         return audio_ct[0]  # Return first channel
 
+    def _transcribe_audio_jit(self, audio_t: Array) -> Array:
+        """Transcribe audio using frozen Whisper model via pure_callback.
+
+        Uses pure_callback to avoid capturing the large Whisper model in JIT trace.
+        Resamples from Mimi sample rate (24kHz) to Whisper sample rate (16kHz).
+        """
+        max_tokens = 68  # 4 prompt + 64 generated
+
+        def transcribe_fn(audio: np.ndarray) -> np.ndarray:
+            """Transcribe audio outside of JIT."""
+            # Resample from Mimi 24kHz to Whisper 16kHz
+            target_16k_len = xax.WHISPER_SAMPLE_RATE * 30
+            indices = np.linspace(0, len(audio) - 1, target_16k_len)
+            audio_16k = np.interp(indices, np.arange(len(audio)), audio)
+            audio_16k = jnp.array(audio_16k, dtype=jnp.float32)
+
+            # Compute mel spectrogram
+            mel_mt = xax.log_mel_spectrogram(audio_16k)
+
+            # Encode audio
+            encoder_out = self.whisper_model.encode(mel_mt)
+
+            # Greedy decoding
+            tokens = jnp.array([50258, 50259, 50360, 50364], dtype=jnp.int32)
+            eos_token = 50257
+
+            for _ in range(64):
+                logits_tv = self.whisper_model.decode(tokens, encoder_out)
+                next_token = int(jnp.argmax(logits_tv[-1]))
+                if next_token == eos_token:
+                    break
+                tokens = jnp.concatenate([tokens, jnp.array([next_token], dtype=jnp.int32)])
+
+            # Pad to fixed length
+            result = np.full(max_tokens, eos_token, dtype=np.int32)
+            result[: len(tokens)] = np.array(tokens)
+            return result
+
+        result = jax.pure_callback(
+            transcribe_fn,
+            jax.ShapeDtypeStruct((max_tokens,), jnp.int32),
+            audio_t,
+        )
+        return result
+
     @override
     def decode_tokens(self, tokens: Array | np.ndarray) -> str:
+        """Decode tokens to text.
+
+        Handles both TTS tokens (text + audio) and Whisper transcript tokens.
+        """
         token_list: list[int] = tokens.tolist()
+
+        # Check if these are Whisper tokens (start with special tokens 50258, 50259, etc.)
+        if len(token_list) >= 4 and token_list[0] == 50258:
+            # Whisper tokens - skip the first 4 special tokens and decode with Whisper tokenizer
+            transcript_tokens = [t for t in token_list[4:] if t != 50257]  # Skip EOS
+            return self.whisper_tokenizer["decode"](transcript_tokens)
+
+        # TTS tokens - filter out audio tokens and decode with Qwen tokenizer
         text_tokens = [t for t in token_list if 0 < t < self.audio_token_offset]
         return self.tokenizer.decode(text_tokens, skip_special_tokens=False)
 
