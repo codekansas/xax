@@ -1723,7 +1723,7 @@ def _load_weights_into_mimi(
             embed = embed_sum / cluster_usage[:, None]
             set_weight(lambda m, li=layer_idx: m.quantizer.acoustic_rvq.layers[li].embeddings_kd, embed)
 
-    logger.info("Loaded %d/%d weight tensors", loaded_count, total_keys)
+    logger.info("Loaded %d/%d weight tensors into Mimi model", loaded_count, total_keys)
     return model
 
 

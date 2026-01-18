@@ -678,6 +678,7 @@ def mel_filters(
     n_mels: int = WHISPER_N_MELS,
     n_fft: int = WHISPER_N_FFT,
     sample_rate: int = WHISPER_SAMPLE_RATE,
+    dtype: jnp.dtype | None = None,
 ) -> Array:
     """Create mel filterbank matching HuggingFace Whisper implementation.
 
@@ -685,23 +686,6 @@ def mel_filters(
 
     Returns filterbank of shape (n_mels, n_fft // 2 + 1)
     """
-    try:
-        # Use HuggingFace's mel_filter_bank if available for exact match
-        from transformers.audio_utils import mel_filter_bank  # noqa: PLC0415
-
-        filters = mel_filter_bank(
-            num_frequency_bins=1 + n_fft // 2,
-            num_mel_filters=n_mels,
-            min_frequency=0.0,
-            max_frequency=8000.0,
-            sampling_rate=sample_rate,
-            norm="slaney",
-            mel_scale="slaney",
-        )
-        return jnp.array(filters.T, dtype=jnp.float32)  # Transpose to (n_mels, n_freqs)
-    except ImportError:
-        pass
-
     # Fallback to custom implementation
     low_freq = 0.0
     high_freq = 8000.0
@@ -737,7 +721,7 @@ def mel_filters(
     enorm = 2.0 / (hz_points[2 : n_mels + 2] - hz_points[:n_mels])
     filterbank *= enorm[:, None]
 
-    return jnp.array(filterbank, dtype=jnp.float32)
+    return jnp.array(filterbank, dtype=dtype)
 
 
 def log_mel_spectrogram(
@@ -746,6 +730,7 @@ def log_mel_spectrogram(
     n_fft: int = WHISPER_N_FFT,
     hop_length: int = WHISPER_HOP_LENGTH,
     padding: int = 0,
+    dtype: jnp.dtype | None = None,
 ) -> Array:
     """Compute log mel spectrogram matching HuggingFace Whisper.
 
@@ -755,6 +740,7 @@ def log_mel_spectrogram(
         n_fft: FFT size
         hop_length: Hop length
         padding: Padding to add
+        dtype: Optional dtype for model parameters
 
     Returns:
         Log mel spectrogram of shape (n_mels, time')
@@ -762,6 +748,9 @@ def log_mel_spectrogram(
     # Pad audio
     if padding > 0:
         audio_t = jnp.pad(audio_t, (0, padding), mode="constant")
+
+    if dtype is None:
+        dtype = audio_t.dtype
 
     # Create Hann window (periodic, like torch.hann_window with periodic=True)
     window = jnp.hanning(n_fft + 1)[:-1]
@@ -786,7 +775,7 @@ def log_mel_spectrogram(
     magnitudes_tf = magnitudes_tf[:-1]
 
     # Apply mel filterbank
-    filters_mf = mel_filters(n_mels, n_fft)
+    filters_mf = mel_filters(n_mels, n_fft, dtype=dtype)
     mel_tf = magnitudes_tf @ filters_mf.T  # (time, n_mels)
 
     # Convert to log scale with clamping
@@ -796,7 +785,7 @@ def log_mel_spectrogram(
     log_mel_tf = jnp.maximum(log_mel_tf, log_mel_tf.max() - 8.0)
     log_mel_tf = (log_mel_tf + 4.0) / 4.0
 
-    return log_mel_tf.T  # (n_mels, time)
+    return log_mel_tf.T.astype(dtype)  # (n_mels, time)
 
 
 @functools.lru_cache(maxsize=16)
@@ -847,7 +836,7 @@ def build_pretrained_whisper(
         Loaded WhisperModel with pretrained weights
     """
     if dtype is None:
-        dtype = jnp.float32
+        dtype = jnp.bfloat16
 
     config = load_whisper_config(repo_id)
     path = download_whisper_repo(repo_id)
@@ -1068,7 +1057,7 @@ def _load_weights_into_whisper(
         if w is not None:
             set_weight(lambda m: m.proj_out.weight, w)
 
-    logger.info("Loaded %d/%d weight tensors", loaded_count, total_keys)
+    logger.info("Loaded %d/%d weight tensors into Whisper model", loaded_count, total_keys)
     return model
 
 
@@ -1205,14 +1194,15 @@ def main() -> None:
         logger.error("Please install librosa or soundfile: pip install librosa soundfile")
         raise e
 
-    audio_t = jnp.array(audio, dtype=jnp.float32)
-    logger.info("Audio loaded: %.2f seconds", len(audio) / WHISPER_SAMPLE_RATE)
-
     # Load model
     logger.info("Loading Whisper model from %s", args.repo)
     config = load_whisper_config(args.repo)
     model = build_pretrained_whisper(args.repo)
     logger.info("Model loaded: %d encoder layers, %d decoder layers", config.encoder_layers, config.decoder_layers)
+
+    dtype = model.proj_out.weight.dtype  # Get dtype from model weights.
+    audio_t = jnp.array(audio, dtype=dtype)
+    logger.info("Audio loaded: %.2f seconds", len(audio) / WHISPER_SAMPLE_RATE)
 
     # Load tokenizer
     logger.info("Loading tokenizer")

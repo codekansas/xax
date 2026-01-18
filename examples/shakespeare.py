@@ -180,7 +180,7 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
         return loss, metrics
 
     @override
-    def decode_tokens(self, tokens: Array | np.ndarray) -> str:
+    def decode_tokens(self, tokens: np.ndarray, token_type: str) -> str:
         # Convert to list and strip trailing zeros (padding from generation)
         token_list: list[int] = tokens.tolist()
         last_zero = len(token_list)

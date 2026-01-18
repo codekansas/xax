@@ -14,7 +14,6 @@ import gc
 import logging
 import os
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TypedDict, override
 
 import equinox as eqx
@@ -174,8 +173,9 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
         # Load Whisper model for ASR evaluation (frozen)
         logger.info("Loading Whisper model for ASR evaluation")
-        self.whisper_model = xax.build_pretrained_whisper()
-        self.whisper_tokenizer = xax.load_whisper_tokenizer()
+        path = xax.download_whisper_repo()
+        self.whisper_config = xax.load_whisper_config()
+        self.whisper_tokenizer = WhisperTokenizerFast.from_pretrained(str(path))
 
     @override
     def get_model(self, params: xax.InitParams) -> TTSModel:
@@ -205,7 +205,8 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         llm_spec = xax.lora_filter_spec(model.llm)  # LoRA on LLM.
         acoustic_spec = jax.tree.map(lambda _: True, model.acoustic_head)  # Train acoustic head.
         mimi_spec = jax.tree.map(lambda _: False, model.mimi)  # Don't train Mimi model.
-        return TTSModel(llm=llm_spec, acoustic_head=acoustic_spec, mimi=mimi_spec)
+        whisper_spec = jax.tree.map(lambda _: False, model.whisper)  # Don't train Whisper model.
+        return TTSModel(llm=llm_spec, acoustic_head=acoustic_spec, mimi=mimi_spec, whisper=whisper_spec)
 
     @override
     def get_optimizer(self) -> xax.Optimizer:
@@ -320,8 +321,13 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             metrics["generated_audio"] = xax.Audio(audio_t, sample_rate=MIMI_SAMPLE_RATE)
 
             # Transcribe generated audio with Whisper for evaluation
-            transcript_tokens = self._transcribe_audio_jit(audio_t)
-            metrics["transcript"] = xax.Tokens(transcript_tokens)
+            transcript_tokens, _, _ = xax.transcribe_with_whisper(
+                model=model.whisper,
+                audio_t=audio_t,
+                eos_token_id=self.whisper_config.eos_token_id,
+                max_tokens=64,
+            )
+            metrics["transcript"] = xax.Tokens(transcript_tokens, tokenizer="whisper")
 
         return loss, metrics
 
@@ -389,84 +395,32 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
         return audio_ct[0]  # Return first channel
 
-    def _transcribe_audio_jit(self, audio_t: Array) -> Array:
-        """Transcribe audio using frozen Whisper model via pure_callback.
-
-        Uses pure_callback to avoid capturing the large Whisper model in JIT trace.
-        Resamples from Mimi sample rate (24kHz) to Whisper sample rate (16kHz).
-        """
-        max_tokens = 68  # 4 prompt + 64 generated
-
-        def transcribe_fn(audio: np.ndarray) -> np.ndarray:
-            """Transcribe audio outside of JIT."""
-            # Resample from Mimi 24kHz to Whisper 16kHz
-            target_16k_len = xax.WHISPER_SAMPLE_RATE * 30
-            indices = np.linspace(0, len(audio) - 1, target_16k_len)
-            audio_16k = np.interp(indices, np.arange(len(audio)), audio)
-            audio_16k = jnp.array(audio_16k, dtype=jnp.float32)
-
-            # Compute mel spectrogram
-            mel_mt = xax.log_mel_spectrogram(audio_16k)
-
-            # Encode audio
-            encoder_out = self.whisper_model.encode(mel_mt)
-
-            # Greedy decoding
-            tokens = jnp.array([50258, 50259, 50360, 50364], dtype=jnp.int32)
-            eos_token = 50257
-
-            for _ in range(64):
-                logits_tv = self.whisper_model.decode(tokens, encoder_out)
-                next_token = int(jnp.argmax(logits_tv[-1]))
-                if next_token == eos_token:
-                    break
-                tokens = jnp.concatenate([tokens, jnp.array([next_token], dtype=jnp.int32)])
-
-            # Pad to fixed length
-            result = np.full(max_tokens, eos_token, dtype=np.int32)
-            result[: len(tokens)] = np.array(tokens)
-            return result
-
-        result = jax.pure_callback(
-            transcribe_fn,
-            jax.ShapeDtypeStruct((max_tokens,), jnp.int32),
-            audio_t,
-        )
-        return result
-
     @override
-    def decode_tokens(self, tokens: Array | np.ndarray) -> str:
-        """Decode tokens to text.
-
-        Handles both TTS tokens (text + audio) and Whisper transcript tokens.
-        """
+    def decode_tokens(self, tokens: np.ndarray, token_type: str) -> str:
         token_list: list[int] = tokens.tolist()
 
-        # Check if these are Whisper tokens (start with special tokens 50258, 50259, etc.)
-        if len(token_list) >= 4 and token_list[0] == 50258:
-            # Whisper tokens - skip the first 4 special tokens and decode with Whisper tokenizer
-            transcript_tokens = [t for t in token_list[4:] if t != 50257]  # Skip EOS
-            return self.whisper_tokenizer["decode"](transcript_tokens)
+        match token_type:
+            case "whisper":
+                transcript_tokens = [t for t in token_list[4:]]
+                return self.whisper_tokenizer.decode(transcript_tokens, skip_special_tokens=True)
 
-        # TTS tokens - filter out audio tokens and decode with Qwen tokenizer
-        text_tokens = [t for t in token_list if 0 < t < self.audio_token_offset]
-        return self.tokenizer.decode(text_tokens, skip_special_tokens=False)
+            case "llm":
+                text_tokens = [t for t in token_list if 0 < t < self.audio_token_offset]
+                return self.tokenizer.decode(text_tokens, skip_special_tokens=False)
+
+            case _:
+                raise ValueError(f"Invalid token type: {token_type}")
 
     @override
     def get_dataset(self) -> Dataset:
-        mimi = xax.build_pretrained_mimi()
-
-        # Check for pre-processed data
-        cache_path = Path("/tmp/ljspeech_processed")
+        cache_path = xax.get_data_dir() / "ljspeech-processed"
         if cache_path.exists():
             logger.info("Loading pre-processed dataset from %s", cache_path)
-            ds = Dataset.load_from_disk(str(cache_path))
-
-            # Remove Mimi model from memory.
-            del mimi
-            gc.collect()
-
+            ds = Dataset.load_from_disk(cache_path)
             return ds
+
+        # Loads the pre-trained Mimi model.
+        mimi = xax.build_pretrained_mimi()
 
         # Load and process dataset (should be done before JAX init)
         logger.info("Processing LJSpeech dataset...")

@@ -8,6 +8,7 @@ from types import TracebackType
 from typing import Generic, Self, TypeVar
 
 import jax
+import numpy as np
 
 from xax.core.conf import field
 from xax.core.state import State
@@ -103,6 +104,9 @@ class LoggerMixin(ArtifactsMixin[Config], Generic[Config]):
 
         self.logger = Logger()
 
+        # Hook up the decode_tokens method to the logger.
+        self.logger.decode_tokens = self.decode_tokens
+
     def log_directory(self) -> Path | None:
         return None
 
@@ -155,6 +159,13 @@ class LoggerMixin(ArtifactsMixin[Config], Generic[Config]):
             case _:
                 # This shouldn't happen, as validation should take care of this
                 raise Exception(f"Invalid logger_backend '{self.config.logger_backend}'")
+
+    def decode_tokens(self, tokens: np.ndarray, token_type: str) -> str:
+        raise NotImplementedError(
+            "When using a Tokens metric you must implement the `decode_tokens` method "
+            "to convert to a string which can be logged. The `token_type` argument "
+            "is passed from the `log_tokens` method or `LogTokens` class."
+        )
 
     def write_logs(self, state: State, heavy: bool) -> None:
         self.logger.write(state, heavy)
