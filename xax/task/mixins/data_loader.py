@@ -1,8 +1,10 @@
 """Defines a mixin for instantiating dataloaders."""
 
+import functools
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
 from queue import Empty, Queue
 from threading import Event, Thread
 from typing import Generic, Iterator, TypeVar
@@ -14,7 +16,7 @@ from datasets import Dataset, DatasetDict, IterableDataset, IterableDatasetDict
 from jax.sharding import NamedSharding, PartitionSpec as P
 from omegaconf import II
 
-from xax.core.conf import field
+from xax.core.conf import field, get_data_dir
 from xax.core.state import Batch
 from xax.task.base import BaseConfig, BaseTask
 from xax.task.mixins.process import ProcessConfig, ProcessMixin
@@ -376,6 +378,22 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
         Returns:
             The dataset to train on.
         """
+
+    def preprocess_dataset(self) -> Dataset:
+        """Runs dataset preprocessing step.
+
+        This is a simple way to write a preprocessing script into your task
+        to generate a dataset that can be used for training.
+        """
+        raise NotImplementedError(
+            "Preprocessing is not implemented for this task - override `preprocess_dataset` "
+            "to return a preprocessed dataset, which will be cached to "
+            f"{self.preprocessed_dataset_path}."
+        )
+
+    @functools.cached_property
+    def preprocessed_dataset_path(self) -> Path:
+        return get_data_dir() / "processed" / self.task_name
 
     def get_streaming_iterator(
         self,

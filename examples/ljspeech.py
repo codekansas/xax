@@ -10,9 +10,7 @@ This allows efficient generation:
 2. Acoustic codes (Q1-Qn) are generated layer-by-layer using cached embeddings
 """
 
-import gc
 import logging
-import os
 from dataclasses import dataclass
 from typing import TypedDict, override
 
@@ -133,11 +131,10 @@ class Config(xax.SupervisedConfig):
     max_audio_length: int = xax.field(256, help="Maximum audio token length")
 
     # Audio settings
-    max_audio_seconds: float = xax.field(5.0, help="Maximum audio duration")
+    max_audio_seconds: float = xax.field(10.0, help="Maximum audio duration")
 
     # Data settings
     processed_data_path: str | None = xax.field(None, help="Path to pre-processed data")
-    max_examples: int | None = xax.field(None, help="Max examples to use (None for all)")
 
     # Eval settings
     eval_prompt: str = xax.field("Hello world, this is a test of the text to speech system.", help="Text for eval")
@@ -413,11 +410,16 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
     @override
     def get_dataset(self) -> Dataset:
-        cache_path = xax.get_data_dir() / "ljspeech-processed"
-        if cache_path.exists():
-            logger.info("Loading pre-processed dataset from %s", cache_path)
-            ds = Dataset.load_from_disk(cache_path)
-            return ds
+        if not self.preprocessed_dataset_path.exists():
+            raise FileNotFoundError(
+                f"Pre-processed dataset not found at {self.preprocessed_dataset_path}. You should first run this "
+                "script with `--launcher dataset` to preprocess the dataset."
+            )
+        return Dataset.load_from_disk(self.preprocessed_dataset_path)
+
+    @override
+    def preprocess_dataset(self) -> Dataset:
+        columns = ["input_ids", "attention_mask", "labels", "acoustic_codes"]
 
         # Loads the pre-trained Mimi model.
         mimi = xax.build_pretrained_mimi()
@@ -426,59 +428,65 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         logger.info("Processing LJSpeech dataset...")
         raw_ds = load_dataset("keithito/lj_speech", split="train")
 
-        # Limit examples for faster testing
-        max_examples = self.config.max_examples or len(raw_ds)
-        logger.info("Processing up to %d examples", max_examples)
+        def process_batch(
+            examples: dict[str, list],
+            *,
+            mimi: xax.MimiModel = mimi,
+        ) -> dict[str, list]:
+            outputs: dict[str, list] = {column: [] for column in columns}
+            for idx in range(len(examples["id"])):
+                example = {k: v[idx] for k, v in examples.items()}
+                result = _process_example(
+                    example,
+                    tokenizer=self.tokenizer,
+                    mimi=mimi,
+                    max_text_length=self.config.max_text_length,
+                    max_audio_length=self.config.max_audio_length,
+                    max_audio_seconds=self.config.max_audio_seconds,
+                    audio_token_offset=self.audio_token_offset,
+                    audio_start_id=self.audio_start_id,
+                    audio_end_id=self.audio_end_id,
+                    num_quantizers=self.config.num_acoustic_quantizers + 1,  # Q0 + acoustic
+                )
+                if result is not None:
+                    for key, value in result.items():
+                        outputs[key].append(value)
+            return outputs
 
-        # Process without multiprocessing to avoid JAX fork issues
-        processed_examples = []
-        for idx, example in enumerate(raw_ds):
-            if idx >= max_examples:
-                break
-            if idx % 10 == 0:
-                logger.info("Processing example %d/%d", idx, max_examples)
-
-            result = _process_example(
-                example,
-                tokenizer=self.tokenizer,
-                mimi=mimi,
-                max_text_length=self.config.max_text_length,
-                max_audio_length=self.config.max_audio_length,
-                max_audio_seconds=self.config.max_audio_seconds,
-                audio_token_offset=self.audio_token_offset,
-                audio_start_id=self.audio_start_id,
-                audio_end_id=self.audio_end_id,
-                num_quantizers=self.config.num_acoustic_quantizers + 1,  # Q0 + acoustic
-            )
-            if result["input_ids"] is not None:
-                processed_examples.append(result)
-
-        logger.info("Processed %d examples", len(processed_examples))
-
-        # Create dataset from processed examples
-        ds = Dataset.from_dict(
-            {
-                "input_ids": [e["input_ids"] for e in processed_examples],
-                "attention_mask": [e["attention_mask"] for e in processed_examples],
-                "labels": [e["labels"] for e in processed_examples],
-                "acoustic_codes": [e["acoustic_codes"] for e in processed_examples],
-            }
+        ds = raw_ds.map(
+            process_batch,
+            batched=True,
+            remove_columns=raw_ds.column_names,
+            desc="Processing LJSpeech",
         )
 
-        # Save to cache for faster subsequent runs
-        ds.save_to_disk(str(cache_path))
-        logger.info("Saved processed dataset to %s", cache_path)
+        ds.set_format(type="numpy", columns=columns)
 
-        # Remove Mimi model from memory.
-        del mimi
-        gc.collect()
-
-        ds.set_format(type="numpy", columns=["input_ids", "attention_mask", "labels", "acoustic_codes"])
         return ds
 
 
+class InputExampleAudioDict(TypedDict):
+    array: Array
+    sampling_rate: int
+
+
+class InputExampleDict(TypedDict):
+    id: str
+    file: str
+    text: str
+    normalized_text: str
+    audio: InputExampleAudioDict
+
+
+class ExampleDict(TypedDict):
+    input_ids: Array
+    attention_mask: Array
+    labels: Array
+    acoustic_codes: Array
+
+
 def _process_example(
-    example: dict,
+    example: InputExampleDict,
     tokenizer: Qwen2TokenizerFast,
     mimi: xax.MimiModel,
     max_text_length: int,
@@ -488,7 +496,7 @@ def _process_example(
     audio_start_id: int,
     audio_end_id: int,
     num_quantizers: int,
-) -> dict:
+) -> ExampleDict | None:
     """Process a single example: tokenize text and encode audio."""
     # Get audio
     audio = example["audio"]["array"]
@@ -497,7 +505,8 @@ def _process_example(
     # Check duration
     duration = len(audio) / sr
     if duration > max_audio_seconds:
-        return {"input_ids": None, "attention_mask": None, "labels": None, "acoustic_codes": None}
+        logger.warning("Skipping %s because audio duration %f > %f", example["id"], duration, max_audio_seconds)
+        return None
 
     # Resample to Mimi sample rate
     if sr != MIMI_SAMPLE_RATE:
@@ -515,7 +524,8 @@ def _process_example(
 
     num_frames = audio_codes.shape[1]
     if num_frames > max_audio_length:
-        return {"input_ids": None, "attention_mask": None, "labels": None, "acoustic_codes": None}
+        logger.warning("Skipping %s because codec frames %d > %d", example["id"], num_frames, max_audio_length)
+        return None
 
     # Get semantic codes (Q0) and acoustic codes (Q1+)
     semantic_codes = audio_codes[0]  # (T',)
@@ -525,7 +535,8 @@ def _process_example(
     text = example["normalized_text"]
     text_tokens = tokenizer.encode(text, add_special_tokens=True)
     if len(text_tokens) > max_text_length:
-        text_tokens = text_tokens[:max_text_length]
+        logger.warning("Skipping %s because text length %d > %d", example["id"], len(text_tokens), max_text_length)
+        return None
 
     # Create sequence: [TEXT] [AUDIO_START] [SEMANTIC_CODES] [AUDIO_END]
     audio_tokens = [audio_token_offset + c for c in semantic_codes]
@@ -593,17 +604,13 @@ def _resize_embeddings(model: xax.LLM, new_vocab_size: int, key: PRNGKeyArray) -
 
 
 if __name__ == "__main__":
-    # Disable JAX preallocation to avoid memory issues during data processing
-    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-
     LJSpeechTTS.launch(
         Config(
             batch_size=4,
             max_grad_norm=1.0,
             gradient_accumulation_steps=2,
             log_heavy_every_n_seconds=60,
-            # max_steps=60 * 10,  # 10 minutes for testing
+            max_steps=60 * 10,  # 10 minutes for testing
             step_kind="second",
-            # max_examples=50,  # Use 50 examples for quick testing
         ),
     )
