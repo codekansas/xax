@@ -454,9 +454,6 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
             return {"resampled_audio": audio, "audio_length": len(audio)}
 
-        # TODO: We make the dataset much shorter here just to test the code.
-        raw_ds = raw_ds.select(range(500))
-
         logger.info("Stage 1: Resampling audio on CPU (parallel)...")
         resampled_ds = raw_ds.map(
             resample_audio,
@@ -572,8 +569,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         ds = resampled_ds.map(
             encode_and_tokenize_batch,
             batched=True,
-            batch_size=64,
-            num_proc=32,
+            batch_size=128,
             remove_columns=resampled_ds.column_names,
             desc="Encoding with Mimi",
         )
