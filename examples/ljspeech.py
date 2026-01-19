@@ -12,7 +12,7 @@ This allows efficient generation:
 
 import logging
 from dataclasses import dataclass
-from typing import TypedDict, override
+from typing import Iterator, TypedDict, override
 
 import equinox as eqx
 import jax
@@ -22,6 +22,7 @@ import numpy as np
 import optax
 from datasets import Dataset, load_dataset
 from jaxtyping import Array, PRNGKeyArray
+from tokenizers import Tokenizer, models, pre_tokenizers, trainers
 from transformers import AutoTokenizer
 from transformers.models.qwen2.tokenization_qwen2_fast import Qwen2TokenizerFast
 from transformers.models.whisper.tokenization_whisper_fast import WhisperTokenizerFast
@@ -43,127 +44,587 @@ DEFAULT_LORA_TARGETS = ("q_proj", "v_proj", "gate", "up")
 
 
 class Batch(TypedDict):
-    input_ids: Array  # Full sequence: [text_tokens, audio_start, flattened_audio_tokens, audio_end]
-    attention_mask: Array
-    labels: Array  # -100 for text tokens, actual tokens for audio portion
-    audio_codes: Array  # (batch, num_quantizers, audio_frames) - original unflattened for decoding
-    audio_codes_mask: Array  # (batch, audio_frames) - valid audio frame positions
-    text_tokens: Array  # (batch, max_text_length) - just the text tokens
+    text_tokens: Array  # (batch, max_text_length) - text for cross-attention
     text_mask: Array  # (batch, max_text_length) - valid text positions
+    semantic_bpe: Array  # (batch, max_bpe_length) - BPE semantic tokens (T2S target)
+    semantic_bpe_mask: Array  # (batch, max_bpe_length) - valid BPE positions
+    bpe_spans: Array  # (batch, max_bpe_length) - spans for each BPE token
+    dilated_semantic: Array  # (batch, max_audio_frames) - expanded semantic tokens (S2A input)
+    acoustic_tokens_flat: Array  # (batch, max_audio_frames * 7) - flattened Q1-Q7 acoustic tokens
+    audio_mask: Array  # (batch, max_audio_frames) - valid audio positions
 
 
-class AcousticHead(eqx.Module):
-    """Lightweight MLP to predict acoustic codes from Qwen embeddings + previous layer code.
+class T2SModel(eqx.Module):
+    """Text-to-Semantic model: generates BPE semantic tokens from text.
 
-    For each acoustic layer i (1 to num_acoustic_quantizers):
-    - Input: [hidden_state, embedding(code_{i-1})]
-    - Output: logits for code_i
+    Uses cross-attention to text embeddings for conditioning. The model autoregressively
+    generates BPE-compressed semantic tokens, which are later expanded and used to
+    generate acoustic tokens.
+
+    Note: BPE embedding and output head weights are tied (shared) for parameter efficiency.
     """
 
-    code_embed: eqx.nn.Embedding  # Embed previous layer's code
-    hidden_proj: eqx.nn.Linear  # Project hidden state
-    output_proj: eqx.nn.Linear  # Output logits
-    num_layers: int = eqx.field(static=True)
+    llm: xax.LLM  # Base LLM (with LoRA)
+    cross_attn: xax.CrossAttentionBlock  # Shared cross-attention layer
+    cross_attn_norm: xax.RMSNorm  # Pre-norm for cross-attention
+    bpe_embed: eqx.nn.Embedding  # Embeddings for BPE tokens (also used as output head)
+    text_embed_proj: eqx.nn.Linear | None  # Optional projection for text embeddings
+    bpe_vocab_size: int = eqx.field(static=True)
 
     @staticmethod
-    def build(hidden_dim: int, num_layers: int, key: PRNGKeyArray) -> "AcousticHead":
-        k1, k2, k3 = jax.random.split(key, 3)
-        mlp_dim = 512  # Lightweight MLP
-        return AcousticHead(
-            code_embed=eqx.nn.Embedding(xax.MIMI_CODEBOOK_SIZE, mlp_dim, key=k1),
-            hidden_proj=eqx.nn.Linear(hidden_dim, mlp_dim, key=k2),
-            output_proj=eqx.nn.Linear(mlp_dim, xax.MIMI_CODEBOOK_SIZE, key=k3),
-            num_layers=num_layers,
-        )
-
-    def __call__(self, hidden_d: Array, prev_code: Array) -> Array:
-        """Predict next acoustic layer's code.
+    def build(
+        llm: xax.LLM,
+        bpe_vocab_size: int,
+        key: PRNGKeyArray,
+        bpe_embed_weights: Array | None = None,
+    ) -> "T2SModel":
+        """Build T2S model from pretrained LLM.
 
         Args:
-            hidden_d: Hidden state from Qwen, shape (hidden_dim,)
-            prev_code: Previous layer's code, scalar
+            llm: Pretrained LLM (can have LoRA applied)
+            bpe_vocab_size: Vocabulary size for BPE tokens
+            key: PRNG key for initialization
+            bpe_embed_weights: Optional pre-computed BPE embedding weights from Mimi,
+                shape (bpe_vocab_size, embed_dim). If provided, uses these instead of random init.
 
         Returns:
-            Logits for next code, shape (codebook_size,)
+            T2SModel instance
         """
-        code_emb_d = self.code_embed(prev_code)
-        hidden_proj_d = self.hidden_proj(hidden_d)
-        combined_d = jax.nn.gelu(code_emb_d + hidden_proj_d)
-        return self.output_proj(combined_d)
+        k1, k2 = jax.random.split(key, 2)
+        embed_dim = llm.config.embed_dim
+
+        cross_attn = xax.CrossAttentionBlock.build(
+            embed_dim=embed_dim,
+            num_heads=llm.config.q_heads,
+            key=k1,
+            use_rotary_embeddings=False,
+        )
+        cross_attn_norm = xax.RMSNorm.build(embed_dim, eps=llm.config.rms_eps)
+
+        # BPE embedding - weights are also used for output projection (tied weights)
+        if bpe_embed_weights is not None:
+            assert bpe_embed_weights.shape == (bpe_vocab_size, embed_dim), (
+                f"BPE embed shape mismatch: {bpe_embed_weights.shape} vs ({bpe_vocab_size}, {embed_dim})"
+            )
+            bpe_embed = eqx.nn.Embedding(bpe_vocab_size, embed_dim, weight=bpe_embed_weights)
+        else:
+            bpe_embed = eqx.nn.Embedding(bpe_vocab_size, embed_dim, key=k2)
+
+        return T2SModel(
+            llm=llm,
+            cross_attn=cross_attn,
+            cross_attn_norm=cross_attn_norm,
+            bpe_embed=bpe_embed,
+            text_embed_proj=None,
+            bpe_vocab_size=bpe_vocab_size,
+        )
+
+    def encode_text(self, text_tokens_t: Array) -> Array:
+        """Encode text tokens to embeddings for cross-attention.
+
+        Args:
+            text_tokens_t: Text token IDs, shape (T,)
+
+        Returns:
+            Text embeddings, shape (T, embed_dim)
+        """
+        text_embed_td = jax.vmap(self.llm.embed)(text_tokens_t)
+        if self.text_embed_proj is not None:
+            text_embed_td = jax.vmap(self.text_embed_proj)(text_embed_td)
+        return text_embed_td
+
+    def forward(
+        self,
+        bpe_tokens_t: Array,
+        text_embeddings_sd: Array,
+    ) -> Array:
+        """Forward pass for training.
+
+        Args:
+            bpe_tokens_t: Input BPE token IDs, shape (T,)
+            text_embeddings_sd: Encoded text, shape (S, embed_dim)
+
+        Returns:
+            Logits for next BPE token, shape (T, bpe_vocab_size)
+        """
+        x_td = jax.vmap(self.bpe_embed)(bpe_tokens_t)
+
+        for block in self.llm.blocks:
+            x_td, _ = block.forward(x_td, cache=None)
+
+            norm_x = jax.vmap(self.cross_attn_norm)(x_td)
+            cross_out, _, _ = self.cross_attn.forward(
+                q_tn=norm_x,
+                kv_sn=text_embeddings_sd,
+            )
+            x_td = x_td + cross_out
+
+        x_td = self.llm.norm(x_td)
+        # Tied weights: use bpe_embed.weight.T for output projection
+        logits_tv = x_td @ self.bpe_embed.weight.T
+        return logits_tv
+
+    def generate(
+        self,
+        text_embeddings_sd: Array,
+        max_length: int,
+        bos_token: int = 2,
+        eos_token: int = 3,
+    ) -> tuple[Array, Array]:
+        """Autoregressively generate BPE tokens.
+
+        Args:
+            text_embeddings_sd: Encoded text, shape (S, embed_dim)
+            max_length: Maximum number of tokens to generate
+            bos_token: BOS token ID (default 2)
+            eos_token: EOS token ID (default 3)
+
+        Returns:
+            Tuple of (tokens, length) where:
+            - tokens: Generated token IDs, shape (max_length,)
+            - length: Actual sequence length (position of first EOS or max_length)
+        """
+        # Initialize with BOS token
+        tokens = jnp.zeros(max_length, dtype=jnp.int32)
+        tokens = tokens.at[0].set(bos_token)
+
+        def generate_step(idx: int, tokens: Array) -> Array:
+            # Forward pass with full sequence (uses causal masking internally)
+            # We pass the entire tokens array; positions after idx are zeros (PAD)
+            logits_tv = self.forward(tokens, text_embeddings_sd)
+            # Get logits at position idx (predicting token at idx+1)
+            next_logits = logits_tv[idx]
+            next_token = jnp.argmax(next_logits)
+            tokens = tokens.at[idx + 1].set(next_token)
+            return tokens
+
+        # Generate tokens autoregressively
+        tokens = jax.lax.fori_loop(0, max_length - 1, generate_step, tokens)
+
+        # Find actual length (first EOS position, or max_length if no EOS)
+        eos_positions = jnp.where(tokens == eos_token, jnp.arange(max_length), max_length)
+        length = jnp.min(eos_positions)
+
+        return tokens, length
 
 
-class TTSModel(eqx.Module):
-    """Combined model for text-to-speech with hierarchical codec prediction.
+def decode_bpe_to_semantic(
+    bpe_tokens_b: Array,
+    bpe_length: Array,
+    decode_table_vs: Array,
+    span_table_v: Array,
+    max_semantic_length: int,
+) -> tuple[Array, Array]:
+    """Decode BPE tokens back to semantic tokens using lookup tables.
 
-    Audio tokens use separate embeddings so we only train those, not the pretrained text embeddings.
-    Each quantizer layer has its own codebook, so we have num_quantizers * codebook_size audio tokens.
-    Weight tying is used: audio_embed.weight is used for both input embeddings and output predictions.
+    Args:
+        bpe_tokens_b: BPE token IDs, shape (B,) where B is max BPE length
+        bpe_length: Actual number of valid BPE tokens (scalar)
+        decode_table_vs: Lookup table mapping token ID -> semantic tokens, shape (V, S)
+        span_table_v: Lookup table mapping token ID -> span length, shape (V,)
+        max_semantic_length: Maximum output length for semantic tokens
+
+    Returns:
+        Tuple of (semantic_tokens, semantic_length) where:
+        - semantic_tokens: Decoded semantic token IDs, shape (max_semantic_length,)
+        - semantic_length: Actual number of semantic tokens (scalar)
+    """
+    # Look up spans and semantic tokens for each BPE token
+    spans_b = span_table_v[bpe_tokens_b]  # (B,)
+    semantic_seqs_bs = decode_table_vs[bpe_tokens_b]  # (B, S)
+
+    # Compute cumulative positions for scattering
+    # Position for BPE token i is sum of spans[0:i]
+    cumsum_b = jnp.cumsum(spans_b)  # Exclusive end positions
+    start_positions_b = jnp.concatenate([jnp.zeros(1, dtype=jnp.int32), cumsum_b[:-1]])
+
+    # Total semantic length
+    semantic_length = jnp.sum(jnp.where(jnp.arange(len(bpe_tokens_b)) < bpe_length, spans_b, 0))
+    semantic_length = jnp.minimum(semantic_length, max_semantic_length)
+
+    # Initialize output array
+    semantic_tokens = jnp.zeros(max_semantic_length, dtype=jnp.int32)
+
+    # Scatter semantic tokens from each BPE token into output
+    max_span = decode_table_vs.shape[1]
+
+    def scatter_bpe_token(carry: Array, inputs: tuple[Array, Array, Array, Array]) -> tuple[Array, None]:
+        output, (start_pos, span, semantic_seq, bpe_idx) = carry, inputs
+        # Only scatter if this BPE token is valid (idx < bpe_length)
+        valid = bpe_idx < bpe_length
+
+        def scatter_positions(pos_in_span: int, out: Array) -> Array:
+            target_pos = start_pos + pos_in_span
+            valid_pos = valid & (pos_in_span < span) & (target_pos < max_semantic_length)
+            return jnp.where(valid_pos, out.at[target_pos].set(semantic_seq[pos_in_span]), out)
+
+        output = jax.lax.fori_loop(0, max_span, scatter_positions, output)
+        return output, None
+
+    semantic_tokens, _ = jax.lax.scan(
+        scatter_bpe_token,
+        semantic_tokens,
+        (start_positions_b, spans_b, semantic_seqs_bs, jnp.arange(len(bpe_tokens_b))),
+    )
+
+    return semantic_tokens, semantic_length
+
+
+def compute_bpe_embeddings_from_mimi(
+    bpe_tokenizer: Tokenizer,
+    mimi_semantic_embed_kd: Array,
+    target_embed_dim: int,
+    base_char: int = 0xE000,
+) -> Array:
+    """Compute BPE token embeddings as mean of constituent Mimi semantic embeddings.
+
+    Each BPE token represents a sequence of semantic tokens. This function computes
+    the embedding for each BPE token as the mean of the Mimi embeddings for its
+    constituent semantic tokens, then tiles to match the target embedding dimension.
+
+    Args:
+        bpe_tokenizer: Trained BPE tokenizer
+        mimi_semantic_embed_kd: Mimi semantic embeddings, shape (codebook_size, codebook_dim)
+        target_embed_dim: Target embedding dimension (e.g., LLM embed_dim)
+        base_char: Unicode base character used for semantic token encoding (default 0xE000)
+
+    Returns:
+        BPE embeddings, shape (bpe_vocab_size, target_embed_dim)
+    """
+    vocab_size = bpe_tokenizer.get_vocab_size()
+    codebook_dim = mimi_semantic_embed_kd.shape[1]
+
+    # Compute number of tiles needed to reach target_embed_dim
+    num_tiles = (target_embed_dim + codebook_dim - 1) // codebook_dim  # Ceiling division
+
+    bpe_embeddings = []
+    for token_id in range(vocab_size):
+        token_str = bpe_tokenizer.id_to_token(token_id)
+
+        if token_str is None or len(token_str) == 0:
+            # Special tokens (<pad>, <unk>, <bos>, <eos>) - use zero embedding
+            embed = np.zeros(codebook_dim)
+        else:
+            # Decode unicode characters back to semantic token IDs
+            semantic_ids = [ord(c) - base_char for c in token_str]
+            # Filter valid semantic IDs (0 to codebook_size-1)
+            valid_ids = [sid for sid in semantic_ids if 0 <= sid < mimi_semantic_embed_kd.shape[0]]
+
+            if valid_ids:
+                # Mean of Mimi embeddings for constituent semantic tokens
+                embeds = np.array([mimi_semantic_embed_kd[sid] for sid in valid_ids])
+                embed = np.mean(embeds, axis=0)
+            else:
+                embed = np.zeros(codebook_dim)
+
+        # Tile to match target dimension, then truncate
+        tiled = np.tile(embed, num_tiles)[:target_embed_dim]
+        bpe_embeddings.append(tiled)
+
+    return jnp.array(np.stack(bpe_embeddings, axis=0), dtype=jnp.float32)
+
+
+class S2AModel(eqx.Module):
+    """Stacked autoregressive GRU for semantic-to-acoustic token generation.
+
+    Architecture: One GRU layer per acoustic quantizer (Q1-Q7). Each layer:
+    - Takes input from the layer below (or semantic embeddings for the first layer)
+    - Has its own hidden state that persists across time steps
+    - Produces output that is used for prediction and passed to the next layer
+
+    This allows the model to capture the dependency between acoustic tokens at
+    different quantizer levels, where the same semantic token can map to different
+    acoustic tokens depending on context.
+
+    Embedding weights are tied with output head weights for parameter efficiency.
     """
 
-    llm: xax.LLM  # Qwen for text (frozen embeddings)
-    audio_embed: eqx.nn.Embedding  # Trainable audio token embeddings (num_quantizers * codebook_size)
-    quantizer_embed: eqx.nn.Embedding  # Optional: embeddings for quantizer index (0-7) as prior
-    acoustic_head: AcousticHead  # MLP for acoustic codes (kept for compatibility)
+    semantic_embed: eqx.nn.Embedding  # Embed semantic (Q0) tokens
+    acoustic_embeds: tuple[eqx.nn.Embedding, ...]  # One embedding per quantizer level
+    gru_cells: tuple[eqx.nn.GRUCell, ...]  # One GRU cell per quantizer level
+    hidden_dim: int = eqx.field(static=True)
+    num_acoustic: int = eqx.field(static=True)
+    codebook_size: int = eqx.field(static=True)
+
+    @staticmethod
+    def build(
+        codebook_size: int = 2048,
+        hidden_dim: int = 256,
+        num_acoustic: int = 7,
+        key: PRNGKeyArray = None,
+        semantic_embed_weights: Array | None = None,
+        acoustic_embed_weights: tuple[Array, ...] | None = None,
+    ) -> "S2AModel":
+        """Build stacked GRU S2A model.
+
+        Args:
+            codebook_size: Size of Mimi codebook (default 2048)
+            hidden_dim: Hidden dimension for GRU and embeddings (default 256 to match Mimi)
+            num_acoustic: Number of acoustic quantizers (Q1-Q7 = 7)
+            key: PRNG key
+            semantic_embed_weights: Optional pre-trained semantic embedding weights from Mimi,
+                shape (codebook_size, hidden_dim). If provided, hidden_dim must match.
+            acoustic_embed_weights: Optional pre-trained acoustic embedding weights from Mimi,
+                tuple of arrays each with shape (codebook_size, hidden_dim).
+
+        Returns:
+            S2AModel instance
+        """
+        keys = jax.random.split(key, 1 + 2 * num_acoustic)
+
+        # Initialize semantic embedding (from Mimi or random)
+        if semantic_embed_weights is not None:
+            assert semantic_embed_weights.shape == (codebook_size, hidden_dim), (
+                f"Semantic embed shape mismatch: {semantic_embed_weights.shape} vs ({codebook_size}, {hidden_dim})"
+            )
+            semantic_embed = eqx.nn.Embedding(codebook_size, hidden_dim, weight=semantic_embed_weights)
+        else:
+            semantic_embed = eqx.nn.Embedding(codebook_size, hidden_dim, key=keys[0])
+
+        # Initialize acoustic embeddings (from Mimi or random)
+        # Weights are tied with output heads for parameter efficiency
+        if acoustic_embed_weights is not None:
+            assert len(acoustic_embed_weights) == num_acoustic, (
+                f"Expected {num_acoustic} acoustic embeddings, got {len(acoustic_embed_weights)}"
+            )
+            acoustic_embeds = tuple(
+                eqx.nn.Embedding(codebook_size, hidden_dim, weight=acoustic_embed_weights[i])
+                for i in range(num_acoustic)
+            )
+        else:
+            acoustic_embeds = tuple(
+                eqx.nn.Embedding(codebook_size, hidden_dim, key=keys[1 + i])
+                for i in range(num_acoustic)
+            )
+
+        # One GRU cell per quantizer level
+        # Layer 0 (Q1): input = semantic_embed + prev_Q1_embed
+        # Layer i (Q{i+1}): input = layer_{i-1}_hidden + prev_Q{i+1}_embed
+        gru_cells = tuple(
+            eqx.nn.GRUCell(hidden_dim, hidden_dim, key=keys[1 + num_acoustic + i])
+            for i in range(num_acoustic)
+        )
+
+        return S2AModel(
+            semantic_embed=semantic_embed,
+            acoustic_embeds=acoustic_embeds,
+            gru_cells=gru_cells,
+            hidden_dim=hidden_dim,
+            num_acoustic=num_acoustic,
+            codebook_size=codebook_size,
+        )
+
+    def init_hidden(self) -> Array:
+        """Initialize hidden states for all GRU layers.
+
+        Returns:
+            Initial hidden states, shape (num_acoustic, hidden_dim)
+        """
+        return jnp.zeros((self.num_acoustic, self.hidden_dim))
+
+    def forward_step(
+        self,
+        semantic_token: Array,
+        prev_acoustic_tokens_7: Array,
+        hidden_states_7d: Array,
+    ) -> tuple[Array, Array]:
+        """Process one time step through all GRU layers.
+
+        Args:
+            semantic_token: Q0 token for this position, scalar
+            prev_acoustic_tokens_7: Previous acoustic tokens at this position (for teacher
+                forcing) or generated tokens (for inference), shape (7,)
+            hidden_states_7d: Hidden states from previous time step, shape (7, hidden_dim)
+
+        Returns:
+            Tuple of (logits_7v, new_hidden_states_7d) where:
+            - logits_7v: Logits for all acoustic tokens, shape (7, codebook_size)
+            - new_hidden_states_7d: Updated hidden states, shape (7, hidden_dim)
+        """
+        # Embed semantic token (input to first layer)
+        semantic_emb_d = self.semantic_embed(semantic_token)
+
+        logits_list = []
+        new_hidden_list = []
+        layer_input_d = semantic_emb_d
+
+        for layer_idx in range(self.num_acoustic):
+            # Add embedding of previous token at this layer
+            prev_token_emb_d = self.acoustic_embeds[layer_idx](prev_acoustic_tokens_7[layer_idx])
+            gru_input_d = layer_input_d + prev_token_emb_d
+
+            # GRU step
+            prev_hidden_d = hidden_states_7d[layer_idx]
+            new_hidden_d = self.gru_cells[layer_idx](gru_input_d, prev_hidden_d)
+            new_hidden_list.append(new_hidden_d)
+
+            # Compute logits with tied weights
+            logits_v = new_hidden_d @ self.acoustic_embeds[layer_idx].weight.T
+            logits_list.append(logits_v)
+
+            # Output of this layer becomes input to next layer
+            layer_input_d = new_hidden_d
+
+        return jnp.stack(logits_list, axis=0), jnp.stack(new_hidden_list, axis=0)
+
+    def forward_all(self, semantic_tokens_t: Array, acoustic_targets_t7: Array) -> Array:
+        """Forward pass for training: compute logits for all positions and quantizers.
+
+        Uses teacher forcing: at each position, uses ground truth previous tokens.
+
+        Args:
+            semantic_tokens_t: Q0 tokens, shape (T,)
+            acoustic_targets_t7: Target acoustic tokens Q1-Q7, shape (T, 7)
+
+        Returns:
+            Logits for all acoustic tokens, shape (T, 7, codebook_size)
+        """
+        tsz = semantic_tokens_t.shape[0]
+
+        # Shift targets for teacher forcing: prev_tokens[t] = targets[t-1]
+        # At t=0, use zeros (no previous tokens)
+        prev_tokens_t7 = jnp.concatenate([
+            jnp.zeros((1, self.num_acoustic), dtype=jnp.int32),
+            acoustic_targets_t7[:-1],
+        ], axis=0)
+
+        def scan_step(
+            hidden_7d: Array,
+            inputs: tuple[Array, Array],
+        ) -> tuple[Array, Array]:
+            semantic_tok, prev_acoustic_7 = inputs
+            logits_7v, new_hidden_7d = self.forward_step(
+                semantic_tok, prev_acoustic_7, hidden_7d
+            )
+            return new_hidden_7d, logits_7v
+
+        init_hidden = self.init_hidden()
+        _, logits_t7v = jax.lax.scan(
+            scan_step,
+            init_hidden,
+            (semantic_tokens_t, prev_tokens_t7),
+        )
+
+        return logits_t7v
+
+    def generate(
+        self,
+        semantic_tokens_t: Array,
+    ) -> Array:
+        """Generate acoustic tokens autoregressively.
+
+        Args:
+            semantic_tokens_t: Q0 tokens, shape (T,)
+
+        Returns:
+            Generated acoustic tokens, shape (T, 7)
+        """
+        def generate_step(
+            carry: tuple[Array, Array],
+            semantic_tok: Array,
+        ) -> tuple[tuple[Array, Array], Array]:
+            hidden_7d, prev_acoustic_7 = carry
+
+            # Forward through all layers
+            logits_7v, new_hidden_7d = self.forward_step(
+                semantic_tok, prev_acoustic_7, hidden_7d
+            )
+
+            # Greedy decoding for each layer
+            new_acoustic_7 = jnp.argmax(logits_7v, axis=-1)
+
+            return (new_hidden_7d, new_acoustic_7), new_acoustic_7
+
+        init_hidden = self.init_hidden()
+        init_acoustic = jnp.zeros(self.num_acoustic, dtype=jnp.int32)
+
+        _, acoustic_tokens_t7 = jax.lax.scan(
+            generate_step,
+            (init_hidden, init_acoustic),
+            semantic_tokens_t,
+        )
+
+        return acoustic_tokens_t7
+
+
+class TwoPartTTSModel(eqx.Module):
+    """Combined two-part TTS model: T2S + S2A + Mimi + Whisper."""
+
+    t2s: T2SModel
+    s2a: S2AModel
     mimi: xax.MimiModel
     whisper: xax.WhisperModel
 
     @staticmethod
     def build(
         llm: xax.LLM,
-        num_acoustic_layers: int,
-        num_quantizers: int,
-        codebook_size: int,
-        key: PRNGKeyArray,
-        use_quantizer_embed: bool = True,
-        init_from_mimi: bool = True,
-    ) -> "TTSModel":
-        hidden_dim = llm.config.embed_dim
-        k1, k2, k3 = jax.random.split(key, 3)
-        acoustic_head = AcousticHead.build(hidden_dim, num_acoustic_layers, k1)
+        bpe_vocab_size: int,
+        s2a_hidden_dim: int | None = None,
+        bpe_tokenizer: Tokenizer | None = None,
+        key: PRNGKeyArray = None,
+    ) -> "TwoPartTTSModel":
+        """Build the two-part TTS model.
 
-        # Load Mimi for audio encoding/decoding
+        Args:
+            llm: Pretrained LLM (with LoRA applied)
+            bpe_vocab_size: Vocabulary size for BPE tokens
+            s2a_hidden_dim: Hidden dimension for S2A stacked GRU. If None, uses Mimi's
+                codebook_dim (256) to enable embedding initialization from Mimi.
+            bpe_tokenizer: Optional BPE tokenizer for computing BPE embeddings from Mimi.
+                If provided, BPE embeddings are initialized as the mean of Mimi semantic
+                embeddings for each BPE token's constituent tokens.
+            key: PRNG key
+
+        Returns:
+            TwoPartTTSModel instance
+        """
+        k1, k2 = jax.random.split(key)
+
+        # Load Mimi first to extract embeddings for S2A initialization
         mimi = xax.build_pretrained_mimi()
 
-        # Separate embeddings for audio tokens: each quantizer has its own codebook
-        # Total tokens = num_quantizers * codebook_size
-        total_audio_tokens = num_quantizers * codebook_size
+        # Use Mimi's codebook_dim for S2A hidden_dim to enable embedding initialization
+        if s2a_hidden_dim is None:
+            s2a_hidden_dim = mimi.config.codebook_dim  # 256
 
-        if init_from_mimi:
-            # Initialize from Mimi codebook embeddings (projected to LLM dim)
-            # This gives audio tokens meaningful acoustic starting points
-            mimi_dim = mimi.quantizer.semantic_rvq.layers[0].codebook_dim  # 256
-            # Collect all quantizer embeddings
-            all_codebook_embeds = []
-            # Semantic quantizer (Q0)
-            all_codebook_embeds.append(mimi.quantizer.semantic_rvq.layers[0].embeddings_kd)
-            # Acoustic quantizers (Q1-Q7)
-            for layer in mimi.quantizer.acoustic_rvq.layers[:num_quantizers - 1]:
-                all_codebook_embeds.append(layer.embeddings_kd)
-            # Stack: (num_quantizers, codebook_size, mimi_dim)
-            stacked_embeds = jnp.stack(all_codebook_embeds, axis=0)
-            # Flatten to (total_audio_tokens, mimi_dim)
-            flat_embeds = stacked_embeds.reshape(total_audio_tokens, mimi_dim)
-            # Project to LLM hidden dim with random projection + scaling
-            proj_matrix = jax.random.normal(k2, (mimi_dim, hidden_dim)) * 0.02
-            audio_weight = flat_embeds @ proj_matrix
-            # Create embedding with initialized weights
-            audio_embed = eqx.nn.Embedding(total_audio_tokens, hidden_dim, key=k2)
-            audio_embed = eqx.tree_at(lambda e: e.weight, audio_embed, audio_weight)
-            logger.info("Initialized audio embeddings from Mimi codebook (projected %d -> %d)", mimi_dim, hidden_dim)
-        else:
-            audio_embed = eqx.nn.Embedding(total_audio_tokens, hidden_dim, key=k2)
+        # Extract embeddings from Mimi for S2A initialization
+        # Semantic embedding from Q0 (semantic RVQ layer 0)
+        semantic_embed_weights = mimi.quantizer.semantic_rvq.layers[0].embeddings_kd
 
-        # Quantizer embeddings: small learned prior for each quantizer (0-7)
-        # This helps the model learn the structure faster
-        quantizer_embed = eqx.nn.Embedding(num_quantizers, hidden_dim, key=k3) if use_quantizer_embed else None
-        return TTSModel(
-            llm=llm,
-            audio_embed=audio_embed,
-            quantizer_embed=quantizer_embed,
-            acoustic_head=acoustic_head,
-            mimi=mimi,
-            whisper=xax.build_pretrained_whisper(),
+        # Acoustic embeddings from Q1-Q7 (acoustic RVQ layers 0-6)
+        acoustic_embed_weights = tuple(
+            mimi.quantizer.acoustic_rvq.layers[i].embeddings_kd
+            for i in range(NUM_ACOUSTIC_QUANTIZERS)
         )
+
+        # Compute BPE embeddings from Mimi semantic embeddings if tokenizer provided
+        bpe_embed_weights = None
+        if bpe_tokenizer is not None:
+            logger.info("Computing BPE embeddings from Mimi semantic embeddings...")
+            bpe_embed_weights = compute_bpe_embeddings_from_mimi(
+                bpe_tokenizer=bpe_tokenizer,
+                mimi_semantic_embed_kd=np.array(semantic_embed_weights),
+                target_embed_dim=llm.config.embed_dim,
+            )
+            logger.info("BPE embeddings computed: shape %s", bpe_embed_weights.shape)
+
+        t2s = T2SModel.build(
+            llm=llm,
+            bpe_vocab_size=bpe_vocab_size,
+            key=k1,
+            bpe_embed_weights=bpe_embed_weights,
+        )
+        s2a = S2AModel.build(
+            codebook_size=xax.MIMI_CODEBOOK_SIZE,
+            hidden_dim=s2a_hidden_dim,
+            num_acoustic=NUM_ACOUSTIC_QUANTIZERS,
+            key=k2,
+            semantic_embed_weights=semantic_embed_weights,
+            acoustic_embed_weights=acoustic_embed_weights,
+        )
+        whisper = xax.build_pretrained_whisper()
+
+        return TwoPartTTSModel(t2s=t2s, s2a=s2a, mimi=mimi, whisper=whisper)
 
 
 @dataclass
@@ -183,22 +644,22 @@ class Config(xax.SupervisedConfig):
     min_learning_rate: float = xax.field(1e-5, help="Minimum learning rate")
     warmup_steps: int = xax.field(50, help="Number of warmup steps")
     max_text_length: int = xax.field(128, help="Maximum text token length")
-    max_audio_frames: int = xax.field(64, help="Maximum audio frames (each frame has 8 quantizer tokens)")
-    semantic_weight: float = xax.field(1.0, help="Loss weight for semantic tokens (Q0) vs acoustic (Q1-Q7)")
-    use_quantizer_embed: bool = xax.field(True, help="Add quantizer index embeddings as prior")
+    max_audio_frames: int = xax.field(64, help="Maximum audio frames")
 
-    # Audio settings
-    max_audio_seconds: float = xax.field(5.0, help="Maximum audio duration")
-    init_audio_from_mimi: bool = xax.field(True, help="Initialize audio embeddings from Mimi codebook")
-    audio_prompt_frames: int = xax.field(0, help="Number of ground truth audio frames to use as prompt (0 = none)")
-    scheduled_sampling: float = xax.field(0.0, help="Probability of using model predictions instead of GT (0-1)")
+    # Two-part architecture settings
+    s2a_hidden_dim: int = xax.field(256, help="S2A stacked GRU hidden dimension (256 = Mimi codebook_dim)")
+    t2s_weight: float = xax.field(1.0, help="Loss weight for T2S (semantic) loss")
+    s2a_weight: float = xax.field(1.0, help="Loss weight for S2A (acoustic) loss")
+    max_bpe_length: int = xax.field(64, help="Maximum BPE sequence length (matches max_audio_frames)")
 
     # Generation settings
     gen_temperature: float = xax.field(0.8, help="Temperature for generation sampling")
     gen_top_k: int = xax.field(50, help="Top-k for generation sampling (0 = no top-k)")
+    max_gen_bpe_tokens: int = xax.field(256, help="Max BPE tokens to generate")
 
     # Data settings
     processed_data_path: str | None = xax.field(None, help="Path to pre-processed data")
+    bpe_vocab_size: int = xax.field(151_669, help="Vocabulary size for BPE tokenizer on semantic tokens")
 
     # Eval settings - use actual training text for debugging
     eval_prompt: str = xax.field(
@@ -208,32 +669,26 @@ class Config(xax.SupervisedConfig):
 
 
 class LJSpeechTTS(xax.SupervisedTask[Config]):
-    """Fine-tune Qwen3 for text-to-speech with hierarchical codec prediction."""
+    """Two-part TTS: T2S (text-to-semantic) + S2A (semantic-to-acoustic)."""
 
     tokenizer: Qwen2TokenizerFast
     whisper_tokenizer: WhisperTokenizerFast
-    mimi: xax.MimiModel
-    audio_start_id: int
-    audio_end_id: int
-    text_vocab_size: int
-    audio_token_offset: int
+    bpe_tokenizer: Tokenizer | None
+    # BPE decode tables: map token ID -> semantic tokens
+    bpe_decode_table: Array | None  # (vocab_size, max_span)
+    bpe_span_table: Array | None  # (vocab_size,)
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
 
-        # Load tokenizer and add special tokens
-        self.tokenizer: Qwen2TokenizerFast = AutoTokenizer.from_pretrained(config.llm_repo.value)
-        self.tokenizer.add_special_tokens({"additional_special_tokens": [AUDIO_START_TOKEN, AUDIO_END_TOKEN]})
+        # Load text tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(config.llm_repo.value)
 
-        self.audio_start_id = self.tokenizer.convert_tokens_to_ids(AUDIO_START_TOKEN)
-        self.audio_end_id = self.tokenizer.convert_tokens_to_ids(AUDIO_END_TOKEN)
-        self.text_vocab_size = len(self.tokenizer)
-        self.audio_token_offset = self.text_vocab_size
-
-        # Pre-tokenize evaluation prompt for audio generation
-        prompt_tokens = self.tokenizer.encode(config.eval_prompt, add_special_tokens=True)
-        prompt_tokens.append(self.audio_start_id)  # Add audio start token
-        self._eval_prompt_tokens = jnp.array(prompt_tokens, dtype=jnp.int32)
+        # Pre-tokenize evaluation prompt
+        self._eval_prompt_tokens = jnp.array(
+            self.tokenizer.encode(config.eval_prompt, add_special_tokens=True),
+            dtype=jnp.int32,
+        )
 
         # Load Whisper model for ASR evaluation (frozen)
         logger.info("Loading Whisper model for ASR evaluation")
@@ -241,12 +696,75 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         self.whisper_config = xax.load_whisper_config()
         self.whisper_tokenizer = WhisperTokenizerFast.from_pretrained(str(path))
 
-    @override
-    def get_model(self, params: xax.InitParams) -> TTSModel:
-        # Build LLM - do NOT extend embeddings, we use separate audio_embed
-        llm = xax.build_pretrained_llm(self.config.llm_repo)
+        # BPE tokenizer and decode tables are loaded lazily
+        self.bpe_tokenizer = None
+        self.bpe_decode_table = None
+        self.bpe_span_table = None
 
-        # Apply LoRA (same config as shakespeare.py)
+    def _load_bpe_tokenizer(self) -> Tokenizer:
+        """Load BPE tokenizer from cache directory."""
+        if self.bpe_tokenizer is None:
+            tokenizer_path = self.dataset_cache_dir / "bpe_tokenizer.json"
+            if not tokenizer_path.exists():
+                raise FileNotFoundError(
+                    f"BPE tokenizer not found at {tokenizer_path}. "
+                    "Run with --launcher dataset first to generate it."
+                )
+            self.bpe_tokenizer = Tokenizer.from_file(str(tokenizer_path))
+        return self.bpe_tokenizer
+
+    def _build_bpe_decode_tables(self) -> tuple[Array, Array]:
+        """Build lookup tables for decoding BPE tokens to semantic tokens.
+
+        Returns:
+            Tuple of (decode_table, span_table) where:
+            - decode_table: shape (vocab_size, max_span) - semantic tokens for each BPE token
+            - span_table: shape (vocab_size,) - number of semantic tokens per BPE token
+        """
+        if self.bpe_decode_table is not None:
+            return self.bpe_decode_table, self.bpe_span_table
+
+        tokenizer = self._load_bpe_tokenizer()
+        vocab_size = tokenizer.get_vocab_size()
+        base_char = 0xE000  # Private Use Area start (matches BPE encoding)
+
+        # Find max span by checking all tokens
+        max_span = 1
+        for token_id in range(vocab_size):
+            token_str = tokenizer.id_to_token(token_id)
+            if token_str is not None:
+                max_span = max(max_span, len(token_str))
+
+        # Build decode table: each row is the semantic token sequence for that BPE token
+        decode_table = np.zeros((vocab_size, max_span), dtype=np.int32)
+        span_table = np.zeros(vocab_size, dtype=np.int32)
+
+        for token_id in range(vocab_size):
+            token_str = tokenizer.id_to_token(token_id)
+            if token_str is None:
+                # Special tokens (<pad>, <unk>, <bos>, <eos>) - leave as zeros
+                span_table[token_id] = 0
+                continue
+
+            # Convert unicode characters back to semantic tokens
+            semantic_tokens = [ord(c) - base_char for c in token_str]
+            span = len(semantic_tokens)
+            span_table[token_id] = span
+            decode_table[token_id, :span] = semantic_tokens
+
+        self.bpe_decode_table = jnp.array(decode_table)
+        self.bpe_span_table = jnp.array(span_table)
+        logger.info(
+            "Built BPE decode tables: vocab_size=%d, max_span=%d",
+            vocab_size,
+            max_span,
+        )
+        return self.bpe_decode_table, self.bpe_span_table
+
+    @override
+    def get_model(self, params: xax.InitParams) -> TwoPartTTSModel:
+        # Build LLM with LoRA
+        llm = xax.build_pretrained_llm(self.config.llm_repo)
         llm = xax.loraize_by_path(
             llm,
             rank=self.config.lora_rank,
@@ -256,40 +774,50 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             key=params.key,
         )
 
-        # Build full model with separate audio embeddings
-        # Each quantizer layer has its own codebook
-        num_quantizers = self.config.num_acoustic_quantizers + 1  # 8 total
+        # Load BPE tokenizer for embedding initialization
+        bpe_tokenizer = self._load_bpe_tokenizer()
+
         k_model = jax.random.fold_in(params.key, 1)
-        return TTSModel.build(
-            llm,
-            self.config.num_acoustic_quantizers,
-            num_quantizers,
-            xax.MIMI_CODEBOOK_SIZE,
-            k_model,
-            use_quantizer_embed=self.config.use_quantizer_embed,
-            init_from_mimi=self.config.init_audio_from_mimi,
+        return TwoPartTTSModel.build(
+            llm=llm,
+            bpe_vocab_size=self.config.bpe_vocab_size,
+            s2a_hidden_dim=self.config.s2a_hidden_dim,
+            bpe_tokenizer=bpe_tokenizer,
+            key=k_model,
         )
 
     @override
-    def get_trainable_filter_spec(self, model: TTSModel) -> TTSModel:
-        # Get LoRA filter spec - only LoRA layers in LLM are trainable
-        # The LLM embeddings and lm_head stay frozen (pretrained text tokens)
-        llm_spec = xax.lora_filter_spec(model.llm)
-
-        # Train audio token embeddings (weight-tied, so no separate lm_head)
-        audio_embed_spec = jax.tree.map(lambda _: True, model.audio_embed)
-        # Train quantizer embeddings if present
-        quantizer_embed_spec = (
-            jax.tree.map(lambda _: True, model.quantizer_embed) if model.quantizer_embed is not None else None
+    def get_trainable_filter_spec(self, model: TwoPartTTSModel) -> TwoPartTTSModel:
+        # T2S: LoRA layers + cross-attention + BPE embeddings (tied with head)
+        llm_spec = xax.lora_filter_spec(model.t2s.llm)
+        cross_attn_spec = jax.tree.map(lambda _: True, model.t2s.cross_attn)
+        cross_attn_norm_spec = jax.tree.map(lambda _: True, model.t2s.cross_attn_norm)
+        bpe_embed_spec = jax.tree.map(lambda _: True, model.t2s.bpe_embed)
+        text_embed_proj_spec = (
+            jax.tree.map(lambda _: True, model.t2s.text_embed_proj)
+            if model.t2s.text_embed_proj is not None
+            else None
         )
-        acoustic_spec = jax.tree.map(lambda _: True, model.acoustic_head)
+
+        t2s_spec = T2SModel(
+            llm=llm_spec,
+            cross_attn=cross_attn_spec,
+            cross_attn_norm=cross_attn_norm_spec,
+            bpe_embed=bpe_embed_spec,
+            text_embed_proj=text_embed_proj_spec,
+            bpe_vocab_size=model.t2s.bpe_vocab_size,
+        )
+
+        # S2A: All layers trainable
+        s2a_spec = jax.tree.map(lambda _: True, model.s2a)
+
+        # Mimi and Whisper: Frozen
         mimi_spec = jax.tree.map(lambda _: False, model.mimi)
         whisper_spec = jax.tree.map(lambda _: False, model.whisper)
-        return TTSModel(
-            llm=llm_spec,
-            audio_embed=audio_embed_spec,
-            quantizer_embed=quantizer_embed_spec,
-            acoustic_head=acoustic_spec,
+
+        return TwoPartTTSModel(
+            t2s=t2s_spec,
+            s2a=s2a_spec,
             mimi=mimi_spec,
             whisper=whisper_spec,
         )
@@ -316,146 +844,83 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
         return optax.adamw(learning_rate=learning_rate_schedule, weight_decay=0.01)
 
-    def _get_embeddings(self, model: TTSModel, token_ids: Array) -> Array:
-        """Get embeddings for mixed text/audio token IDs.
-
-        Uses LLM embeddings for text tokens, separate audio_embed for audio tokens.
-        Each quantizer has its own codebook: total audio tokens = num_quantizers * codebook_size.
-        Optionally adds quantizer index embeddings as a prior to help learning.
-        """
-        num_quantizers = self.config.num_acoustic_quantizers + 1  # 8
-        total_audio_tokens = num_quantizers * xax.MIMI_CODEBOOK_SIZE
-
-        # Mask for audio tokens
-        is_audio = token_ids >= self.audio_token_offset
-
-        # Get text embeddings (for all tokens, but will be masked out for audio)
-        text_embed = jax.vmap(model.llm.embed)(jnp.where(is_audio, 0, token_ids))
-
-        # Get audio embeddings (map audio token IDs to 0-based index into audio_embed)
-        audio_ids = jnp.where(is_audio, token_ids - self.audio_token_offset, 0)
-        audio_ids = jnp.clip(audio_ids, 0, total_audio_tokens - 1)
-        audio_embed = jax.vmap(model.audio_embed)(audio_ids)
-
-        # Optionally add quantizer embeddings as prior
-        if model.quantizer_embed is not None:
-            # Compute quantizer index (0-7) for each audio token
-            quantizer_idx = audio_ids // xax.MIMI_CODEBOOK_SIZE
-            quantizer_idx = jnp.clip(quantizer_idx, 0, num_quantizers - 1)
-            q_embed = jax.vmap(model.quantizer_embed)(quantizer_idx)
-            # Add quantizer embedding to audio embedding (only for audio positions)
-            audio_embed = audio_embed + jnp.where(is_audio[..., None], q_embed, 0)
-
-        # Combine: use text embed where is_text, audio embed where is_audio
-        return jnp.where(is_audio[..., None], audio_embed, text_embed)
-
-    def _forward_hidden_from_embed(self, model: TTSModel, embed_td: Array) -> Array:
-        """Run transformer blocks on pre-computed embeddings."""
-        x_tn = embed_td
-        for block in model.llm.blocks:
-            x_tn, _ = block.forward(x_tn, cache=None)
-        return model.llm.norm(x_tn)
-
     @override
     def compute_loss(
         self,
-        model: TTSModel,
+        model: TwoPartTTSModel,
         batch: Batch,
         state: xax.State,
         heavy: bool,
         key: PRNGKeyArray,
     ) -> tuple[Array, dict[str, xax.Metric]]:
-        # Simple next-token prediction on flattened sequence
-        # The sequence is: [TEXT] [AUDIO_START] [Q0_t0, Q1_t0, ..., Q7_t0, Q0_t1, ...] [AUDIO_END]
-        input_ids_bt = batch["input_ids"][:, :-1]
-        targets_bt = batch["labels"][:, 1:]
-        mask_bt = batch["attention_mask"][:, 1:] == 1
-        loss_mask_bt = (targets_bt != -100) & mask_bt
+        # T2S Loss: next-token prediction on BPE semantic sequence
+        # Encode text for cross-attention
+        text_embeddings_bsd = jax.vmap(model.t2s.encode_text)(batch["text_tokens"])
 
-        # Scheduled sampling: with probability p, replace audio input tokens with random tokens
-        # This helps the model be robust to imperfect inputs (addresses exposure bias)
-        if self.config.scheduled_sampling > 0:
-            num_quantizers = self.config.num_acoustic_quantizers + 1
-            total_audio_tokens = num_quantizers * xax.MIMI_CODEBOOK_SIZE
-            is_audio_input = input_ids_bt >= self.audio_token_offset
-            # Generate random replacement tokens
-            k1, key = jax.random.split(key)
-            random_tokens = jax.random.randint(
-                k1, input_ids_bt.shape, 0, total_audio_tokens
-            ) + self.audio_token_offset
-            # Generate mask for which tokens to replace
-            k2, key = jax.random.split(key)
-            replace_mask = jax.random.uniform(k2, input_ids_bt.shape) < self.config.scheduled_sampling
-            # Only replace audio tokens, not text
-            replace_mask = replace_mask & is_audio_input
-            # Apply replacement
-            input_ids_bt = jnp.where(replace_mask, random_tokens, input_ids_bt)
+        # BPE input/target: shift by one for next-token prediction
+        bpe_input_bs = batch["semantic_bpe"][:, :-1]
+        bpe_target_bs = batch["semantic_bpe"][:, 1:]
+        bpe_mask_bs = batch["semantic_bpe_mask"][:, 1:]
 
-        # Get embeddings with separate text/audio lookup
-        embed_btd = jax.vmap(self._get_embeddings, in_axes=(None, 0))(model, input_ids_bt)
+        # T2S forward: predict next BPE token given context + cross-attention to text
+        t2s_logits_bsv = jax.vmap(model.t2s.forward)(bpe_input_bs, text_embeddings_bsd)
+        t2s_loss_bs = optax.softmax_cross_entropy_with_integer_labels(t2s_logits_bsv, bpe_target_bs)
+        t2s_loss = jnp.sum(t2s_loss_bs * bpe_mask_bs) / jnp.maximum(jnp.sum(bpe_mask_bs), 1)
 
-        # Forward pass through LLM layers (skip embedding layer)
-        hidden_btd = jax.vmap(self._forward_hidden_from_embed, in_axes=(None, 0))(model, embed_btd)
+        # T2S accuracy
+        t2s_preds_bs = jnp.argmax(t2s_logits_bsv, axis=-1)
+        t2s_correct_bs = (t2s_preds_bs == bpe_target_bs) & bpe_mask_bs
+        t2s_accuracy = jnp.sum(t2s_correct_bs) / jnp.maximum(jnp.sum(bpe_mask_bs), 1)
 
-        # Create prediction weight matrix with weight tying:
-        # - LLM lm_head for text tokens
-        # - audio_embed for audio tokens (weight tying)
-        text_weights = model.llm.lm_head.weight  # (text_vocab, hidden)
-        audio_weights = model.audio_embed.weight  # (audio_vocab, hidden) - weight tying
-        tied_weights = jnp.concatenate([text_weights, audio_weights], axis=0)
+        # S2A Loss: autoregressive prediction of Q1-Q7 given Q0
+        semantic_tokens_ba = batch["dilated_semantic"]  # Q0
+        # Reshape flattened acoustic tokens: (B, A*7) -> (B, A, 7)
+        bsz = batch["acoustic_tokens_flat"].shape[0]
+        acoustic_targets_ba7 = batch["acoustic_tokens_flat"].reshape(bsz, self.config.max_audio_frames, 7)
+        audio_mask_ba = batch["audio_mask"]
 
-        # Compute per-token logits and loss
-        logits_btv = jnp.einsum("btd,vd->btv", hidden_btd, tied_weights)
-        per_token_loss_bt = optax.softmax_cross_entropy_with_integer_labels(logits_btv, targets_bt)
+        # S2A forward: compute logits for all quantizers
+        s2a_logits_ba7v = jax.vmap(model.s2a.forward_all)(semantic_tokens_ba, acoustic_targets_ba7)
 
-        # Apply semantic weighting: Q0 tokens get higher weight, Q1-Q7 get weight 1.0
-        # Audio tokens are in range [audio_offset, audio_offset + 16384)
-        # Q0 tokens have (token - audio_offset) // CODEBOOK_SIZE == 0
-        num_quantizers = self.config.num_acoustic_quantizers + 1  # 8
-        is_audio = targets_bt >= self.audio_token_offset
-        audio_idx = jnp.where(is_audio, targets_bt - self.audio_token_offset, 0)
-        quantizer_idx = audio_idx // xax.MIMI_CODEBOOK_SIZE  # Which quantizer (0-7)
-        is_semantic = is_audio & (quantizer_idx == 0)  # Q0 tokens
+        # S2A loss: cross-entropy for each quantizer
+        s2a_loss_ba7 = optax.softmax_cross_entropy_with_integer_labels(
+            s2a_logits_ba7v.reshape(-1, s2a_logits_ba7v.shape[-1]),
+            acoustic_targets_ba7.reshape(-1),
+        ).reshape(acoustic_targets_ba7.shape)
 
-        # Weight: semantic_weight for Q0, 1.0 for everything else
-        token_weight_bt = jnp.where(is_semantic, self.config.semantic_weight, 1.0)
-        weighted_mask_bt = loss_mask_bt.astype(jnp.float32) * token_weight_bt
+        # Mask and average
+        s2a_mask_ba7 = audio_mask_ba[..., None]  # (B, A, 1) broadcast to (B, A, 7)
+        s2a_loss = jnp.sum(s2a_loss_ba7 * s2a_mask_ba7) / jnp.maximum(jnp.sum(s2a_mask_ba7) * 7, 1)
 
-        # Weighted average loss
-        loss = jnp.sum(per_token_loss_bt * weighted_mask_bt) / jnp.maximum(jnp.sum(weighted_mask_bt), 1)
+        # S2A accuracy
+        s2a_preds_ba7 = jnp.argmax(s2a_logits_ba7v, axis=-1)
+        s2a_correct_ba7 = (s2a_preds_ba7 == acoustic_targets_ba7) & audio_mask_ba[..., None]
+        s2a_accuracy = jnp.sum(s2a_correct_ba7) / jnp.maximum(jnp.sum(audio_mask_ba) * 7, 1)
 
-        # Compute token accuracy (logits_btv already computed above)
-        predictions_bt = jnp.argmax(logits_btv, axis=-1)
-        correct_bt = (predictions_bt == targets_bt) & loss_mask_bt
-        accuracy = jnp.sum(correct_bt) / jnp.maximum(jnp.sum(loss_mask_bt), 1)
+        # Combined loss
+        loss = self.config.t2s_weight * t2s_loss + self.config.s2a_weight * s2a_loss
 
         metrics: dict[str, xax.Metric] = {
             "loss": xax.Scalar(loss),
-            "perplexity": xax.Scalar(jnp.exp(loss)),
-            "accuracy": xax.Scalar(accuracy),
+            "t2s_loss": xax.Scalar(t2s_loss),
+            "s2a_loss": xax.Scalar(s2a_loss),
+            "t2s_perplexity": xax.Scalar(jnp.exp(t2s_loss)),
+            "s2a_perplexity": xax.Scalar(jnp.exp(s2a_loss)),
+            "t2s_accuracy": xax.Scalar(t2s_accuracy),
+            "s2a_accuracy": xax.Scalar(s2a_accuracy),
         }
 
         if heavy:
-            gen_key, _ = jax.random.split(key)
-            audio_t, decoded_audio_t = self._generate_audio_jit(model, batch, gen_key)
-            metrics["generated_audio"] = xax.Audio(audio_t, sample_rate=xax.MIMI_SAMPLE_RATE)
-            metrics["real_audio"] = xax.Audio(decoded_audio_t, sample_rate=xax.MIMI_SAMPLE_RATE)
-
-            # Teacher-forced audio: decode model predictions given ground truth context
-            # This shows what the model would generate at each step with perfect context
-            tf_audio_t = self._decode_teacher_forced(model, predictions_bt[0], targets_bt[0], loss_mask_bt[0])
-            metrics["teacher_forced_audio"] = xax.Audio(tf_audio_t, sample_rate=xax.MIMI_SAMPLE_RATE)
-
-            # Transcribe teacher-forced audio
-            tf_transcript_tokens, _, _ = xax.transcribe_with_whisper(
-                model=model.whisper,
-                audio_t=tf_audio_t,
-                eos_token_id=self.whisper_config.eos_token_id,
-                max_tokens=64,
+            gen_key = jax.random.fold_in(key, state.num_steps)
+            # Build BPE decode tables if needed (lazy initialization)
+            bpe_decode_table, bpe_span_table = self._build_bpe_decode_tables()
+            audio_t, gt_audio_t = self._generate_audio(
+                model, batch, gen_key, bpe_decode_table, bpe_span_table
             )
-            metrics["tf_transcript"] = xax.Tokens(tf_transcript_tokens, tokenizer="whisper")
+            metrics["generated_audio"] = xax.Audio(audio_t, sample_rate=xax.MIMI_SAMPLE_RATE)
+            metrics["real_audio"] = xax.Audio(gt_audio_t, sample_rate=xax.MIMI_SAMPLE_RATE)
 
-            # Transcribe generated audio with Whisper for evaluation
+            # Transcribe generated audio with Whisper
             transcript_tokens, _, _ = xax.transcribe_with_whisper(
                 model=model.whisper,
                 audio_t=audio_t,
@@ -464,10 +929,10 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             )
             metrics["transcript"] = xax.Tokens(transcript_tokens, tokenizer="whisper")
 
-            # Also transcribe the ground truth audio for comparison
+            # Also transcribe ground truth
             gt_transcript_tokens, _, _ = xax.transcribe_with_whisper(
                 model=model.whisper,
-                audio_t=decoded_audio_t,
+                audio_t=gt_audio_t,
                 eos_token_id=self.whisper_config.eos_token_id,
                 max_tokens=64,
             )
@@ -475,194 +940,67 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
         return loss, metrics
 
-    def _decode_teacher_forced(
-        self, model: TTSModel, predictions_t: Array, targets_t: Array, mask_t: Array
-    ) -> Array:
-        """Decode teacher-forced predictions to audio.
+    def _generate_audio(
+        self,
+        model: TwoPartTTSModel,
+        batch: Batch,
+        key: PRNGKeyArray,
+        bpe_decode_table: Array,
+        bpe_span_table: Array,
+    ) -> tuple[Array, Array]:
+        """Generate audio using full end-to-end pipeline.
 
-        Takes the model's next-token predictions (given ground truth context) and decodes
-        them to audio. This shows what the model would generate at each step with perfect
-        context, helping debug whether the model is learning the audio distribution.
-
-        Args:
-            model: The TTS model
-            predictions_t: Model predictions of shape (seq_len,)
-            targets_t: Ground truth targets of shape (seq_len,)
-            mask_t: Loss mask of shape (seq_len,)
+        Pipeline:
+        1. T2S: Encode text and autoregressively generate BPE tokens
+        2. Decode BPE to semantic tokens
+        3. S2A: Generate acoustic tokens from semantic tokens
+        4. Mimi: Decode all codes to audio
 
         Returns:
-            Audio waveform from teacher-forced predictions
+            Tuple of (generated audio, ground truth audio)
         """
-        num_quantizers = self.config.num_acoustic_quantizers + 1  # 8
-        max_frames = self.config.max_audio_frames
-        total_audio_tokens = num_quantizers * xax.MIMI_CODEBOOK_SIZE
+        # Step 1: Encode text with T2S
+        text_tokens = batch["text_tokens"][0]
+        text_embeddings_sd = model.t2s.encode_text(text_tokens)
 
-        # Find audio token positions (where targets are audio tokens)
-        is_audio = (targets_t >= self.audio_token_offset) & (
-            targets_t < self.audio_token_offset + total_audio_tokens
-        ) & mask_t
-
-        # Extract audio predictions and convert to Mimi codes
-        audio_preds = jnp.where(is_audio, predictions_t, self.audio_token_offset)
-        audio_idx = audio_preds - self.audio_token_offset
-        audio_idx = jnp.clip(audio_idx, 0, total_audio_tokens - 1)
-        audio_codes_flat = audio_idx % xax.MIMI_CODEBOOK_SIZE
-
-        # Count valid audio tokens
-        num_audio_tokens = jnp.sum(is_audio)
-        expected_tokens = max_frames * num_quantizers
-
-        # Pad or truncate to expected length
-        audio_codes_padded = jnp.zeros(expected_tokens, dtype=jnp.int32)
-        # Extract only audio positions
-        audio_positions = jnp.where(is_audio, jnp.arange(len(is_audio)), len(is_audio))
-        sorted_positions = jnp.sort(audio_positions)
-        valid_audio_codes = audio_codes_flat[sorted_positions[:expected_tokens]]
-        audio_codes_padded = audio_codes_padded.at[:].set(
-            jnp.where(jnp.arange(expected_tokens) < num_audio_tokens, valid_audio_codes, 0)
+        # Step 2: Generate BPE tokens autoregressively
+        max_bpe_length = self.config.max_bpe_length
+        bpe_tokens, bpe_length = model.t2s.generate(
+            text_embeddings_sd,
+            max_length=max_bpe_length,
+            bos_token=2,  # <bos>
+            eos_token=3,  # <eos>
         )
 
-        # Unflatten: (max_tokens,) -> (max_frames, 8) -> (8, max_frames)
-        codes_tq = audio_codes_padded.reshape(max_frames, num_quantizers)
-        codes_qt = codes_tq.T  # (8, max_frames)
-
-        # Decode with Mimi
-        audio_ct = model.mimi.decode(codes_qt)
-        return audio_ct[0]
-
-    def _generate_audio_jit(self, model: TTSModel, batch: Batch, key: PRNGKeyArray) -> tuple[Array, Array]:
-        """Generate audio with custom generation loop using separate embeddings.
-
-        The LLM generates all 8 quantizers interleaved per frame:
-        [Q0_t0, Q1_t0, ..., Q7_t0, Q0_t1, Q1_t1, ..., Q7_t1, ...]
-
-        Then we unflatten to (8, T) for Mimi decode.
-
-        If audio_prompt_frames > 0, uses ground truth audio tokens from batch as prompt.
-        """
-        num_quantizers = self.config.num_acoustic_quantizers + 1  # 8
-        max_frames = self.config.max_audio_frames
-        max_tokens = max_frames * num_quantizers  # 8 tokens per frame
-        prompt_tokens = self._eval_prompt_tokens
-        text_len = prompt_tokens.shape[0]
-
-        # Create combined weight matrix for logits
-        text_weights = model.llm.lm_head.weight  # (text_vocab, hidden)
-        audio_weights = model.audio_embed.weight  # (audio_vocab, hidden) - weight tying
-        tied_weights = jnp.concatenate([text_weights, audio_weights], axis=0)
-
-        # Optional: use ground truth audio as prompt
-        audio_prompt_tokens = self.config.audio_prompt_frames * num_quantizers
-        if audio_prompt_tokens > 0:
-            # Get audio tokens from batch (first sample)
-            # batch["input_ids"] has format: [text, audio_start, audio_tokens, audio_end]
-            gt_audio_codes = batch["audio_codes"][0]  # (8, max_frames)
-            # Flatten and convert to tokens
-            gt_audio_flat = []
-            for frame_idx in range(min(self.config.audio_prompt_frames, max_frames)):
-                for q_idx in range(num_quantizers):
-                    code = gt_audio_codes[q_idx, frame_idx]
-                    token = self.audio_token_offset + q_idx * xax.MIMI_CODEBOOK_SIZE + code
-                    gt_audio_flat.append(token)
-            audio_prompt = jnp.array(gt_audio_flat, dtype=jnp.int32)
-        else:
-            audio_prompt = jnp.array([], dtype=jnp.int32)
-
-        # Initialize output with text prompt + optional audio prompt
-        initial_len = text_len + len(audio_prompt)
-        tokens_to_generate = max_tokens - len(audio_prompt)
-        total_len = text_len + max_tokens
-        output = jnp.zeros(total_len, dtype=jnp.int32)
-        output = output.at[:text_len].set(prompt_tokens)
-        if len(audio_prompt) > 0:
-            output = output.at[text_len:initial_len].set(audio_prompt)
-
-        # Sampling parameters
-        temperature = self.config.gen_temperature
-        top_k = self.config.gen_top_k
-
-        # Autoregressive generation with temperature sampling
-        def generate_step(
-            carry: tuple[Array, PRNGKeyArray], step_idx: Array
-        ) -> tuple[tuple[Array, PRNGKeyArray], None]:
-            tokens, rng = carry
-            rng, sample_key = jax.random.split(rng)
-            # pos is the position we want to generate
-            pos = initial_len + step_idx
-            # Get embeddings for full sequence
-            embed_td = self._get_embeddings(model, tokens)
-            # Forward through transformer
-            hidden_td = self._forward_hidden_from_embed(model, embed_td)
-            # Get hidden state at PREVIOUS position (which predicts current position)
-            last_hidden = hidden_td[pos - 1]
-            # Compute logits with tied weights
-            logits = last_hidden @ tied_weights.T
-
-            # Apply temperature
-            logits = logits / temperature
-
-            # Apply top-k filtering
-            if top_k > 0:
-                # Get top-k values and indices
-                top_k_logits, top_k_indices = jax.lax.top_k(logits, top_k)
-                # Create mask for non-top-k tokens
-                mask = jnp.ones_like(logits) * float("-inf")
-                mask = mask.at[top_k_indices].set(top_k_logits)
-                logits = mask
-
-            # Sample from distribution
-            next_token = jax.random.categorical(sample_key, logits)
-
-            # Update tokens at current position
-            tokens = tokens.at[pos].set(next_token)
-            return (tokens, rng), None
-
-        # Run generation for remaining tokens
-        if tokens_to_generate > 1:
-            (output, key), _ = jax.lax.scan(
-                generate_step,
-                (output, key),
-                jnp.arange(tokens_to_generate - 1),
-            )
-            # Generate the last token
-            (output, key), _ = generate_step((output, key), jnp.array(tokens_to_generate - 1))
-        elif tokens_to_generate == 1:
-            (output, key), _ = generate_step((output, key), jnp.array(0))
-
-        # Extract the audio region (after text prompt, includes audio prompt + generated)
-        audio_region = jax.lax.dynamic_slice(output, (text_len,), (max_tokens,))
-
-        # Filter to only valid audio tokens (total = num_quantizers * codebook_size)
-        total_audio_tokens = num_quantizers * xax.MIMI_CODEBOOK_SIZE
-        audio_token_mask = (audio_region >= self.audio_token_offset) & (
-            audio_region < self.audio_token_offset + total_audio_tokens
+        # Step 3: Decode BPE to semantic tokens
+        max_semantic = self.config.max_audio_frames
+        semantic_tokens, semantic_length = decode_bpe_to_semantic(
+            bpe_tokens_b=bpe_tokens,
+            bpe_length=bpe_length,
+            decode_table_vs=bpe_decode_table,
+            span_table_v=bpe_span_table,
+            max_semantic_length=max_semantic,
         )
 
-        # Debug: log audio token ratio
-        audio_ratio = jnp.sum(audio_token_mask) / max_tokens
-        jax.debug.print("Audio ratio: {x:.2f}, first 16 tokens: {y}", x=audio_ratio, y=audio_region[:16])
+        # Step 4: Generate acoustic tokens with stacked GRU S2A
+        acoustic_tokens_a7 = model.s2a.generate(semantic_tokens)  # (A, 7)
 
-        # Convert to Mimi codes
-        # Token = audio_offset + q_idx * CODEBOOK_SIZE + code
-        # So: audio_idx = token - audio_offset, code = audio_idx % CODEBOOK_SIZE
-        audio_idx = jnp.where(audio_token_mask, audio_region - self.audio_token_offset, 0)
-        audio_codes_flat = audio_idx % xax.MIMI_CODEBOOK_SIZE
-        audio_codes_flat = jnp.clip(audio_codes_flat, 0, xax.MIMI_CODEBOOK_SIZE - 1)
+        # Step 5: Combine Q0 (semantic) + Q1-Q7 (predicted acoustic) and decode
+        all_codes_8a = jnp.concatenate([
+            semantic_tokens[None, :],  # (1, A)
+            acoustic_tokens_a7.T,  # (7, A)
+        ], axis=0)  # (8, A)
 
-        # Unflatten: (max_tokens,) -> (max_frames, 8) -> (8, max_frames)
-        # The flattening was: [Q0_t0, Q1_t0, ..., Q7_t0, Q0_t1, Q1_t1, ..., Q7_t1, ...]
-        # So we reshape to (T, 8) and transpose to (8, T)
-        codes_tq = audio_codes_flat.reshape(max_frames, num_quantizers)
-        codes_qt = codes_tq.T  # (8, max_frames)
+        audio_ct = model.mimi.decode(all_codes_8a)
 
-        # Decode with Mimi
-        audio_ct = model.mimi.decode(codes_qt)
+        # Ground truth audio: Q0 + GT Q1-Q7
+        gt_semantic = batch["dilated_semantic"][0]
+        gt_acoustic_flat = batch["acoustic_tokens_flat"][0]
+        gt_acoustic = gt_acoustic_flat.reshape(self.config.max_audio_frames, 7).T  # (7, A)
+        gt_codes_8a = jnp.concatenate([gt_semantic[None, :], gt_acoustic], axis=0)
+        gt_audio_ct = model.mimi.decode(gt_codes_8a)
 
-        # Also decode the ground truth audio sequence for reference
-        gt_audio_codes = batch["audio_codes"][0]  # (8, max_frames)
-        decoded_audio_ct = model.mimi.decode(gt_audio_codes)
-
-        return audio_ct[0], decoded_audio_ct[0]
+        return audio_ct[0], gt_audio_ct[0]
 
     @override
     def decode_tokens(self, tokens: np.ndarray, token_type: str) -> str:
@@ -674,18 +1012,225 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
                 return self.whisper_tokenizer.decode(transcript_tokens, skip_special_tokens=True)
 
             case "llm":
-                text_tokens = [t for t in token_list if 0 < t < self.audio_token_offset]
-                return self.tokenizer.decode(text_tokens, skip_special_tokens=False)
+                return self.tokenizer.decode(token_list, skip_special_tokens=False)
 
             case _:
                 raise ValueError(f"Invalid token type: {token_type}")
 
     @override
     def get_dataset(self) -> Dataset:
-        return self.load_dataset("tokenized")
+        return self.load_dataset("train")
+
+    @xax.dataset_fn("train", dependencies=["bpe"], use_hash=False)
+    def train_dataset(self) -> Dataset:
+        """Creates the final dataset that we use to train the model.
+
+        The training dataset has the following columns:
+         - text_tokens: Transcribed audio tokens, which we cross-attend to when
+           generating the semantic tokens autoregressively, shape (T).
+         - text_mask: Binary mask for the text tokens, shape (T).
+         - semantic_bpe: BPE-encoded semantic tokens that we generate
+           autoregressively, shape (S).
+         - semantic_bpe_mask: Binary mask for the semantic tokens, shape (S).
+         - bpe_spans: Number of original tokens each BPE token represents, shape (S).
+         - dilated_semantic: The semantic tokens expanded from BPE,
+           with 1:1 correspondence to audio frames, shape (A).
+         - acoustic_tokens: The Mimi acoustic codec tokens Q1-Q7, shape (A, 7).
+         - audio_mask: Binary mask for the audio tokens, shape (A).
+
+        Each column is right-padded so that the length of each row in a column
+        is consistent (so that they can be easily collated).
+
+        Returns:
+            Dataset with the above columns.
+        """
+        ds = self.load_dataset("bpe")
+
+        max_text_len = self.config.max_text_length
+        max_bpe_len = self.config.max_bpe_length
+        max_audio_frames = self.config.max_audio_frames
+
+        def prepare_sample(example: dict) -> dict:
+            # Text tokens for cross-attention context
+            text_tokens = np.array(example["text_tokens"], dtype=np.int32)
+            text_len = min(len(text_tokens), max_text_len)
+            text_padded = np.zeros(max_text_len, dtype=np.int32)
+            text_padded[:text_len] = text_tokens[:text_len]
+            text_mask = np.zeros(max_text_len, dtype=np.bool_)
+            text_mask[:text_len] = True
+
+            # Semantic BPE tokens (T2S target)
+            semantic_bpe = np.array(example["semantic_bpe"], dtype=np.int32)
+            bpe_spans = np.array(example["bpe_spans"], dtype=np.int32)
+            bpe_len = min(len(semantic_bpe), max_bpe_len)
+            bpe_padded = np.zeros(max_bpe_len, dtype=np.int32)
+            bpe_padded[:bpe_len] = semantic_bpe[:bpe_len]
+            spans_padded = np.zeros(max_bpe_len, dtype=np.int32)
+            spans_padded[:bpe_len] = bpe_spans[:bpe_len]
+            bpe_mask = np.zeros(max_bpe_len, dtype=np.bool_)
+            bpe_mask[:bpe_len] = True
+
+            # Audio codes: (T_audio, 8) where column 0 is Q0 (semantic), 1-7 are acoustic
+            audio_codes = np.asarray(example["audio_codes"])
+            semantic_tokens = audio_codes[:, 0]  # Q0: shape (T_audio,)
+            acoustic_tokens = audio_codes[:, 1:8]  # Q1-Q7: shape (T_audio, 7)
+
+            audio_len = min(len(semantic_tokens), max_audio_frames)
+            semantic_padded = np.zeros(max_audio_frames, dtype=np.int32)
+            semantic_padded[:audio_len] = semantic_tokens[:audio_len]
+
+            # Flatten acoustic tokens to 1D for HuggingFace compatibility
+            # Shape: (max_audio_frames * 7,) - will be reshaped to (max_audio_frames, 7) in collate
+            acoustic_padded = np.zeros(max_audio_frames * 7, dtype=np.int32)
+            acoustic_flat = acoustic_tokens[:audio_len].flatten()
+            acoustic_padded[: len(acoustic_flat)] = acoustic_flat
+
+            audio_mask = np.zeros(max_audio_frames, dtype=np.bool_)
+            audio_mask[:audio_len] = True
+
+            return {
+                "text_tokens": text_padded,
+                "text_mask": text_mask,
+                "semantic_bpe": bpe_padded,
+                "semantic_bpe_mask": bpe_mask,
+                "bpe_spans": spans_padded,
+                "dilated_semantic": semantic_padded,
+                "acoustic_tokens_flat": acoustic_padded,  # Flattened for HF compatibility
+                "audio_mask": audio_mask,
+            }
+
+        # Map and remove columns that shouldn't be in final dataset (esp. 2D arrays)
+        result = ds.map(prepare_sample, desc="Preparing training data")
+        # Remove columns that aren't used in training (and would cause JAX dtype issues)
+        cols_to_remove = [c for c in result.column_names if c not in prepare_sample.__code__.co_consts]
+        cols_to_keep = [
+            "text_tokens",
+            "text_mask",
+            "semantic_bpe",
+            "semantic_bpe_mask",
+            "bpe_spans",
+            "dilated_semantic",
+            "acoustic_tokens_flat",
+            "audio_mask",
+        ]
+        cols_to_remove = [c for c in result.column_names if c not in cols_to_keep]
+        if cols_to_remove:
+            result = result.remove_columns(cols_to_remove)
+        return result
+
+    @xax.dataset_fn("bpe", dependencies=["tokenized"], use_hash=False)
+    def bpe_dataset(self) -> Dataset:
+        """Learns a BPE tokenizer on the semantic tokens and applies it to the dataset.
+
+        The semantic tokens (Q0, first quantizer) capture high-level speech content.
+        BPE compression groups frequent token patterns, reducing sequence length
+        while preserving semantic information.
+
+        Each semantic token (0-2047) is mapped to a unique unicode character so that
+        BPE can properly merge adjacent tokens as atomic units.
+
+        Returns dataset with columns:
+        - text_tokens: shape (T_text,) - original text tokens
+        - audio_codes: shape (T_audio, C) - original audio codes (all quantizers)
+        - semantic_bpe: shape (T_bpe,) - BPE-encoded semantic tokens
+        - bpe_spans: shape (T_bpe,) - number of original tokens each BPE token represents
+        """
+        ds = self.load_dataset("tokenized")
+
+        # Map semantic tokens (0-2047) to unique unicode characters.
+        # Use Private Use Area starting at U+E000 to avoid conflicts.
+        base_char = 0xE000
+
+        def tokens_to_chars(tokens: np.ndarray) -> str:
+            """Convert token IDs to a string of unique unicode characters."""
+            return "".join(chr(base_char + int(t)) for t in tokens)
+
+        # Step 1: Extract semantic tokens and convert to character strings
+        logger.info("Extracting semantic tokens for BPE training...")
+
+        def get_semantic_chars(example: dict) -> dict:
+            """Convert semantic tokens to unicode character string for BPE training."""
+            audio_codes = np.asarray(example["audio_codes"])
+            semantic_tokens = audio_codes[:, 0]
+            semantic_chars = tokens_to_chars(semantic_tokens)
+            return {"semantic_chars": semantic_chars}
+
+        ds_with_chars = ds.map(get_semantic_chars, desc="Extracting semantic tokens")
+
+        # Step 2: Train BPE tokenizer on character sequences
+        logger.info("Training BPE tokenizer on semantic tokens...")
+
+        # Create initial alphabet from all possible semantic tokens
+        initial_alphabet = [chr(base_char + i) for i in range(xax.MIMI_CODEBOOK_SIZE)]
+
+        # Initialize BPE tokenizer with no pre-tokenizer (treat entire string as one sequence)
+        tokenizer = Tokenizer(models.BPE())
+        # Don't use any pre-tokenizer - we want BPE to operate on the raw character sequence
+        tokenizer.pre_tokenizer = pre_tokenizers.Sequence([])
+
+        # Configure BPE trainer with the semantic token alphabet
+        bpe_vocab_size = self.config.bpe_vocab_size
+        trainer = trainers.BpeTrainer(
+            vocab_size=bpe_vocab_size,
+            special_tokens=["<pad>", "<unk>", "<bos>", "<eos>"],
+            initial_alphabet=initial_alphabet,
+            show_progress=True,
+        )
+
+        # Train on semantic token character strings
+        def batch_iterator(batch_size: int = 1000) -> Iterator[list[str]]:
+            for idx in range(0, len(ds_with_chars), batch_size):
+                yield ds_with_chars[idx : idx + batch_size]["semantic_chars"]
+
+        tokenizer.train_from_iterator(batch_iterator(), trainer=trainer)
+        logger.info("BPE tokenizer trained with vocab size %d", tokenizer.get_vocab_size())
+
+        # Save tokenizer for later use
+        tokenizer_path = self.dataset_cache_dir / "bpe_tokenizer.json"
+        tokenizer_path.parent.mkdir(parents=True, exist_ok=True)
+        tokenizer.save(str(tokenizer_path))
+        logger.info("Saved BPE tokenizer to %s", tokenizer_path)
+
+        # Step 3: Apply BPE encoding to all samples
+        logger.info("Applying BPE encoding to dataset...")
+
+        def apply_bpe(example: dict) -> dict:
+            """Apply BPE encoding to semantic tokens and compute spans."""
+            audio_codes = np.asarray(example["audio_codes"])
+            semantic_tokens = audio_codes[:, 0]
+            semantic_chars = tokens_to_chars(semantic_tokens)
+
+            encoding = tokenizer.encode(semantic_chars)
+            semantic_bpe = np.array(encoding.ids, dtype=np.int32)
+
+            # Compute spans: how many original tokens each BPE token represents
+            # Each token in the encoding corresponds to a substring of the original
+            bpe_spans = np.array([len(token) for token in encoding.tokens], dtype=np.int32)
+
+            return {"semantic_bpe": semantic_bpe, "bpe_spans": bpe_spans}
+
+        ds_bpe = ds.map(
+            apply_bpe,
+            remove_columns=["semantic_chars"] if "semantic_chars" in ds.column_names else [],
+            desc="Applying BPE",
+        )
+
+        # Log compression statistics
+        total_original = sum(len(np.asarray(ex["audio_codes"])) for ex in ds_bpe)
+        total_bpe = sum(len(ex["semantic_bpe"]) for ex in ds_bpe)
+        compression_ratio = total_original / total_bpe if total_bpe > 0 else 0
+        logger.info(
+            "BPE compression: %d -> %d tokens (%.2fx compression)",
+            total_original,
+            total_bpe,
+            compression_ratio,
+        )
+
+        return ds_bpe
 
     @xax.dataset_fn("tokenized", use_hash=False)
     def tokenized_dataset(self) -> Dataset:
+        """Tokenizes the LJSpeech dataset text and audio."""
         columns = ["text_tokens", "audio_codes"]
 
         # Load raw dataset
@@ -784,11 +1329,11 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 if __name__ == "__main__":
     LJSpeechTTS.launch(
         Config(
-            batch_size=8,
+            batch_size=128,
             max_grad_norm=5.0,
             gradient_accumulation_steps=2,
             log_heavy_every_n_seconds=60,
-            max_steps=60 * 60,  # 1 hour
+            # max_steps=60 * 60,  # 1 hour
             step_kind="second",
         ),
     )

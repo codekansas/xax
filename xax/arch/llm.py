@@ -7,7 +7,7 @@ import sys
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import Iterator, overload
+from typing import Iterator, Literal, overload
 
 import chex
 import equinox as eqx
@@ -20,6 +20,8 @@ from omegaconf import MISSING
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field as PydanticField
 
 from xax.arch.attention import (
+    AttentionCache,
+    CrossAttentionBlock,
     RMSNorm,
     SelfAttentionBlock,
     SwiGLU,
@@ -233,6 +235,246 @@ class LLM(eqx.Module):
             return logits_tv, cache
 
 
+class CrossAttentionLLM(eqx.Module):
+    """LLM with shared cross-attention layer for encoder-decoder style models.
+
+    This wraps a base LLM and adds a single CrossAttentionBlock that is shared
+    across all transformer layers. The cross-attention is applied after each
+    self-attention block, allowing the decoder to attend to encoder outputs.
+
+    This is useful for tasks like text-to-speech where we want to cross-attend
+    to text embeddings while generating audio tokens.
+    """
+
+    llm: LLM
+    cross_attn: CrossAttentionBlock
+    cross_attn_norm: RMSNorm
+    config: LLMConfig
+
+    @classmethod
+    def build(
+        cls,
+        config: LLMConfig,
+        *,
+        key: PRNGKeyArray,
+    ) -> "CrossAttentionLLM":
+        """Build CrossAttentionLLM with a shared cross-attention layer.
+
+        Args:
+            config: LLM configuration
+            key: PRNG key for initialization
+
+        Returns:
+            CrossAttentionLLM with shared cross-attention
+        """
+        k1, k2 = jax.random.split(key)
+
+        llm = LLM.build(config, key=k1)
+        cross_attn = CrossAttentionBlock.build(
+            embed_dim=config.embed_dim,
+            num_heads=config.q_heads,
+            key=k2,
+            use_rotary_embeddings=False,
+        )
+        cross_attn_norm = RMSNorm.build(config.embed_dim, eps=config.rms_eps)
+
+        return cls(
+            llm=llm,
+            cross_attn=cross_attn,
+            cross_attn_norm=cross_attn_norm,
+            config=config,
+        )
+
+    @classmethod
+    def from_llm(
+        cls,
+        llm: LLM,
+        *,
+        key: PRNGKeyArray,
+    ) -> "CrossAttentionLLM":
+        """Create CrossAttentionLLM from an existing LLM.
+
+        Args:
+            llm: Existing LLM model (can be pretrained)
+            key: PRNG key for cross-attention initialization
+
+        Returns:
+            CrossAttentionLLM wrapping the provided LLM
+        """
+        cross_attn = CrossAttentionBlock.build(
+            embed_dim=llm.config.embed_dim,
+            num_heads=llm.config.q_heads,
+            key=key,
+            use_rotary_embeddings=False,
+        )
+        cross_attn_norm = RMSNorm.build(llm.config.embed_dim, eps=llm.config.rms_eps)
+
+        return cls(
+            llm=llm,
+            cross_attn=cross_attn,
+            cross_attn_norm=cross_attn_norm,
+            config=llm.config,
+        )
+
+    def init_cache(
+        self,
+        max_len: int | None = None,
+        dtype: jnp.dtype = jnp.bfloat16,
+        encoder_output_sn: Array | None = None,
+    ) -> tuple[list[TransformerBlockCache], AttentionCache | None]:
+        """Initialize KV caches for autoregressive generation.
+
+        Args:
+            max_len: Maximum sequence length for self-attention cache
+            dtype: Data type for cache arrays
+            encoder_output_sn: Encoder output for cross-attention cache.
+                Shape (encoder_seq_len, embed_dim). If provided, computes
+                and caches K/V projections for cross-attention.
+
+        Returns:
+            Tuple of (self-attention caches, cross-attention cache)
+        """
+        self_caches = self.llm.init_cache(max_len=max_len, dtype=dtype)
+
+        cross_cache = None
+        if encoder_output_sn is not None:
+            cross_cache, _ = self.cross_attn.init_cache(kv_sn=encoder_output_sn)
+
+        return self_caches, cross_cache
+
+    @overload
+    def forward_hidden(self, tokens_t: Array) -> Array: ...
+
+    @overload
+    def forward_hidden(
+        self,
+        tokens_t: Array,
+        *,
+        encoder_output_sn: Array,
+    ) -> Array: ...
+
+    @overload
+    def forward_hidden(
+        self,
+        tokens_t: Array,
+        *,
+        caches: list[TransformerBlockCache],
+        cross_cache: AttentionCache,
+    ) -> tuple[Array, list[TransformerBlockCache], AttentionCache]: ...
+
+    def forward_hidden(
+        self,
+        tokens_t: Array,
+        *,
+        encoder_output_sn: Array | None = None,
+        caches: list[TransformerBlockCache] | None = None,
+        cross_cache: AttentionCache | None = None,
+    ) -> tuple[Array, list[TransformerBlockCache], AttentionCache] | Array:
+        """Forward pass with cross-attention to encoder output.
+
+        Args:
+            tokens_t: Input token IDs, shape (seq_len,)
+            encoder_output_sn: Encoder output for cross-attention,
+                shape (encoder_seq_len, embed_dim). Required if no cross_cache.
+            caches: Self-attention KV caches per layer
+            cross_cache: Cross-attention KV cache (precomputed from encoder)
+
+        Returns:
+            Hidden states and updated caches if caching, else just hidden states
+        """
+        chex.assert_rank(tokens_t, 1)
+        x_tn = jax.vmap(self.llm.embed)(tokens_t)
+
+        if caches is None:
+            # No caching - simple forward pass
+            for block in self.llm.blocks:
+                x_tn, _ = block.forward(x_tn, cache=None)
+
+                # Apply shared cross-attention if encoder output provided
+                if encoder_output_sn is not None:
+                    norm_x = jax.vmap(self.cross_attn_norm)(x_tn)
+                    cross_out, _, _ = self.cross_attn.forward(
+                        q_tn=norm_x,
+                        kv_sn=encoder_output_sn,
+                    )
+                    x_tn = x_tn + cross_out
+
+            return self.llm.norm(x_tn)
+
+        else:
+            # With caching for autoregressive generation
+            caches_out: list[TransformerBlockCache] = []
+            updated_cross_cache = cross_cache
+
+            for block, cache in zip(self.llm.blocks, caches, strict=True):
+                x_tn, cache = block.forward(x_tn, cache=cache)
+                caches_out.append(cache)
+
+                # Apply shared cross-attention using cached K/V
+                if cross_cache is not None or encoder_output_sn is not None:
+                    norm_x = jax.vmap(self.cross_attn_norm)(x_tn)
+                    cross_out, updated_cross_cache, _ = self.cross_attn.forward(
+                        q_tn=norm_x,
+                        cache=cross_cache,
+                        kv_sn=encoder_output_sn if cross_cache is None else None,
+                    )
+                    x_tn = x_tn + cross_out
+
+            return self.llm.norm(x_tn), caches_out, updated_cross_cache  # type: ignore[return-value]
+
+    @overload
+    def forward(self, tokens_t: Array) -> Array: ...
+
+    @overload
+    def forward(
+        self,
+        tokens_t: Array,
+        *,
+        encoder_output_sn: Array,
+    ) -> Array: ...
+
+    @overload
+    def forward(
+        self,
+        tokens_t: Array,
+        *,
+        caches: list[TransformerBlockCache],
+        cross_cache: AttentionCache,
+    ) -> tuple[Array, list[TransformerBlockCache], AttentionCache]: ...
+
+    def forward(
+        self,
+        tokens_t: Array,
+        *,
+        encoder_output_sn: Array | None = None,
+        caches: list[TransformerBlockCache] | None = None,
+        cross_cache: AttentionCache | None = None,
+    ) -> tuple[Array, list[TransformerBlockCache], AttentionCache] | Array:
+        """Forward pass returning logits.
+
+        Args:
+            tokens_t: Input token IDs, shape (seq_len,)
+            encoder_output_sn: Encoder output for cross-attention
+            caches: Self-attention KV caches per layer
+            cross_cache: Cross-attention KV cache
+
+        Returns:
+            Logits and updated caches if caching, else just logits
+        """
+        if caches is None:
+            x_td = self.forward_hidden(tokens_t, encoder_output_sn=encoder_output_sn)
+            return apply_linear(x_td, self.llm.lm_head)
+        else:
+            x_td, caches_out, cross_cache_out = self.forward_hidden(
+                tokens_t,
+                encoder_output_sn=encoder_output_sn,
+                caches=caches,
+                cross_cache=cross_cache,
+            )
+            logits_tv = apply_linear(x_td, self.llm.lm_head)
+            return logits_tv, caches_out, cross_cache_out
+
+
 class LLMRepo(Enum):
     QWEN3_600M = "Qwen/Qwen3-0.6B"
     QWEN3_1_7B = "Qwen/Qwen3-1.7B"
@@ -242,8 +484,31 @@ class LLMRepo(Enum):
     QWEN3_32B = "Qwen/Qwen3-32B"
 
 
-def build_pretrained_llm(repo: LLMRepo, dtype: jnp.dtype | None = None) -> LLM:
-    """Loads a pretrained model.
+@overload
+def build_pretrained_llm(
+    repo: LLMRepo,
+    dtype: jnp.dtype | None = None,
+) -> LLM: ...
+
+
+@overload
+def build_pretrained_llm(
+    repo: LLMRepo,
+    dtype: jnp.dtype | None = None,
+    *,
+    use_cross_attention: Literal[True],
+    cross_attention_key: PRNGKeyArray | None = None,
+) -> CrossAttentionLLM: ...
+
+
+def build_pretrained_llm(
+    repo: LLMRepo,
+    dtype: jnp.dtype | None = None,
+    *,
+    use_cross_attention: bool = False,
+    cross_attention_key: PRNGKeyArray | None = None,
+) -> LLM | CrossAttentionLLM:
+    """Loads a pretrained model, optionally with cross-attention support.
 
     For tensor parallelism, set up a mesh with a 'model' axis before calling:
 
@@ -254,13 +519,25 @@ def build_pretrained_llm(repo: LLMRepo, dtype: jnp.dtype | None = None) -> LLM:
     Args:
         repo: Pretrained model repository.
         dtype: Optional dtype for the model.
+        use_cross_attention: If True, wraps the LLM with a CrossAttentionLLM
+            that adds a shared cross-attention layer. The cross-attention
+            weights are randomly initialized.
+        cross_attention_key: PRNG key for initializing cross-attention weights.
+            Required if use_cross_attention is True. If not provided, defaults
+            to jax.random.key(0).
 
     Returns:
-        LLM model with loaded weights, sharded according to the mesh.
+        LLM model with loaded weights, optionally wrapped with cross-attention.
     """
     config = hf_config_to_llm_config(cfg=load_hf_config(repo.value))
     model_shape = eqx.filter_eval_shape(LLM.build, config, key=jax.random.key(0))
-    return load_hf_weights_into_llm(model_shape, repo.value, dtype=dtype)
+    llm = load_hf_weights_into_llm(model_shape, repo.value, dtype=dtype)
+
+    if use_cross_attention:
+        key = cross_attention_key if cross_attention_key is not None else jax.random.key(0)
+        return CrossAttentionLLM.from_llm(llm, key=key)
+
+    return llm
 
 
 def tie_embedding_and_head(model: LLM) -> LLM:

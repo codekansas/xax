@@ -3,6 +3,7 @@
 import atexit
 import logging
 import os
+import random
 import re
 import subprocess
 import threading
@@ -86,9 +87,17 @@ class TensorboardLogger(LoggerImpl):
         time.sleep(self.wait_seconds)
 
         port = int(os.environ.get("TENSORBOARD_PORT", DEFAULT_TENSORBOARD_PORT))
+        change_ports = bool(int(os.environ.get("TENSORBOARD_CHANGE_PORT", "1")))
+
+        rng = random.Random(42)
 
         while port_is_busy(port):
-            logger.warning("Port %s is busy, waiting...", port)
+            if change_ports:
+                new_port = rng.randint(6000, 9000)
+                logger.warning("Port %s is busy, checking port %d...", port, new_port)
+                port = new_port
+            else:
+                logger.warning("Port %s is busy, waiting...", port)
             time.sleep(10)
 
         def make_localhost(s: str) -> str:

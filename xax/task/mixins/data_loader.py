@@ -431,7 +431,12 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
         """Get the cache path for a dataset."""
         return self.dataset_cache_dir / name / hash_val
 
-    def load_dataset(self, name: str, hash_val: str | None = None) -> DatasetType:
+    def load_dataset(
+        self,
+        name: str,
+        hash_val: str | None = None,
+        generate: bool = False,
+    ) -> DatasetType:
         """Loads a dataset from the cache or generates it if it doesn't exist.
 
         Args:
@@ -439,6 +444,9 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
             hash_val: A specific hash to load. If this is specified, we just check
                 if the hashed path exists, and throw an error if it doesn't
                 (since we don't know what the hash corresponds to).
+            generate: If set, we generate the dataset; otherwise, we show the
+                user a warning telling them to pre-generate the dataset before
+                running training.
 
         Returns:
             The loaded dataset.
@@ -468,7 +476,14 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
 
         # First, ensure all dependencies are built
         for dep in ds_fn.dependencies:
-            self.load_dataset(dep)
+            self.load_dataset(dep, generate=generate)
+
+        if not generate:
+            raise RuntimeError(
+                "You are calling `load_dataset` on a dataset which has not yet been generated "
+                "or which has an invalidated cache. Run with `--launcher dataset` to generate "
+                "all the datasets for this task before training."
+            )
 
         # Generate the dataset
         logger.info("Generating dataset '%s' (path: '%s')...", name, cache_path)
@@ -510,7 +525,7 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
 
         # Build each dataset in order
         for name in build_order:
-            self.load_dataset(name)
+            self.load_dataset(name, generate=True)
 
     @functools.cached_property
     def dataset_cache_dir(self) -> Path:
