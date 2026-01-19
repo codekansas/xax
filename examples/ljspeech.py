@@ -39,6 +39,12 @@ NUM_ACOUSTIC_QUANTIZERS = 7  # Use Q1-Q7 for acoustic (8 total quantizers)
 AUDIO_START_TOKEN = "<|audio_start|>"
 AUDIO_END_TOKEN = "<|audio_end|>"
 
+# BPE special token IDs (from tokenizer config)
+BPE_PAD_TOKEN = 0
+BPE_UNK_TOKEN = 1
+BPE_BOS_TOKEN = 2
+BPE_EOS_TOKEN = 3
+
 # LoRA targets (same as shakespeare.py)
 DEFAULT_LORA_TARGETS = ("q_proj", "v_proj", "gate", "up")
 
@@ -168,8 +174,8 @@ class T2SModel(eqx.Module):
         self,
         text_embeddings_sd: Array,
         max_length: int,
-        bos_token: int = 2,
-        eos_token: int = 3,
+        bos_token: int = BPE_BOS_TOKEN,
+        eos_token: int = BPE_EOS_TOKEN,
     ) -> tuple[Array, Array]:
         """Autoregressively generate BPE tokens.
 
@@ -297,25 +303,31 @@ def compute_bpe_embeddings_from_mimi(
     # Compute number of tiles needed to reach target_embed_dim
     num_tiles = (target_embed_dim + codebook_dim - 1) // codebook_dim  # Ceiling division
 
+    # Special token IDs (these don't map to semantic tokens)
+    special_token_ids = {BPE_PAD_TOKEN, BPE_UNK_TOKEN, BPE_BOS_TOKEN, BPE_EOS_TOKEN}
+
     bpe_embeddings = []
     for token_id in range(vocab_size):
-        token_str = bpe_tokenizer.id_to_token(token_id)
-
-        if token_str is None or len(token_str) == 0:
-            # Special tokens (<pad>, <unk>, <bos>, <eos>) - use zero embedding
+        if token_id in special_token_ids:
+            # Special tokens use zero embedding
             embed = np.zeros(codebook_dim)
         else:
-            # Decode unicode characters back to semantic token IDs
-            semantic_ids = [ord(c) - base_char for c in token_str]
-            # Filter valid semantic IDs (0 to codebook_size-1)
-            valid_ids = [sid for sid in semantic_ids if 0 <= sid < mimi_semantic_embed_kd.shape[0]]
+            token_str = bpe_tokenizer.id_to_token(token_id)
 
-            if valid_ids:
-                # Mean of Mimi embeddings for constituent semantic tokens
-                embeds = np.array([mimi_semantic_embed_kd[sid] for sid in valid_ids])
-                embed = np.mean(embeds, axis=0)
-            else:
+            if token_str is None or len(token_str) == 0:
                 embed = np.zeros(codebook_dim)
+            else:
+                # Decode unicode characters back to semantic token IDs
+                semantic_ids = [ord(c) - base_char for c in token_str]
+                # Filter valid semantic IDs (0 to codebook_size-1)
+                valid_ids = [sid for sid in semantic_ids if 0 <= sid < mimi_semantic_embed_kd.shape[0]]
+
+                if valid_ids:
+                    # Mean of Mimi embeddings for constituent semantic tokens
+                    embeds = np.array([mimi_semantic_embed_kd[sid] for sid in valid_ids])
+                    embed = np.mean(embeds, axis=0)
+                else:
+                    embed = np.zeros(codebook_dim)
 
         # Tile to match target dimension, then truncate
         tiled = np.tile(embed, num_tiles)[:target_embed_dim]
@@ -739,10 +751,17 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         decode_table = np.zeros((vocab_size, max_span), dtype=np.int32)
         span_table = np.zeros(vocab_size, dtype=np.int32)
 
+        # Special token IDs (these don't map to semantic tokens)
+        special_token_ids = {BPE_PAD_TOKEN, BPE_UNK_TOKEN, BPE_BOS_TOKEN, BPE_EOS_TOKEN}
+
         for token_id in range(vocab_size):
+            if token_id in special_token_ids:
+                # Special tokens don't map to semantic tokens
+                span_table[token_id] = 0
+                continue
+
             token_str = tokenizer.id_to_token(token_id)
             if token_str is None:
-                # Special tokens (<pad>, <unk>, <bos>, <eos>) - leave as zeros
                 span_table[token_id] = 0
                 continue
 
@@ -968,8 +987,8 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         bpe_tokens, bpe_length = model.t2s.generate(
             text_embeddings_sd,
             max_length=max_bpe_length,
-            bos_token=2,  # <bos>
-            eos_token=3,  # <eos>
+            bos_token=BPE_BOS_TOKEN,
+            eos_token=BPE_EOS_TOKEN,
         )
 
         # Step 3: Decode BPE to semantic tokens
@@ -1059,9 +1078,16 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             text_mask = np.zeros(max_text_len, dtype=np.bool_)
             text_mask[:text_len] = True
 
-            # Semantic BPE tokens (T2S target)
-            semantic_bpe = np.array(example["semantic_bpe"], dtype=np.int32)
-            bpe_spans = np.array(example["bpe_spans"], dtype=np.int32)
+            # Semantic BPE tokens (T2S target) - prepend BOS, append EOS
+            semantic_bpe_raw = np.array(example["semantic_bpe"], dtype=np.int32)
+            bpe_spans_raw = np.array(example["bpe_spans"], dtype=np.int32)
+
+            # Add BOS at start and EOS at end
+            # BOS and EOS have span 0 (they don't map to any semantic tokens)
+            semantic_bpe = np.concatenate([[BPE_BOS_TOKEN], semantic_bpe_raw, [BPE_EOS_TOKEN]])
+            bpe_spans = np.concatenate([[0], bpe_spans_raw, [0]])
+
+            # Truncate to max length (keeping BOS, may lose EOS if too long)
             bpe_len = min(len(semantic_bpe), max_bpe_len)
             bpe_padded = np.zeros(max_bpe_len, dtype=np.int32)
             bpe_padded[:bpe_len] = semantic_bpe[:bpe_len]
