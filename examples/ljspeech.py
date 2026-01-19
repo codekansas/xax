@@ -673,12 +673,6 @@ class Config(xax.SupervisedConfig):
     processed_data_path: str | None = xax.field(None, help="Path to pre-processed data")
     bpe_vocab_size: int = xax.field(151_669, help="Vocabulary size for BPE tokenizer on semantic tokens")
 
-    # Eval settings - use actual training text for debugging
-    eval_prompt: str = xax.field(
-        "With this change the art of printing touched bottom,",
-        help="Text for eval (must be in training set)",
-    )
-
 
 class LJSpeechTTS(xax.SupervisedTask[Config]):
     """Two-part TTS: T2S (text-to-semantic) + S2A (semantic-to-acoustic)."""
@@ -695,12 +689,6 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
         # Load text tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(config.llm_repo.value)
-
-        # Pre-tokenize evaluation prompt
-        self._eval_prompt_tokens = jnp.array(
-            self.tokenizer.encode(config.eval_prompt, add_special_tokens=True),
-            dtype=jnp.int32,
-        )
 
         # Load Whisper model for ASR evaluation (frozen)
         logger.info("Loading Whisper model for ASR evaluation")
