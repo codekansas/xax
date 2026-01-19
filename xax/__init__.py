@@ -464,6 +464,7 @@ NAME_MAP: dict[str, str] = {
     "CPUStatsOptions": "task.mixins.cpu_stats",
     "DataloadersConfig": "task.mixins.data_loader",
     "DataloadersMixin": "task.mixins.data_loader",
+    "dataset_fn": "task.mixins.data_loader",
     "GPUStatsOptions": "task.mixins.gpu_stats",
     "ParallelConfig": "task.mixins.parallel",
     "ParallelMixin": "task.mixins.parallel",
@@ -735,7 +736,7 @@ if IMPORT_ALL or TYPE_CHECKING:
     from xax.task.loggers.tensorboard import TensorboardLogger
     from xax.task.mixins.checkpointing import load_ckpt
     from xax.task.mixins.cpu_stats import CPUStatsOptions
-    from xax.task.mixins.data_loader import DataloadersConfig, DataloadersMixin
+    from xax.task.mixins.data_loader import DataloadersConfig, DataloadersMixin, dataset_fn
     from xax.task.mixins.gpu_stats import GPUStatsOptions
     from xax.task.mixins.parallel import ParallelConfig, ParallelMixin
     from xax.task.mixins.step_wrapper import StepContext

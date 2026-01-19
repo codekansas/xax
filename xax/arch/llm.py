@@ -999,12 +999,16 @@ def _sample_next_token(
     """
     logits_tv = logits_tv.astype(jnp.float32)
 
-    # Temperature scaling
-    logits_tv = jnp.where(temperature > 0, logits_tv / temperature, logits_tv)
+    # True greedy decoding when temperature is 0
+    is_greedy = temperature <= 0
+    greedy_tokens = jnp.argmax(logits_tv, axis=-1, keepdims=True)
+
+    # Temperature scaling for sampling
+    scaled_logits = jnp.where(temperature > 0, logits_tv / temperature, logits_tv)
 
     # Top-p nucleus sampling
-    sort_idx_tv = jnp.argsort(logits_tv, axis=-1, descending=True)
-    sort_logits_tv = jnp.take_along_axis(logits_tv, sort_idx_tv, axis=-1)
+    sort_idx_tv = jnp.argsort(scaled_logits, axis=-1, descending=True)
+    sort_logits_tv = jnp.take_along_axis(scaled_logits, sort_idx_tv, axis=-1)
     sort_probs_tv = jax.nn.softmax(sort_logits_tv, axis=-1)
     cum_probs_tv = jnp.cumsum(sort_probs_tv, axis=-1)
     mask_tv = cum_probs_tv > top_p
@@ -1015,7 +1019,8 @@ def _sample_next_token(
     sampled_idx_tn = jax.random.categorical(key, masked_logits_tv, axis=-1, shape=shape)
     next_token_tn = jnp.take_along_axis(sort_idx_tv, sampled_idx_tn, axis=-1)
 
-    return next_token_tn
+    # Use greedy result when temperature <= 0
+    return jnp.where(is_greedy, greedy_tokens, next_token_tn)
 
 
 def llm_generate_jit(
