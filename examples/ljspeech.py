@@ -45,6 +45,13 @@ BPE_UNK_TOKEN = 1
 BPE_BOS_TOKEN = 2
 BPE_EOS_TOKEN = 3
 
+# Acoustic token special IDs (added to Mimi codebook)
+# Mimi codebook is 2048, so we use 2048 and 2049 for BOS/EOS
+ACOUSTIC_BOS_TOKEN = 2048
+ACOUSTIC_EOS_TOKEN = 2049
+ACOUSTIC_PAD_TOKEN = 2050
+ACOUSTIC_VOCAB_SIZE = 2051  # 2048 Mimi codes + BOS + EOS + PAD
+
 # LoRA targets (same as shakespeare.py)
 DEFAULT_LORA_TARGETS = ("q_proj", "v_proj", "gate", "up")
 
@@ -56,7 +63,7 @@ class Batch(TypedDict):
     semantic_bpe_mask: Array  # (batch, max_bpe_length) - valid BPE positions
     bpe_spans: Array  # (batch, max_bpe_length) - spans for each BPE token
     dilated_semantic: Array  # (batch, max_audio_frames) - expanded semantic tokens (S2A input)
-    acoustic_tokens_flat: Array  # (batch, max_audio_frames * 7) - flattened Q1-Q7 acoustic tokens
+    audio_codes: Array  # (batch, max_audio_frames, 7) - codes S2A (BOS + tokens + EOS)
     audio_mask: Array  # (batch, max_audio_frames) - valid audio positions
 
 
@@ -139,6 +146,34 @@ class T2SModel(eqx.Module):
             text_embed_td = jax.vmap(self.text_embed_proj)(text_embed_td)
         return text_embed_td
 
+    def forward_hidden(
+        self,
+        bpe_tokens_t: Array,
+        text_embeddings_sd: Array,
+    ) -> Array:
+        """Forward pass that returns pre-logit hidden features.
+
+        Args:
+            bpe_tokens_t: Input BPE token IDs, shape (T,)
+            text_embeddings_sd: Encoded text, shape (S, embed_dim)
+
+        Returns:
+            Hidden features before logit projection, shape (T, embed_dim)
+        """
+        x_td = jax.vmap(self.bpe_embed)(bpe_tokens_t)
+
+        for block in self.llm.blocks:
+            x_td, _ = block.forward(x_td, cache=None)
+
+            norm_x = jax.vmap(self.cross_attn_norm)(x_td)
+            cross_out, _, _ = self.cross_attn.forward(
+                q_tn=norm_x,
+                kv_sn=text_embeddings_sd,
+            )
+            x_td = x_td + cross_out
+
+        return self.llm.norm(x_td)
+
     def forward(
         self,
         bpe_tokens_t: Array,
@@ -153,22 +188,30 @@ class T2SModel(eqx.Module):
         Returns:
             Logits for next BPE token, shape (T, bpe_vocab_size)
         """
-        x_td = jax.vmap(self.bpe_embed)(bpe_tokens_t)
-
-        for block in self.llm.blocks:
-            x_td, _ = block.forward(x_td, cache=None)
-
-            norm_x = jax.vmap(self.cross_attn_norm)(x_td)
-            cross_out, _, _ = self.cross_attn.forward(
-                q_tn=norm_x,
-                kv_sn=text_embeddings_sd,
-            )
-            x_td = x_td + cross_out
-
-        x_td = self.llm.norm(x_td)
+        x_td = self.forward_hidden(bpe_tokens_t, text_embeddings_sd)
         # Tied weights: use bpe_embed.weight.T for output projection
         logits_tv = x_td @ self.bpe_embed.weight.T
         return logits_tv
+
+    def forward_with_hidden(
+        self,
+        bpe_tokens_t: Array,
+        text_embeddings_sd: Array,
+    ) -> tuple[Array, Array]:
+        """Forward pass that returns both logits and hidden features.
+
+        Args:
+            bpe_tokens_t: Input BPE token IDs, shape (T,)
+            text_embeddings_sd: Encoded text, shape (S, embed_dim)
+
+        Returns:
+            Tuple of (logits, hidden) where:
+            - logits: shape (T, bpe_vocab_size)
+            - hidden: shape (T, embed_dim)
+        """
+        x_td = self.forward_hidden(bpe_tokens_t, text_embeddings_sd)
+        logits_tv = x_td @ self.bpe_embed.weight.T
+        return logits_tv, x_td
 
     def generate(
         self,
@@ -176,8 +219,8 @@ class T2SModel(eqx.Module):
         max_length: int,
         bos_token: int = BPE_BOS_TOKEN,
         eos_token: int = BPE_EOS_TOKEN,
-    ) -> tuple[Array, Array]:
-        """Autoregressively generate BPE tokens.
+    ) -> tuple[Array, Array, Array]:
+        """Autoregressively generate BPE tokens and return hidden features.
 
         Args:
             text_embeddings_sd: Encoded text, shape (S, embed_dim)
@@ -186,9 +229,10 @@ class T2SModel(eqx.Module):
             eos_token: EOS token ID (default 3)
 
         Returns:
-            Tuple of (tokens, length) where:
+            Tuple of (tokens, length, hidden) where:
             - tokens: Generated token IDs, shape (max_length,)
             - length: Actual sequence length (position of first EOS or max_length)
+            - hidden: Hidden features for each token, shape (max_length, embed_dim)
         """
         # Initialize with BOS token
         tokens = jnp.zeros(max_length, dtype=jnp.int32)
@@ -211,7 +255,10 @@ class T2SModel(eqx.Module):
         eos_positions = jnp.where(tokens == eos_token, jnp.arange(max_length), max_length)
         length = jnp.min(eos_positions)
 
-        return tokens, length
+        # Get hidden features for the generated sequence
+        hidden_td = self.forward_hidden(tokens, text_embeddings_sd)
+
+        return tokens, length, hidden_td
 
 
 def decode_bpe_to_semantic(
@@ -276,6 +323,40 @@ def decode_bpe_to_semantic(
     return semantic_tokens, semantic_length
 
 
+def dilate_bpe_features(
+    bpe_hidden_bd: Array,
+    bpe_spans_b: Array,
+    max_semantic_length: int,
+) -> Array:
+    """Dilate BPE hidden features to semantic token positions.
+
+    Each BPE token's hidden features are replicated for each semantic token
+    it represents (based on its span). This allows the S2A model to receive
+    context from the T2S model at each semantic token position.
+
+    Args:
+        bpe_hidden_bd: Hidden features for each BPE token, shape (B, D)
+        bpe_spans_b: Number of semantic tokens each BPE token represents, shape (B,)
+        max_semantic_length: Maximum output length
+
+    Returns:
+        Dilated hidden features, shape (max_semantic_length, D)
+    """
+    # Compute cumulative spans (end positions for each BPE token)
+    cumsum_b = jnp.cumsum(bpe_spans_b)
+
+    # For each output position, find which BPE token it belongs to
+    # bpe_idx[i] = index of the BPE token that covers output position i
+    output_positions_a = jnp.arange(max_semantic_length)
+    bpe_idx_a = jnp.searchsorted(cumsum_b, output_positions_a, side="right")
+
+    # Clamp to valid indices (positions beyond total span get last BPE token)
+    bpe_idx_a = jnp.minimum(bpe_idx_a, bpe_hidden_bd.shape[0] - 1)
+
+    # Index into BPE features to get dilated output
+    return bpe_hidden_bd[bpe_idx_a]
+
+
 def compute_bpe_embeddings_from_mimi(
     bpe_tokenizer: Tokenizer,
     mimi_semantic_embed_kd: Array,
@@ -337,226 +418,283 @@ def compute_bpe_embeddings_from_mimi(
 
 
 class S2AModel(eqx.Module):
-    """Stacked autoregressive GRU for semantic-to-acoustic token generation.
+    """GRU-based autoregressive decoder for semantic-to-acoustic token generation.
 
-    Architecture: One GRU layer per acoustic quantizer (Q1-Q7). Each layer:
-    - Takes input from the layer below (or semantic embeddings for the first layer)
-    - Has its own hidden state that persists across time steps
-    - Produces output that is used for prediction and passed to the next layer
+    Architecture:
+    - Takes dilated context vectors from T2S model (one per semantic token position)
+    - Projects context to hidden_dim, then for each acoustic quantizer (Q1-Q7):
+      - Applies a SwiGLU layer to the cumulative embedding
+      - GRU autoregressively generates tokens within the layer
+      - Adds the final token embedding to condition upper layers
 
-    This allows the model to capture the dependency between acoustic tokens at
-    different quantizer levels, where the same semantic token can map to different
-    acoustic tokens depending on context.
-
-    Embedding weights are tied with output head weights for parameter efficiency.
+    Uses BOS/EOS tokens for each quantizer layer's autoregressive generation.
+    Embedding and head weights are untied but both initialized from Mimi embeddings.
     """
 
-    semantic_embed: eqx.nn.Embedding  # Embed semantic (Q0) tokens
-    acoustic_embeds: tuple[eqx.nn.Embedding, ...]  # One embedding per quantizer level
-    gru_cells: tuple[eqx.nn.GRUCell, ...]  # One GRU cell per quantizer level
+    context_proj: eqx.nn.Linear  # Project T2S context to hidden_dim
+    acoustic_embeds: tuple[eqx.nn.Embedding, ...]  # One embedding per quantizer level (input)
+    acoustic_heads: tuple[eqx.nn.Embedding, ...]  # One head per quantizer level (output, untied)
+    acoustic_grus: tuple[eqx.nn.GRUCell, ...]  # GRU cells for autoregressive generation
+    swiglu_layers: tuple[xax.SwiGLU, ...]  # SwiGLU layers between codec levels
     hidden_dim: int = eqx.field(static=True)
+    context_dim: int = eqx.field(static=True)
     num_acoustic: int = eqx.field(static=True)
-    codebook_size: int = eqx.field(static=True)
+    vocab_size: int = eqx.field(static=True)  # Mimi codebook + BOS + EOS
 
     @staticmethod
     def build(
-        codebook_size: int = 2048,
+        vocab_size: int = ACOUSTIC_VOCAB_SIZE,
         hidden_dim: int = 256,
+        context_dim: int = 1024,
         num_acoustic: int = 7,
         key: PRNGKeyArray = None,
-        semantic_embed_weights: Array | None = None,
         acoustic_embed_weights: tuple[Array, ...] | None = None,
     ) -> "S2AModel":
-        """Build stacked GRU S2A model.
+        """Build S2A model with GRU-based autoregressive generation.
 
         Args:
-            codebook_size: Size of Mimi codebook (default 2048)
-            hidden_dim: Hidden dimension for GRU and embeddings (default 256 to match Mimi)
+            vocab_size: Size of acoustic vocabulary (Mimi codebook + BOS + EOS = 2050)
+            hidden_dim: Hidden dimension for embeddings (default 256 to match Mimi)
+            context_dim: Dimension of T2S context vectors (LLM embed_dim)
             num_acoustic: Number of acoustic quantizers (Q1-Q7 = 7)
             key: PRNG key
-            semantic_embed_weights: Optional pre-trained semantic embedding weights from Mimi,
-                shape (codebook_size, hidden_dim). If provided, hidden_dim must match.
             acoustic_embed_weights: Optional pre-trained acoustic embedding weights from Mimi,
-                tuple of arrays each with shape (codebook_size, hidden_dim).
+                tuple of arrays each with shape (codebook_size, hidden_dim). BOS/EOS
+                embeddings will be initialized randomly and appended.
 
         Returns:
             S2AModel instance
         """
-        keys = jax.random.split(key, 1 + 2 * num_acoustic)
+        keys = jax.random.split(key, 1 + 4 * num_acoustic)
 
-        # Initialize semantic embedding (from Mimi or random)
-        if semantic_embed_weights is not None:
-            assert semantic_embed_weights.shape == (codebook_size, hidden_dim), (
-                f"Semantic embed shape mismatch: {semantic_embed_weights.shape} vs ({codebook_size}, {hidden_dim})"
-            )
-            semantic_embed = eqx.nn.Embedding(codebook_size, hidden_dim, weight=semantic_embed_weights)
-        else:
-            semantic_embed = eqx.nn.Embedding(codebook_size, hidden_dim, key=keys[0])
+        # Project T2S context (LLM embed_dim) to S2A hidden_dim
+        context_proj = eqx.nn.Linear(context_dim, hidden_dim, key=keys[0])
 
-        # Initialize acoustic embeddings (from Mimi or random)
-        # Weights are tied with output heads for parameter efficiency
+        # Initialize acoustic embeddings (from Mimi or random, plus BOS/EOS/PAD)
+        def make_embed_with_special_tokens(mimi_weights: Array | None, key: PRNGKeyArray) -> eqx.nn.Embedding:
+            if mimi_weights is not None:
+                # Append random embeddings for BOS, EOS, and PAD tokens
+                k1, k2 = jax.random.split(key)
+                bos_emb = jax.random.normal(k1, (1, hidden_dim)) * 0.02
+                eos_emb = jax.random.normal(k2, (1, hidden_dim)) * 0.02
+                pad_emb = jnp.zeros((1, hidden_dim))  # PAD is zero embedding
+                full_weights = jnp.concatenate([mimi_weights, bos_emb, eos_emb, pad_emb], axis=0)
+                return eqx.nn.Embedding(vocab_size, hidden_dim, weight=full_weights)
+            else:
+                return eqx.nn.Embedding(vocab_size, hidden_dim, key=key)
+
         if acoustic_embed_weights is not None:
             assert len(acoustic_embed_weights) == num_acoustic, (
                 f"Expected {num_acoustic} acoustic embeddings, got {len(acoustic_embed_weights)}"
             )
             acoustic_embeds = tuple(
-                eqx.nn.Embedding(codebook_size, hidden_dim, weight=acoustic_embed_weights[i])
-                for i in range(num_acoustic)
+                make_embed_with_special_tokens(acoustic_embed_weights[i], keys[1 + i]) for i in range(num_acoustic)
             )
         else:
             acoustic_embeds = tuple(
-                eqx.nn.Embedding(codebook_size, hidden_dim, key=keys[1 + i])
-                for i in range(num_acoustic)
+                eqx.nn.Embedding(vocab_size, hidden_dim, key=keys[1 + i]) for i in range(num_acoustic)
             )
 
-        # One GRU cell per quantizer level
-        # Layer 0 (Q1): input = semantic_embed + prev_Q1_embed
-        # Layer i (Q{i+1}): input = layer_{i-1}_hidden + prev_Q{i+1}_embed
-        gru_cells = tuple(
-            eqx.nn.GRUCell(hidden_dim, hidden_dim, key=keys[1 + num_acoustic + i])
-            for i in range(num_acoustic)
+        # Initialize acoustic heads (untied from embeddings)
+        if acoustic_embed_weights is not None:
+            acoustic_heads = tuple(
+                make_embed_with_special_tokens(acoustic_embed_weights[i], keys[1 + num_acoustic + i])
+                for i in range(num_acoustic)
+            )
+        else:
+            acoustic_heads = tuple(
+                eqx.nn.Embedding(vocab_size, hidden_dim, key=keys[1 + num_acoustic + i]) for i in range(num_acoustic)
+            )
+
+        # GRU cells for autoregressive generation within each layer
+        acoustic_grus = tuple(
+            eqx.nn.GRUCell(hidden_dim, hidden_dim, key=keys[1 + 2 * num_acoustic + i]) for i in range(num_acoustic)
+        )
+
+        # SwiGLU layers between codec levels for added capacity
+        swiglu_layers = tuple(
+            xax.SwiGLU.build(embed_dim=hidden_dim, key=keys[1 + 3 * num_acoustic + i]) for i in range(num_acoustic)
         )
 
         return S2AModel(
-            semantic_embed=semantic_embed,
+            context_proj=context_proj,
             acoustic_embeds=acoustic_embeds,
-            gru_cells=gru_cells,
+            acoustic_heads=acoustic_heads,
+            acoustic_grus=acoustic_grus,
+            swiglu_layers=swiglu_layers,
             hidden_dim=hidden_dim,
+            context_dim=context_dim,
             num_acoustic=num_acoustic,
-            codebook_size=codebook_size,
+            vocab_size=vocab_size,
         )
-
-    def init_hidden(self) -> Array:
-        """Initialize hidden states for all GRU layers.
-
-        Returns:
-            Initial hidden states, shape (num_acoustic, hidden_dim)
-        """
-        return jnp.zeros((self.num_acoustic, self.hidden_dim))
 
     def forward_step(
         self,
-        semantic_token: Array,
-        prev_acoustic_tokens_7: Array,
         hidden_states_7d: Array,
+        context_d: Array,
+        acoustic_input_7: Array,
+        acoustic_target_7: Array,
     ) -> tuple[Array, Array]:
-        """Process one time step through all GRU layers.
+        """Compute logits for one timestep using teacher forcing.
+
+        Each quantizer layer uses a GRU that maintains hidden state across timesteps.
+        The GRU input is the embedding of the previous token (from acoustic_input).
 
         Args:
-            semantic_token: Q0 token for this position, scalar
-            prev_acoustic_tokens_7: Previous acoustic tokens at this position (for teacher
-                forcing) or generated tokens (for inference), shape (7,)
-            hidden_states_7d: Hidden states from previous time step, shape (7, hidden_dim)
+            hidden_states_7d: GRU hidden states from previous timestep, shape (7, hidden_dim)
+            context_d: Context vector from T2S (dilated), shape (context_dim,)
+            acoustic_input_7: Input tokens for this timestep (prev tokens or BOS), shape (7,)
+            acoustic_target_7: Target tokens for this timestep (for layer conditioning), shape (7,)
 
         Returns:
-            Tuple of (logits_7v, new_hidden_states_7d) where:
-            - logits_7v: Logits for all acoustic tokens, shape (7, codebook_size)
-            - new_hidden_states_7d: Updated hidden states, shape (7, hidden_dim)
+            Tuple of (new_hidden_states, logits) where:
+            - new_hidden_states: Updated GRU hidden states, shape (7, hidden_dim)
+            - logits: Logits for all acoustic tokens, shape (7, vocab_size)
         """
-        # Embed semantic token (input to first layer)
-        semantic_emb_d = self.semantic_embed(semantic_token)
+        # Project context to hidden_dim
+        projected_d = self.context_proj(context_d)
 
         logits_list = []
         new_hidden_list = []
-        layer_input_d = semantic_emb_d
+        cumulative_emb_d = projected_d
 
         for layer_idx in range(self.num_acoustic):
-            # Add embedding of previous token at this layer
-            prev_token_emb_d = self.acoustic_embeds[layer_idx](prev_acoustic_tokens_7[layer_idx])
-            gru_input_d = layer_input_d + prev_token_emb_d
+            # SwiGLU layer for added capacity (expects 2D input)
+            swiglu_out_d = self.swiglu_layers[layer_idx](cumulative_emb_d[None, :])[0]
+            cumulative_emb_d = cumulative_emb_d + swiglu_out_d
 
-            # GRU step
+            # GRU input: cumulative embedding + input token embedding (prev token or BOS)
+            input_emb_d = self.acoustic_embeds[layer_idx](acoustic_input_7[layer_idx])
+            gru_input_d = cumulative_emb_d + input_emb_d
+
+            # GRU step with hidden state from previous timestep
             prev_hidden_d = hidden_states_7d[layer_idx]
-            new_hidden_d = self.gru_cells[layer_idx](gru_input_d, prev_hidden_d)
+            new_hidden_d = self.acoustic_grus[layer_idx](gru_input_d, prev_hidden_d)
             new_hidden_list.append(new_hidden_d)
 
-            # Compute logits with tied weights
-            logits_v = new_hidden_d @ self.acoustic_embeds[layer_idx].weight.T
+            # Compute logits with head weights
+            logits_v = new_hidden_d @ self.acoustic_heads[layer_idx].weight.T
             logits_list.append(logits_v)
 
-            # Output of this layer becomes input to next layer
-            layer_input_d = new_hidden_d
+            # Add this layer's target embedding for conditioning upper layers (teacher forcing)
+            target_emb_d = self.acoustic_embeds[layer_idx](acoustic_target_7[layer_idx])
+            cumulative_emb_d = cumulative_emb_d + target_emb_d
 
-        return jnp.stack(logits_list, axis=0), jnp.stack(new_hidden_list, axis=0)
+        return jnp.stack(new_hidden_list, axis=0), jnp.stack(logits_list, axis=0)
 
-    def forward_all(self, semantic_tokens_t: Array, acoustic_targets_t7: Array) -> Array:
+    def forward_all(
+        self,
+        context_td: Array,
+        acoustic_inputs_t7: Array,
+        acoustic_targets_t7: Array,
+    ) -> Array:
         """Forward pass for training: compute logits for all positions and quantizers.
 
-        Uses teacher forcing: at each position, uses ground truth previous tokens.
+        Uses scan to carry GRU hidden states across timesteps for temporal autoregression.
+        Teacher forcing: input at timestep t is the token from t-1 (or BOS for t=0).
 
         Args:
-            semantic_tokens_t: Q0 tokens, shape (T,)
+            context_td: Dilated context vectors from T2S, shape (T, context_dim)
+            acoustic_inputs_t7: Input tokens (shifted targets with BOS), shape (T, 7)
             acoustic_targets_t7: Target acoustic tokens Q1-Q7, shape (T, 7)
 
         Returns:
-            Logits for all acoustic tokens, shape (T, 7, codebook_size)
+            Logits for all acoustic tokens, shape (T, 7, vocab_size)
         """
-        tsz = semantic_tokens_t.shape[0]
+        # Initialize hidden states to zeros
+        init_hidden_7d = jnp.zeros((self.num_acoustic, self.hidden_dim))
 
-        # Shift targets for teacher forcing: prev_tokens[t] = targets[t-1]
-        # At t=0, use zeros (no previous tokens)
-        prev_tokens_t7 = jnp.concatenate([
-            jnp.zeros((1, self.num_acoustic), dtype=jnp.int32),
-            acoustic_targets_t7[:-1],
-        ], axis=0)
-
-        def scan_step(
-            hidden_7d: Array,
-            inputs: tuple[Array, Array],
-        ) -> tuple[Array, Array]:
-            semantic_tok, prev_acoustic_7 = inputs
-            logits_7v, new_hidden_7d = self.forward_step(
-                semantic_tok, prev_acoustic_7, hidden_7d
-            )
+        def scan_fn(hidden_7d: Array, inputs: tuple[Array, Array, Array]) -> tuple[Array, Array]:
+            ctx_d, inp_7, tgt_7 = inputs
+            new_hidden_7d, logits_7v = self.forward_step(hidden_7d, ctx_d, inp_7, tgt_7)
             return new_hidden_7d, logits_7v
 
-        init_hidden = self.init_hidden()
+        # Scan over timesteps, carrying hidden state
         _, logits_t7v = jax.lax.scan(
-            scan_step,
-            init_hidden,
-            (semantic_tokens_t, prev_tokens_t7),
+            scan_fn,
+            init_hidden_7d,
+            (context_td, acoustic_inputs_t7, acoustic_targets_t7),
         )
 
         return logits_t7v
 
-    def generate(
+    def generate_step(
         self,
-        semantic_tokens_t: Array,
-    ) -> Array:
-        """Generate acoustic tokens autoregressively.
+        hidden_states_7d: Array,
+        context_d: Array,
+        prev_tokens_7: Array,
+    ) -> tuple[Array, Array]:
+        """Generate acoustic tokens for one timestep autoregressively across layers.
 
         Args:
-            semantic_tokens_t: Q0 tokens, shape (T,)
+            hidden_states_7d: GRU hidden states from previous timestep, shape (7, hidden_dim)
+            context_d: Context vector from T2S (dilated), shape (context_dim,)
+            prev_tokens_7: Tokens from previous timestep (or BOS for t=0), shape (7,)
+
+        Returns:
+            Tuple of (new_hidden_states, generated_tokens) where:
+            - new_hidden_states: Updated GRU hidden states, shape (7, hidden_dim)
+            - generated_tokens: Generated acoustic tokens, shape (7,)
+        """
+        # Project context to hidden_dim
+        projected_d = self.context_proj(context_d)
+
+        tokens_list = []
+        new_hidden_list = []
+        cumulative_emb_d = projected_d
+
+        for layer_idx in range(self.num_acoustic):
+            # SwiGLU layer for added capacity (expects 2D input)
+            swiglu_out_d = self.swiglu_layers[layer_idx](cumulative_emb_d[None, :])[0]
+            cumulative_emb_d = cumulative_emb_d + swiglu_out_d
+
+            # GRU input: cumulative embedding + prev token embedding
+            prev_emb_d = self.acoustic_embeds[layer_idx](prev_tokens_7[layer_idx])
+            gru_input_d = cumulative_emb_d + prev_emb_d
+
+            # GRU step with hidden state from previous timestep
+            prev_hidden_d = hidden_states_7d[layer_idx]
+            new_hidden_d = self.acoustic_grus[layer_idx](gru_input_d, prev_hidden_d)
+            new_hidden_list.append(new_hidden_d)
+
+            # Compute logits and take argmax (excluding BOS/EOS from generation)
+            logits_v = new_hidden_d @ self.acoustic_heads[layer_idx].weight.T
+            # Mask out BOS/EOS tokens during generation
+            logits_v = logits_v.at[ACOUSTIC_BOS_TOKEN].set(-jnp.inf)
+            logits_v = logits_v.at[ACOUSTIC_EOS_TOKEN].set(-jnp.inf)
+            token = jnp.argmax(logits_v)
+            tokens_list.append(token)
+
+            # Add this layer's predicted embedding for conditioning upper layers
+            layer_emb_d = self.acoustic_embeds[layer_idx](token)
+            cumulative_emb_d = cumulative_emb_d + layer_emb_d
+
+        return jnp.stack(new_hidden_list, axis=0), jnp.stack(tokens_list, axis=0)
+
+    def generate(self, context_td: Array) -> Array:
+        """Generate acoustic tokens given context vectors.
+
+        Uses scan to carry GRU hidden states across timesteps for temporal autoregression.
+
+        Args:
+            context_td: Dilated context vectors from T2S, shape (T, context_dim)
 
         Returns:
             Generated acoustic tokens, shape (T, 7)
         """
-        def generate_step(
-            carry: tuple[Array, Array],
-            semantic_tok: Array,
-        ) -> tuple[tuple[Array, Array], Array]:
-            hidden_7d, prev_acoustic_7 = carry
+        # Initialize hidden states to zeros and prev tokens to BOS
+        init_hidden_7d = jnp.zeros((self.num_acoustic, self.hidden_dim))
+        init_tokens_7 = jnp.full((self.num_acoustic,), ACOUSTIC_BOS_TOKEN, dtype=jnp.int32)
 
-            # Forward through all layers
-            logits_7v, new_hidden_7d = self.forward_step(
-                semantic_tok, prev_acoustic_7, hidden_7d
-            )
+        def scan_fn(carry: tuple[Array, Array], ctx_d: Array) -> tuple[tuple[Array, Array], Array]:
+            hidden_7d, prev_tokens_7 = carry
+            new_hidden_7d, new_tokens_7 = self.generate_step(hidden_7d, ctx_d, prev_tokens_7)
+            return (new_hidden_7d, new_tokens_7), new_tokens_7
 
-            # Greedy decoding for each layer
-            new_acoustic_7 = jnp.argmax(logits_7v, axis=-1)
+        # Scan over timesteps, carrying hidden state and previous tokens
+        _, tokens_t7 = jax.lax.scan(scan_fn, (init_hidden_7d, init_tokens_7), context_td)
 
-            return (new_hidden_7d, new_acoustic_7), new_acoustic_7
-
-        init_hidden = self.init_hidden()
-        init_acoustic = jnp.zeros(self.num_acoustic, dtype=jnp.int32)
-
-        _, acoustic_tokens_t7 = jax.lax.scan(
-            generate_step,
-            (init_hidden, init_acoustic),
-            semantic_tokens_t,
-        )
-
-        return acoustic_tokens_t7
+        return tokens_t7
 
 
 class TwoPartTTSModel(eqx.Module):
@@ -565,12 +703,13 @@ class TwoPartTTSModel(eqx.Module):
     t2s: T2SModel
     s2a: S2AModel
     mimi: xax.MimiModel
-    whisper: xax.WhisperModel
+    whisper_transcriber: xax.WhisperTranscriber
 
     @staticmethod
     def build(
         llm: xax.LLM,
         bpe_vocab_size: int,
+        whisper_eos_token_id: int,
         s2a_hidden_dim: int | None = None,
         bpe_tokenizer: Tokenizer | None = None,
         key: PRNGKeyArray = None,
@@ -580,6 +719,7 @@ class TwoPartTTSModel(eqx.Module):
         Args:
             llm: Pretrained LLM (with LoRA applied)
             bpe_vocab_size: Vocabulary size for BPE tokens
+            whisper_eos_token_id: EOS token ID for Whisper transcription
             s2a_hidden_dim: Hidden dimension for S2A stacked GRU. If None, uses Mimi's
                 codebook_dim (256) to enable embedding initialization from Mimi.
             bpe_tokenizer: Optional BPE tokenizer for computing BPE embeddings from Mimi.
@@ -599,14 +739,13 @@ class TwoPartTTSModel(eqx.Module):
         if s2a_hidden_dim is None:
             s2a_hidden_dim = mimi.config.codebook_dim  # 256
 
-        # Extract embeddings from Mimi for S2A initialization
-        # Semantic embedding from Q0 (semantic RVQ layer 0)
+        # Extract embeddings from Mimi for S2A and BPE initialization
+        # Semantic embedding from Q0 (for BPE embedding computation)
         semantic_embed_weights = mimi.quantizer.semantic_rvq.layers[0].embeddings_kd
 
         # Acoustic embeddings from Q1-Q7 (acoustic RVQ layers 0-6)
         acoustic_embed_weights = tuple(
-            mimi.quantizer.acoustic_rvq.layers[i].embeddings_kd
-            for i in range(NUM_ACOUSTIC_QUANTIZERS)
+            mimi.quantizer.acoustic_rvq.layers[i].embeddings_kd for i in range(NUM_ACOUSTIC_QUANTIZERS)
         )
 
         # Compute BPE embeddings from Mimi semantic embeddings if tokenizer provided
@@ -627,16 +766,21 @@ class TwoPartTTSModel(eqx.Module):
             bpe_embed_weights=bpe_embed_weights,
         )
         s2a = S2AModel.build(
-            codebook_size=xax.MIMI_CODEBOOK_SIZE,
+            vocab_size=ACOUSTIC_VOCAB_SIZE,
             hidden_dim=s2a_hidden_dim,
+            context_dim=llm.config.embed_dim,
             num_acoustic=NUM_ACOUSTIC_QUANTIZERS,
             key=k2,
-            semantic_embed_weights=semantic_embed_weights,
             acoustic_embed_weights=acoustic_embed_weights,
         )
-        whisper = xax.build_pretrained_whisper()
+        whisper_model = xax.build_pretrained_whisper()
+        whisper_transcriber = xax.WhisperTranscriber(
+            model=whisper_model,
+            eos_token_id=whisper_eos_token_id,
+            dtype=jnp.bfloat16,  # Match model dtype
+        )
 
-        return TwoPartTTSModel(t2s=t2s, s2a=s2a, mimi=mimi, whisper=whisper)
+        return TwoPartTTSModel(t2s=t2s, s2a=s2a, mimi=mimi, whisper_transcriber=whisper_transcriber)
 
 
 @dataclass
@@ -656,13 +800,17 @@ class Config(xax.SupervisedConfig):
     min_learning_rate: float = xax.field(1e-5, help="Minimum learning rate")
     warmup_steps: int = xax.field(50, help="Number of warmup steps")
     max_text_length: int = xax.field(128, help="Maximum text token length")
-    max_audio_frames: int = xax.field(64, help="Maximum audio frames")
+    max_audio_frames: int = xax.field(256, help="Maximum audio frames")
 
     # Two-part architecture settings
-    s2a_hidden_dim: int = xax.field(256, help="S2A stacked GRU hidden dimension (256 = Mimi codebook_dim)")
+    s2a_hidden_dim: int = xax.field(256, help="S2A hidden dimension (256 = Mimi codebook_dim)")
     t2s_weight: float = xax.field(1.0, help="Loss weight for T2S (semantic) loss")
     s2a_weight: float = xax.field(1.0, help="Loss weight for S2A (acoustic) loss")
-    max_bpe_length: int = xax.field(64, help="Maximum BPE sequence length (matches max_audio_frames)")
+    s2a_layer_weights: tuple[float, ...] = xax.field(
+        (1.0, 0.7, 0.5, 0.4, 0.3, 0.3, 0.3),
+        help="Per-layer weights for S2A loss (Q1-Q7)",
+    )
+    max_bpe_length: int = xax.field(64, help="Maximum BPE sequence length")
 
     # Generation settings
     gen_temperature: float = xax.field(0.8, help="Temperature for generation sampling")
@@ -707,8 +855,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             tokenizer_path = self.dataset_cache_dir / "bpe_tokenizer.json"
             if not tokenizer_path.exists():
                 raise FileNotFoundError(
-                    f"BPE tokenizer not found at {tokenizer_path}. "
-                    "Run with --launcher dataset first to generate it."
+                    f"BPE tokenizer not found at {tokenizer_path}. Run with --launcher dataset first to generate it."
                 )
             self.bpe_tokenizer = Tokenizer.from_file(str(tokenizer_path))
         return self.bpe_tokenizer
@@ -785,13 +932,16 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         bpe_tokenizer = self._load_bpe_tokenizer()
 
         k_model = jax.random.fold_in(params.key, 1)
-        return TwoPartTTSModel.build(
+        model = TwoPartTTSModel.build(
             llm=llm,
             bpe_vocab_size=self.config.bpe_vocab_size,
+            whisper_eos_token_id=self.whisper_config.eos_token_id,
             s2a_hidden_dim=self.config.s2a_hidden_dim,
             bpe_tokenizer=bpe_tokenizer,
             key=k_model,
         )
+
+        return model
 
     @override
     def get_trainable_filter_spec(self, model: TwoPartTTSModel) -> TwoPartTTSModel:
@@ -801,9 +951,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         cross_attn_norm_spec = jax.tree.map(lambda _: True, model.t2s.cross_attn_norm)
         bpe_embed_spec = jax.tree.map(lambda _: True, model.t2s.bpe_embed)
         text_embed_proj_spec = (
-            jax.tree.map(lambda _: True, model.t2s.text_embed_proj)
-            if model.t2s.text_embed_proj is not None
-            else None
+            jax.tree.map(lambda _: True, model.t2s.text_embed_proj) if model.t2s.text_embed_proj is not None else None
         )
 
         t2s_spec = T2SModel(
@@ -820,13 +968,13 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
         # Mimi and Whisper: Frozen
         mimi_spec = jax.tree.map(lambda _: False, model.mimi)
-        whisper_spec = jax.tree.map(lambda _: False, model.whisper)
+        whisper_transcriber_spec = jax.tree.map(lambda _: False, model.whisper_transcriber)
 
         return TwoPartTTSModel(
             t2s=t2s_spec,
             s2a=s2a_spec,
             mimi=mimi_spec,
-            whisper=whisper_spec,
+            whisper_transcriber=whisper_transcriber_spec,
         )
 
     @override
@@ -869,8 +1017,8 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         bpe_target_bs = batch["semantic_bpe"][:, 1:]
         bpe_mask_bs = batch["semantic_bpe_mask"][:, 1:]
 
-        # T2S forward: predict next BPE token given context + cross-attention to text
-        t2s_logits_bsv = jax.vmap(model.t2s.forward)(bpe_input_bs, text_embeddings_bsd)
+        # T2S forward: get both logits and hidden features
+        t2s_logits_bsv, t2s_hidden_bsd = jax.vmap(model.t2s.forward_with_hidden)(bpe_input_bs, text_embeddings_bsd)
         t2s_loss_bs = optax.softmax_cross_entropy_with_integer_labels(t2s_logits_bsv, bpe_target_bs)
         t2s_loss = jnp.sum(t2s_loss_bs * bpe_mask_bs) / jnp.maximum(jnp.sum(bpe_mask_bs), 1)
 
@@ -879,15 +1027,27 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         t2s_correct_bs = (t2s_preds_bs == bpe_target_bs) & bpe_mask_bs
         t2s_accuracy = jnp.sum(t2s_correct_bs) / jnp.maximum(jnp.sum(bpe_mask_bs), 1)
 
-        # S2A Loss: autoregressive prediction of Q1-Q7 given Q0
-        semantic_tokens_ba = batch["dilated_semantic"]  # Q0
-        # Reshape flattened acoustic tokens: (B, A*7) -> (B, A, 7)
-        bsz = batch["acoustic_tokens_flat"].shape[0]
-        acoustic_targets_ba7 = batch["acoustic_tokens_flat"].reshape(bsz, self.config.max_audio_frames, 7)
-        audio_mask_ba = batch["audio_mask"]
+        # Dilate T2S hidden features to semantic token positions
+        # Use BPE spans (excluding BOS at position 0 to match bpe_input_bs)
+        # Context length is max_audio_frames - 1 since audio_codes has BOS prepended
+        bpe_spans_bs = batch["bpe_spans"][:, :-1]
+        dilated_context_bad = jax.vmap(dilate_bpe_features, in_axes=(0, 0, None))(
+            t2s_hidden_bsd, bpe_spans_bs, self.config.max_audio_frames - 1
+        )
 
-        # S2A forward: compute logits for all quantizers
-        s2a_logits_ba7v = jax.vmap(model.s2a.forward_all)(semantic_tokens_ba, acoustic_targets_ba7)
+        # S2A Loss: autoregressive prediction of Q1-Q7 given dilated context
+        # audio_codes has shape (B, A, 7) with BOS at position 0, EOS at the end
+        # Derive inputs (shifted right) and targets (shifted left)
+        audio_codes_ba7 = batch["audio_codes"]
+        acoustic_inputs_ba7 = audio_codes_ba7[:, :-1, :]  # BOS through second-to-last
+        acoustic_targets_ba7 = audio_codes_ba7[:, 1:, :]  # First token through EOS
+        audio_mask_ba = batch["audio_mask"][:, 1:]  # Shift mask to match targets
+
+        # S2A forward: compute logits for all quantizers using dilated context
+        # Uses scan to carry GRU hidden states across timesteps
+        s2a_logits_ba7v = jax.vmap(model.s2a.forward_all)(
+            dilated_context_bad, acoustic_inputs_ba7, acoustic_targets_ba7
+        )
 
         # S2A loss: cross-entropy for each quantizer
         s2a_loss_ba7 = optax.softmax_cross_entropy_with_integer_labels(
@@ -895,11 +1055,16 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             acoustic_targets_ba7.reshape(-1),
         ).reshape(acoustic_targets_ba7.shape)
 
-        # Mask and average
-        s2a_mask_ba7 = audio_mask_ba[..., None]  # (B, A, 1) broadcast to (B, A, 7)
-        s2a_loss = jnp.sum(s2a_loss_ba7 * s2a_mask_ba7) / jnp.maximum(jnp.sum(s2a_mask_ba7) * 7, 1)
+        # Apply per-layer weights (Q1-Q7)
+        layer_weights_7 = jnp.array(self.config.s2a_layer_weights)
+        s2a_loss_ba7 = s2a_loss_ba7 * layer_weights_7
 
-        # S2A accuracy
+        # Mask and average (normalize by sum of weights, not count)
+        s2a_mask_ba7 = audio_mask_ba[..., None]  # (B, A, 1) broadcast to (B, A, 7)
+        weighted_mask_ba7 = s2a_mask_ba7 * layer_weights_7
+        s2a_loss = jnp.sum(s2a_loss_ba7 * s2a_mask_ba7) / jnp.maximum(jnp.sum(weighted_mask_ba7), 1)
+
+        # S2A accuracy (unweighted)
         s2a_preds_ba7 = jnp.argmax(s2a_logits_ba7v, axis=-1)
         s2a_correct_ba7 = (s2a_preds_ba7 == acoustic_targets_ba7) & audio_mask_ba[..., None]
         s2a_accuracy = jnp.sum(s2a_correct_ba7) / jnp.maximum(jnp.sum(audio_mask_ba) * 7, 1)
@@ -911,8 +1076,6 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             "loss": xax.Scalar(loss),
             "t2s_loss": xax.Scalar(t2s_loss),
             "s2a_loss": xax.Scalar(s2a_loss),
-            "t2s_perplexity": xax.Scalar(jnp.exp(t2s_loss)),
-            "s2a_perplexity": xax.Scalar(jnp.exp(s2a_loss)),
             "t2s_accuracy": xax.Scalar(t2s_accuracy),
             "s2a_accuracy": xax.Scalar(s2a_accuracy),
         }
@@ -921,28 +1084,16 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             gen_key = jax.random.fold_in(key, state.num_steps)
             # Build BPE decode tables if needed (lazy initialization)
             bpe_decode_table, bpe_span_table = self._build_bpe_decode_tables()
-            audio_t, gt_audio_t = self._generate_audio(
-                model, batch, gen_key, bpe_decode_table, bpe_span_table
-            )
+            audio_t, gt_audio_t = self._generate_audio(model, batch, gen_key, bpe_decode_table, bpe_span_table)
             metrics["generated_audio"] = xax.Audio(audio_t, sample_rate=xax.MIMI_SAMPLE_RATE)
             metrics["real_audio"] = xax.Audio(gt_audio_t, sample_rate=xax.MIMI_SAMPLE_RATE)
 
             # Transcribe generated audio with Whisper
-            transcript_tokens, _, _ = xax.transcribe_with_whisper(
-                model=model.whisper,
-                audio_t=audio_t,
-                eos_token_id=self.whisper_config.eos_token_id,
-                max_tokens=64,
-            )
+            transcript_tokens, _, _ = model.whisper_transcriber.transcribe(audio_t, max_tokens=64)
             metrics["transcript"] = xax.Tokens(transcript_tokens, tokenizer="whisper")
 
             # Also transcribe ground truth
-            gt_transcript_tokens, _, _ = xax.transcribe_with_whisper(
-                model=model.whisper,
-                audio_t=gt_audio_t,
-                eos_token_id=self.whisper_config.eos_token_id,
-                max_tokens=64,
-            )
+            gt_transcript_tokens, _, _ = model.whisper_transcriber.transcribe(gt_audio_t, max_tokens=64)
             metrics["gt_transcript"] = xax.Tokens(gt_transcript_tokens, tokenizer="whisper")
 
         return loss, metrics
@@ -958,10 +1109,11 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         """Generate audio using full end-to-end pipeline.
 
         Pipeline:
-        1. T2S: Encode text and autoregressively generate BPE tokens
+        1. T2S: Encode text and autoregressively generate BPE tokens + hidden features
         2. Decode BPE to semantic tokens
-        3. S2A: Generate acoustic tokens from semantic tokens
-        4. Mimi: Decode all codes to audio
+        3. Dilate T2S hidden features to semantic token positions
+        4. S2A: Generate acoustic tokens from dilated context
+        5. Mimi: Decode all codes to audio
 
         Returns:
             Tuple of (generated audio, ground truth audio)
@@ -970,9 +1122,9 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         text_tokens = batch["text_tokens"][0]
         text_embeddings_sd = model.t2s.encode_text(text_tokens)
 
-        # Step 2: Generate BPE tokens autoregressively
+        # Step 2: Generate BPE tokens and hidden features autoregressively
         max_bpe_length = self.config.max_bpe_length
-        bpe_tokens, bpe_length = model.t2s.generate(
+        bpe_tokens, bpe_length, bpe_hidden_bd = model.t2s.generate(
             text_embeddings_sd,
             max_length=max_bpe_length,
             bos_token=BPE_BOS_TOKEN,
@@ -989,21 +1141,29 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             max_semantic_length=max_semantic,
         )
 
-        # Step 4: Generate acoustic tokens with stacked GRU S2A
-        acoustic_tokens_a7 = model.s2a.generate(semantic_tokens)  # (A, 7)
+        # Step 4: Dilate T2S hidden features to semantic token positions
+        bpe_spans_b = bpe_span_table[bpe_tokens]
+        dilated_context_ad = dilate_bpe_features(bpe_hidden_bd, bpe_spans_b, max_semantic)
+
+        # Step 5: Generate acoustic tokens using dilated context
+        acoustic_tokens_a7 = model.s2a.generate(dilated_context_ad)  # (A, 7)
 
         # Step 5: Combine Q0 (semantic) + Q1-Q7 (predicted acoustic) and decode
-        all_codes_8a = jnp.concatenate([
-            semantic_tokens[None, :],  # (1, A)
-            acoustic_tokens_a7.T,  # (7, A)
-        ], axis=0)  # (8, A)
+        all_codes_8a = jnp.concatenate(
+            [
+                semantic_tokens[None, :],  # (1, A)
+                acoustic_tokens_a7.T,  # (7, A)
+            ],
+            axis=0,
+        )  # (8, A)
 
         audio_ct = model.mimi.decode(all_codes_8a)
 
         # Ground truth audio: Q0 + GT Q1-Q7
+        # audio_codes has BOS at position 0, so skip it for actual tokens
         gt_semantic = batch["dilated_semantic"][0]
-        gt_acoustic_flat = batch["acoustic_tokens_flat"][0]
-        gt_acoustic = gt_acoustic_flat.reshape(self.config.max_audio_frames, 7).T  # (7, A)
+        gt_acoustic_a7 = batch["audio_codes"][0, 1:, :]  # Skip BOS, shape (A-1, 7)
+        gt_acoustic = gt_acoustic_a7.T  # (7, A-1)
         gt_codes_8a = jnp.concatenate([gt_semantic[None, :], gt_acoustic], axis=0)
         gt_audio_ct = model.mimi.decode(gt_codes_8a)
 
@@ -1085,22 +1245,34 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             bpe_mask[:bpe_len] = True
 
             # Audio codes: (T_audio, 8) where column 0 is Q0 (semantic), 1-7 are acoustic
-            audio_codes = np.asarray(example["audio_codes"])
+            audio_codes_raw = np.asarray(example["audio_codes"])
+            audio_codes = np.pad(audio_codes_raw, ((1, 1), (0, 0)), mode="empty")
+            audio_codes[0] = ACOUSTIC_BOS_TOKEN
+            audio_codes[-1] = ACOUSTIC_EOS_TOKEN
             semantic_tokens = audio_codes[:, 0]  # Q0: shape (T_audio,)
             acoustic_tokens = audio_codes[:, 1:8]  # Q1-Q7: shape (T_audio, 7)
 
+            # Add padding tokens to the audio codes.
             audio_len = min(len(semantic_tokens), max_audio_frames)
-            semantic_padded = np.zeros(max_audio_frames, dtype=np.int32)
-            semantic_padded[:audio_len] = semantic_tokens[:audio_len]
+            semantic_padded = np.pad(
+                semantic_tokens[:max_audio_frames],
+                ((0, max_audio_frames - audio_len),),
+                mode="constant",
+                constant_values=ACOUSTIC_PAD_TOKEN,
+            )
+            acoustic_padded = np.pad(
+                acoustic_tokens[:max_audio_frames],
+                ((0, max_audio_frames - audio_len), (0, 0)),
+                mode="constant",
+                constant_values=ACOUSTIC_PAD_TOKEN,
+            )
 
-            # Flatten acoustic tokens to 1D for HuggingFace compatibility
-            # Shape: (max_audio_frames * 7,) - will be reshaped to (max_audio_frames, 7) in collate
-            acoustic_padded = np.zeros(max_audio_frames * 7, dtype=np.int32)
-            acoustic_flat = acoustic_tokens[:audio_len].flatten()
-            acoustic_padded[: len(acoustic_flat)] = acoustic_flat
+            # Remove BOS token from the semantic tokens.
+            semantic_padded = semantic_padded[1:]
 
+            # Mask includes positions 0 to audio_len (inclusive) for EOS prediction
             audio_mask = np.zeros(max_audio_frames, dtype=np.bool_)
-            audio_mask[:audio_len] = True
+            audio_mask[: audio_len + 1] = True  # +1 for EOS position
 
             return {
                 "text_tokens": text_padded,
@@ -1109,7 +1281,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
                 "semantic_bpe_mask": bpe_mask,
                 "bpe_spans": spans_padded,
                 "dilated_semantic": semantic_padded,
-                "acoustic_tokens_flat": acoustic_padded,  # Flattened for HF compatibility
+                "audio_codes": acoustic_padded,
                 "audio_mask": audio_mask,
             }
 
@@ -1124,7 +1296,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             "semantic_bpe_mask",
             "bpe_spans",
             "dilated_semantic",
-            "acoustic_tokens_flat",
+            "audio_codes",
             "audio_mask",
         ]
         cols_to_remove = [c for c in result.column_names if c not in cols_to_keep]

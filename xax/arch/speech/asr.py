@@ -678,15 +678,14 @@ def mel_filters(
     n_mels: int = WHISPER_N_MELS,
     n_fft: int = WHISPER_N_FFT,
     sample_rate: int = WHISPER_SAMPLE_RATE,
-    dtype: jnp.dtype | None = None,
 ) -> Array:
     """Create mel filterbank matching HuggingFace Whisper implementation.
 
     Uses Slaney-style mel scale and normalization with max frequency of 8000 Hz.
+    Always returns float32 filterbank - cast to desired dtype at call site.
 
     Returns filterbank of shape (n_mels, n_fft // 2 + 1)
     """
-    # Fallback to custom implementation
     low_freq = 0.0
     high_freq = 8000.0
 
@@ -721,7 +720,7 @@ def mel_filters(
     enorm = 2.0 / (hz_points[2 : n_mels + 2] - hz_points[:n_mels])
     filterbank *= enorm[:, None]
 
-    return jnp.array(filterbank, dtype=dtype)
+    return jnp.array(filterbank, dtype=jnp.float32)
 
 
 def log_mel_spectrogram(
@@ -774,8 +773,8 @@ def log_mel_spectrogram(
     # Discard last frame (HuggingFace does this)
     magnitudes_tf = magnitudes_tf[:-1]
 
-    # Apply mel filterbank
-    filters_mf = mel_filters(n_mels, n_fft, dtype=dtype)
+    # Apply mel filterbank (cast from float32 to target dtype)
+    filters_mf = mel_filters(n_mels, n_fft).astype(dtype)
     mel_tf = magnitudes_tf @ filters_mf.T  # (time, n_mels)
 
     # Convert to log scale with clamping
@@ -786,6 +785,166 @@ def log_mel_spectrogram(
     log_mel_tf = (log_mel_tf + 4.0) / 4.0
 
     return log_mel_tf.T.astype(dtype)  # (n_mels, time)
+
+
+class WhisperTranscriber(eqx.Module):
+    """Whisper transcriber with pre-computed mel filterbank.
+
+    This module wraps a WhisperModel and pre-computes the mel filterbank
+    at initialization time to avoid lru_cache issues inside JIT.
+
+    Usage:
+        transcriber = WhisperTranscriber(model, eos_token_id, dtype=jnp.bfloat16)
+        tokens, length, encoder_out = transcriber.transcribe(audio_t, max_tokens=64)
+    """
+
+    model: WhisperModel
+    mel_filters_mf: Array
+    eos_token_id: int = eqx.field(static=True)
+    n_mels: int = eqx.field(static=True)
+    n_fft: int = eqx.field(static=True)
+    hop_length: int = eqx.field(static=True)
+    sample_rate: int = eqx.field(static=True)
+    chunk_length: int = eqx.field(static=True)
+
+    # Whisper special tokens for English transcription
+    sot_token: int = eqx.field(static=True, default=50258)  # <|startoftranscript|>
+    lang_token: int = eqx.field(static=True, default=50259)  # <|en|>
+    task_token: int = eqx.field(static=True, default=50360)  # <|transcribe|>
+    notimestamps_token: int = eqx.field(static=True, default=50364)  # <|notimestamps|>
+
+    def __init__(
+        self,
+        model: WhisperModel,
+        eos_token_id: int,
+        *,
+        n_mels: int = WHISPER_N_MELS,
+        n_fft: int = WHISPER_N_FFT,
+        hop_length: int = WHISPER_HOP_LENGTH,
+        sample_rate: int = WHISPER_SAMPLE_RATE,
+        chunk_length: int = WHISPER_CHUNK_LENGTH,
+        dtype: jnp.dtype | None = None,
+    ) -> None:
+        self.model = model
+        self.eos_token_id = eos_token_id
+        self.n_mels = n_mels
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.sample_rate = sample_rate
+        self.chunk_length = chunk_length
+
+        # Pre-compute mel filterbank in desired dtype
+        filters_f32 = mel_filters(n_mels, n_fft, sample_rate)
+        self.mel_filters_mf = filters_f32 if dtype is None else filters_f32.astype(dtype)
+
+    def compute_mel_spectrogram(self, audio_t: Array) -> Array:
+        """Compute log mel spectrogram using pre-computed filterbank.
+
+        Args:
+            audio_t: Audio waveform of shape (time,)
+
+        Returns:
+            Log mel spectrogram of shape (n_mels, time')
+        """
+        # Pad or trim audio to chunk length
+        # Use concatenate + dynamic_slice to handle traced shapes
+        target_len = self.sample_rate * self.chunk_length
+        # Concatenate with zeros padding to ensure at least target_len
+        padding = jnp.zeros(target_len, dtype=audio_t.dtype)
+        audio_padded = jnp.concatenate([audio_t, padding])
+        # Slice to exactly target_len
+        audio_t = jax.lax.dynamic_slice(audio_padded, (0,), (target_len,))
+
+        dtype = self.mel_filters_mf.dtype
+
+        # Create Hann window (periodic, like torch.hann_window with periodic=True)
+        window = jnp.hanning(self.n_fft + 1)[:-1]
+
+        # Pad audio for STFT with reflection padding
+        pad_len = self.n_fft // 2
+        audio_padded = jnp.pad(audio_t, (pad_len, pad_len), mode="reflect")
+
+        # Compute number of frames
+        n_samples = audio_padded.shape[0]
+        n_frames = 1 + (n_samples - self.n_fft) // self.hop_length
+
+        # Extract frames and apply window
+        indices = jnp.arange(self.n_fft)[None, :] + jnp.arange(n_frames)[:, None] * self.hop_length
+        frames_tf = audio_padded[indices] * window
+
+        # Compute FFT
+        fft_tf = jnp.fft.rfft(frames_tf, n=self.n_fft)
+        magnitudes_tf = jnp.abs(fft_tf) ** 2
+
+        # Discard last frame (HuggingFace does this)
+        magnitudes_tf = magnitudes_tf[:-1]
+
+        # Apply pre-computed mel filterbank
+        mel_tf = magnitudes_tf @ self.mel_filters_mf.T  # (time, n_mels)
+
+        # Convert to log scale with clamping
+        log_mel_tf = jnp.log10(jnp.maximum(mel_tf, 1e-10))
+
+        # Normalize (Whisper-style): clip to max - 8, then scale
+        log_mel_tf = jnp.maximum(log_mel_tf, log_mel_tf.max() - 8.0)
+        log_mel_tf = (log_mel_tf + 4.0) / 4.0
+
+        return log_mel_tf.T.astype(dtype)  # (n_mels, time)
+
+    def transcribe(self, audio_t: Array, max_tokens: int) -> tuple[Array, Array, Array]:
+        """Transcribe audio using greedy decoding.
+
+        Args:
+            audio_t: Audio waveform of shape (time,)
+            max_tokens: Maximum number of tokens to generate
+
+        Returns:
+            Tuple of (token_ids, final_length, encoder_output)
+        """
+        # Compute mel spectrogram using pre-computed filterbank
+        mel_mt = self.compute_mel_spectrogram(audio_t)
+
+        # Encode
+        encoder_out_td = self.model.encode(mel_mt)
+
+        # Start tokens
+        tokens_t = jnp.array(
+            [self.sot_token, self.lang_token, self.task_token, self.notimestamps_token],
+            dtype=jnp.int32,
+        )
+
+        # Greedy decoding using lax.scan
+        max_len = tokens_t.shape[0] + max_tokens
+        tokens_full_t = jnp.full((max_len,), self.eos_token_id, dtype=tokens_t.dtype)
+        tokens_full_t = tokens_full_t.at[: tokens_t.shape[0]].set(tokens_t)
+        init_len_s = jnp.array(tokens_t.shape[0], dtype=jnp.int32)
+        init_done_s = jnp.array(False)
+
+        def decode_step(
+            carry: tuple[Array, Array, Array],
+            _: None,
+        ) -> tuple[tuple[Array, Array, Array], None]:
+            tokens_full_t, cur_len_s, done_s = carry
+            logits_tv = self.model.decode(tokens_full_t, encoder_out_td)
+            next_token_s = jnp.argmax(logits_tv[cur_len_s - 1]).astype(tokens_full_t.dtype)
+            is_eos_s = next_token_s == self.eos_token_id
+            should_write_s = ~done_s
+
+            def write_token(tokens_full_t: Array) -> Array:
+                return tokens_full_t.at[cur_len_s].set(next_token_s)
+
+            tokens_full_t = jax.lax.cond(should_write_s, write_token, lambda t: t, tokens_full_t)
+            new_len_s = jnp.minimum(cur_len_s + should_write_s.astype(cur_len_s.dtype), max_len)
+            new_done_s = done_s | is_eos_s
+            return (tokens_full_t, new_len_s, new_done_s), None
+
+        (tokens_full_t, final_len_s, _), _ = jax.lax.scan(
+            decode_step,
+            (tokens_full_t, init_len_s, init_done_s),
+            length=max_tokens,
+        )
+
+        return tokens_full_t, final_len_s, encoder_out_td
 
 
 @functools.lru_cache(maxsize=16)

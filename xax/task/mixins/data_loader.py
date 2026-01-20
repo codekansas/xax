@@ -10,7 +10,7 @@ from graphlib import TopologicalSorter
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Event, Thread
-from typing import Callable, Collection, Generic, Iterator, TypeVar
+from typing import Any, Callable, Collection, Generic, Iterator, TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -33,6 +33,16 @@ Tc_co = TypeVar("Tc_co", covariant=True)
 DatasetType = DatasetDict | Dataset | IterableDatasetDict | IterableDataset
 
 DEFAULT_HASH = "default"
+
+
+def fix_object_dtype(x: Any) -> Any:  # noqa: ANN401
+    """Fix dtype=object arrays."""
+    if isinstance(x, np.ndarray) and x.dtype == np.object_:
+        raise ValueError(
+            "Your dataset contains a ragged array. This is not supported. "
+            "Make sure they are all padded to the same length."
+        )
+    return x
 
 
 def _hash_function(fn: Callable) -> str:
@@ -176,6 +186,9 @@ class StreamingBatchIterator(Iterator[Batch]):
         if isinstance(item, BaseException):
             self._error = item
             raise item
+
+        # Fix for dtype=object arrays
+        item = jax.tree.map(fix_object_dtype, item)
 
         # Transfer to device in main thread to ensure proper mesh context
         return jax.device_put(item, self._sharding)

@@ -98,7 +98,7 @@ class TensorboardLogger(LoggerImpl):
                 port = new_port
             else:
                 logger.warning("Port %s is busy, waiting...", port)
-            time.sleep(10)
+                time.sleep(10)
 
         def make_localhost(s: str) -> str:
             if self.use_localhost:
