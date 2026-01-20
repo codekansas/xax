@@ -834,8 +834,10 @@ class WhisperTranscriber(eqx.Module):
         self.chunk_length = chunk_length
 
         # Pre-compute mel filterbank in desired dtype
-        filters_f32 = mel_filters(n_mels, n_fft, sample_rate)
-        self.mel_filters_mf = filters_f32 if dtype is None else filters_f32.astype(dtype)
+        filters = mel_filters(n_mels, n_fft, sample_rate)
+        if dtype is not None:
+            dtype = jnp.bfloat16
+        self.mel_filters_mf = filters.astype(dtype)
 
     def compute_mel_spectrogram(self, audio_t: Array) -> Array:
         """Compute log mel spectrogram using pre-computed filterbank.

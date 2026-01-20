@@ -110,7 +110,7 @@ class T2SModel(eqx.Module):
             embed_dim=embed_dim,
             num_heads=llm.config.q_heads,
             key=k1,
-            use_rotary_embeddings=False,
+            use_rotary_embeddings=True,
         )
         cross_attn_norm = xax.RMSNorm.build(embed_dim, eps=llm.config.rms_eps)
 
@@ -418,28 +418,32 @@ def compute_bpe_embeddings_from_mimi(
 
 
 class S2AModel(eqx.Module):
-    """GRU-based autoregressive decoder for semantic-to-acoustic token generation.
+    """Causal transformer-based decoder for semantic-to-acoustic token generation.
 
     Architecture:
     - Takes dilated context vectors from T2S model (one per semantic token position)
     - Projects context to hidden_dim, then for each acoustic quantizer (Q1-Q7):
-      - Applies a SwiGLU layer to the cumulative embedding
-      - GRU autoregressively generates tokens within the layer
-      - Adds the final token embedding to condition upper layers
+      - Runs a causal transformer over the sequence (parallelized over time during training)
+      - Conditions on embeddings from lower layers (teacher forcing)
+      - Predicts tokens for this quantizer level
 
     Uses BOS/EOS tokens for each quantizer layer's autoregressive generation.
     Embedding and head weights are untied but both initialized from Mimi embeddings.
+
+    Key advantage over GRU: During training, all timesteps within a layer are processed
+    in parallel using causal attention, while layers are still processed sequentially
+    for proper conditioning.
     """
 
     context_proj: eqx.nn.Linear  # Project T2S context to hidden_dim
     acoustic_embeds: tuple[eqx.nn.Embedding, ...]  # One embedding per quantizer level (input)
-    acoustic_heads: tuple[eqx.nn.Embedding, ...]  # One head per quantizer level (output, untied)
-    acoustic_grus: tuple[eqx.nn.GRUCell, ...]  # GRU cells for autoregressive generation
-    swiglu_layers: tuple[xax.SwiGLU, ...]  # SwiGLU layers between codec levels
+    acoustic_heads: tuple[eqx.nn.Linear, ...]  # One head per quantizer level (output)
+    transformers: tuple[tuple[xax.TransformerBlock, ...], ...]  # Transformer layers per quantizer
     hidden_dim: int = eqx.field(static=True)
     context_dim: int = eqx.field(static=True)
     num_acoustic: int = eqx.field(static=True)
-    vocab_size: int = eqx.field(static=True)  # Mimi codebook + BOS + EOS
+    vocab_size: int = eqx.field(static=True)  # Mimi codebook + BOS + EOS + PAD
+    num_transformer_layers: int = eqx.field(static=True)
 
     @staticmethod
     def build(
@@ -447,31 +451,34 @@ class S2AModel(eqx.Module):
         hidden_dim: int = 256,
         context_dim: int = 1024,
         num_acoustic: int = 7,
+        num_transformer_layers: int = 2,
+        num_heads: int = 4,
         key: PRNGKeyArray = None,
         acoustic_embed_weights: tuple[Array, ...] | None = None,
     ) -> "S2AModel":
-        """Build S2A model with GRU-based autoregressive generation.
+        """Build S2A model with causal transformer-based autoregressive generation.
 
         Args:
-            vocab_size: Size of acoustic vocabulary (Mimi codebook + BOS + EOS = 2050)
+            vocab_size: Size of acoustic vocabulary (Mimi codebook + BOS + EOS + PAD = 2051)
             hidden_dim: Hidden dimension for embeddings (default 256 to match Mimi)
             context_dim: Dimension of T2S context vectors (LLM embed_dim)
             num_acoustic: Number of acoustic quantizers (Q1-Q7 = 7)
+            num_transformer_layers: Number of transformer layers per quantizer
+            num_heads: Number of attention heads
             key: PRNG key
             acoustic_embed_weights: Optional pre-trained acoustic embedding weights from Mimi,
-                tuple of arrays each with shape (codebook_size, hidden_dim). BOS/EOS
+                tuple of arrays each with shape (codebook_size, hidden_dim). BOS/EOS/PAD
                 embeddings will be initialized randomly and appended.
 
         Returns:
             S2AModel instance
         """
-        keys = jax.random.split(key, 1 + 4 * num_acoustic)
-
         # Project T2S context (LLM embed_dim) to S2A hidden_dim
-        context_proj = eqx.nn.Linear(context_dim, hidden_dim, key=keys[0])
+        key, ctx_key = jax.random.split(key)
+        context_proj = eqx.nn.Linear(context_dim, hidden_dim, key=ctx_key)
 
         # Initialize acoustic embeddings (from Mimi or random, plus BOS/EOS/PAD)
-        def make_embed_with_special_tokens(mimi_weights: Array | None, key: PRNGKeyArray) -> eqx.nn.Embedding:
+        def make_embed(mimi_weights: Array | None, key: PRNGKeyArray) -> eqx.nn.Embedding:
             if mimi_weights is not None:
                 # Append random embeddings for BOS, EOS, and PAD tokens
                 k1, k2 = jax.random.split(key)
@@ -483,104 +490,80 @@ class S2AModel(eqx.Module):
             else:
                 return eqx.nn.Embedding(vocab_size, hidden_dim, key=key)
 
+        key, *emb_keys = jax.random.split(key, num_acoustic + 1)
         if acoustic_embed_weights is not None:
-            assert len(acoustic_embed_weights) == num_acoustic, (
-                f"Expected {num_acoustic} acoustic embeddings, got {len(acoustic_embed_weights)}"
-            )
-            acoustic_embeds = tuple(
-                make_embed_with_special_tokens(acoustic_embed_weights[i], keys[1 + i]) for i in range(num_acoustic)
-            )
+            assert len(acoustic_embed_weights) == num_acoustic
+            acoustic_embeds = tuple(make_embed(acoustic_embed_weights[i], emb_keys[i]) for i in range(num_acoustic))
         else:
-            acoustic_embeds = tuple(
-                eqx.nn.Embedding(vocab_size, hidden_dim, key=keys[1 + i]) for i in range(num_acoustic)
-            )
+            acoustic_embeds = tuple(make_embed(None, emb_keys[i]) for i in range(num_acoustic))
 
-        # Initialize acoustic heads (untied from embeddings)
-        if acoustic_embed_weights is not None:
-            acoustic_heads = tuple(
-                make_embed_with_special_tokens(acoustic_embed_weights[i], keys[1 + num_acoustic + i])
-                for i in range(num_acoustic)
-            )
-        else:
-            acoustic_heads = tuple(
-                eqx.nn.Embedding(vocab_size, hidden_dim, key=keys[1 + num_acoustic + i]) for i in range(num_acoustic)
-            )
+        # Initialize acoustic heads (linear projection to vocab)
+        key, *head_keys = jax.random.split(key, num_acoustic + 1)
+        acoustic_heads = tuple(eqx.nn.Linear(hidden_dim, vocab_size, key=head_keys[i]) for i in range(num_acoustic))
 
-        # GRU cells for autoregressive generation within each layer
-        acoustic_grus = tuple(
-            eqx.nn.GRUCell(hidden_dim, hidden_dim, key=keys[1 + 2 * num_acoustic + i]) for i in range(num_acoustic)
-        )
-
-        # SwiGLU layers between codec levels for added capacity
-        swiglu_layers = tuple(
-            xax.SwiGLU.build(embed_dim=hidden_dim, key=keys[1 + 3 * num_acoustic + i]) for i in range(num_acoustic)
-        )
+        # Build transformer layers for each quantizer level
+        transformers_list = []
+        for _ in range(num_acoustic):
+            layer_list = []
+            for _ in range(num_transformer_layers):
+                key, trf_key = jax.random.split(key)
+                layer = xax.TransformerBlock.build(
+                    embed_dim=hidden_dim,
+                    num_heads=num_heads,
+                    ff_dim=hidden_dim * 4,  # Standard 4x expansion
+                    key=trf_key,
+                    causal=True,  # Causal attention for autoregressive generation
+                    use_rotary_embeddings=True,  # RoPE for position encoding
+                    norm_type="rmsnorm",
+                    feedforward_type="swiglu",
+                )
+                layer_list.append(layer)
+            transformers_list.append(tuple(layer_list))
 
         return S2AModel(
             context_proj=context_proj,
             acoustic_embeds=acoustic_embeds,
             acoustic_heads=acoustic_heads,
-            acoustic_grus=acoustic_grus,
-            swiglu_layers=swiglu_layers,
+            transformers=tuple(transformers_list),
             hidden_dim=hidden_dim,
             context_dim=context_dim,
             num_acoustic=num_acoustic,
             vocab_size=vocab_size,
+            num_transformer_layers=num_transformer_layers,
         )
 
-    def forward_step(
+    def forward_layer(
         self,
-        hidden_states_7d: Array,
-        context_d: Array,
-        acoustic_input_7: Array,
-        acoustic_target_7: Array,
-    ) -> tuple[Array, Array]:
-        """Compute logits for one timestep using teacher forcing.
-
-        Each quantizer layer uses a GRU that maintains hidden state across timesteps.
-        The GRU input is the embedding of the previous token (from acoustic_input).
+        layer_idx: int,
+        context_td: Array,
+        lower_layer_embeds_td: Array,
+        acoustic_inputs_t: Array,
+    ) -> Array:
+        """Forward pass for a single quantizer layer.
 
         Args:
-            hidden_states_7d: GRU hidden states from previous timestep, shape (7, hidden_dim)
-            context_d: Context vector from T2S (dilated), shape (context_dim,)
-            acoustic_input_7: Input tokens for this timestep (prev tokens or BOS), shape (7,)
-            acoustic_target_7: Target tokens for this timestep (for layer conditioning), shape (7,)
+            layer_idx: Index of the quantizer layer (0-6 for Q1-Q7)
+            context_td: Projected context vectors, shape (T, hidden_dim)
+            lower_layer_embeds_td: Sum of embeddings from layers 0..layer_idx-1, shape (T, hidden_dim)
+            acoustic_inputs_t: Input tokens for this layer (shifted targets), shape (T,)
 
         Returns:
-            Tuple of (new_hidden_states, logits) where:
-            - new_hidden_states: Updated GRU hidden states, shape (7, hidden_dim)
-            - logits: Logits for all acoustic tokens, shape (7, vocab_size)
+            Logits for this layer, shape (T, vocab_size)
         """
-        # Project context to hidden_dim
-        projected_d = self.context_proj(context_d)
+        # Get input embeddings for this layer
+        input_embeds_td = jax.vmap(self.acoustic_embeds[layer_idx])(acoustic_inputs_t)
 
-        logits_list = []
-        new_hidden_list = []
-        cumulative_emb_d = projected_d
+        # Combine: context + lower layer conditioning + current layer input
+        x_td = context_td + lower_layer_embeds_td + input_embeds_td
 
-        for layer_idx in range(self.num_acoustic):
-            # SwiGLU layer for added capacity (expects 2D input)
-            swiglu_out_d = self.swiglu_layers[layer_idx](cumulative_emb_d[None, :])[0]
-            cumulative_emb_d = cumulative_emb_d + swiglu_out_d
+        # Run through transformer layers
+        for transformer_layer in self.transformers[layer_idx]:
+            x_td, _ = transformer_layer(x_td, cache=None)
 
-            # GRU input: cumulative embedding + input token embedding (prev token or BOS)
-            input_emb_d = self.acoustic_embeds[layer_idx](acoustic_input_7[layer_idx])
-            gru_input_d = cumulative_emb_d + input_emb_d
+        # Project to vocabulary
+        logits_tv = jax.vmap(self.acoustic_heads[layer_idx])(x_td)
 
-            # GRU step with hidden state from previous timestep
-            prev_hidden_d = hidden_states_7d[layer_idx]
-            new_hidden_d = self.acoustic_grus[layer_idx](gru_input_d, prev_hidden_d)
-            new_hidden_list.append(new_hidden_d)
-
-            # Compute logits with head weights
-            logits_v = new_hidden_d @ self.acoustic_heads[layer_idx].weight.T
-            logits_list.append(logits_v)
-
-            # Add this layer's target embedding for conditioning upper layers (teacher forcing)
-            target_emb_d = self.acoustic_embeds[layer_idx](acoustic_target_7[layer_idx])
-            cumulative_emb_d = cumulative_emb_d + target_emb_d
-
-        return jnp.stack(new_hidden_list, axis=0), jnp.stack(logits_list, axis=0)
+        return logits_tv
 
     def forward_all(
         self,
@@ -590,8 +573,9 @@ class S2AModel(eqx.Module):
     ) -> Array:
         """Forward pass for training: compute logits for all positions and quantizers.
 
-        Uses scan to carry GRU hidden states across timesteps for temporal autoregression.
-        Teacher forcing: input at timestep t is the token from t-1 (or BOS for t=0).
+        Each layer's transformer processes all timesteps in parallel using causal attention.
+        Layers are processed sequentially to maintain proper conditioning.
+        Teacher forcing: lower layers use ground truth targets for conditioning.
 
         Args:
             context_td: Dilated context vectors from T2S, shape (T, context_dim)
@@ -601,80 +585,89 @@ class S2AModel(eqx.Module):
         Returns:
             Logits for all acoustic tokens, shape (T, 7, vocab_size)
         """
-        # Initialize hidden states to zeros
-        init_hidden_7d = jnp.zeros((self.num_acoustic, self.hidden_dim))
+        # Project context once
+        projected_td = jax.vmap(self.context_proj)(context_td)
 
-        def scan_fn(hidden_7d: Array, inputs: tuple[Array, Array, Array]) -> tuple[Array, Array]:
-            ctx_d, inp_7, tgt_7 = inputs
-            new_hidden_7d, logits_7v = self.forward_step(hidden_7d, ctx_d, inp_7, tgt_7)
-            return new_hidden_7d, logits_7v
+        logits_list = []
+        cumulative_embeds_td = jnp.zeros_like(projected_td)
 
-        # Scan over timesteps, carrying hidden state
-        _, logits_t7v = jax.lax.scan(
-            scan_fn,
-            init_hidden_7d,
-            (context_td, acoustic_inputs_t7, acoustic_targets_t7),
-        )
+        for layer_idx in range(self.num_acoustic):
+            # Forward through this layer's transformer
+            logits_tv = self.forward_layer(
+                layer_idx=layer_idx,
+                context_td=projected_td,
+                lower_layer_embeds_td=cumulative_embeds_td,
+                acoustic_inputs_t=acoustic_inputs_t7[:, layer_idx],
+            )
+            logits_list.append(logits_tv)
 
-        return logits_t7v
+            # Add this layer's target embeddings for conditioning upper layers (teacher forcing)
+            target_embeds_td = jax.vmap(self.acoustic_embeds[layer_idx])(acoustic_targets_t7[:, layer_idx])
+            cumulative_embeds_td = cumulative_embeds_td + target_embeds_td
+
+        # Stack: (T, 7, vocab_size)
+        return jnp.stack(logits_list, axis=1)
 
     def generate_step(
         self,
-        hidden_states_7d: Array,
+        caches: list[list[xax.TransformerBlockCache]],
         context_d: Array,
         prev_tokens_7: Array,
-    ) -> tuple[Array, Array]:
+    ) -> tuple[list[list[xax.TransformerBlockCache]], Array]:
         """Generate acoustic tokens for one timestep autoregressively across layers.
 
         Args:
-            hidden_states_7d: GRU hidden states from previous timestep, shape (7, hidden_dim)
-            context_d: Context vector from T2S (dilated), shape (context_dim,)
+            caches: KV caches for each layer's transformers, shape [7][num_layers]
+            context_d: Projected context vector, shape (hidden_dim,)
             prev_tokens_7: Tokens from previous timestep (or BOS for t=0), shape (7,)
 
         Returns:
-            Tuple of (new_hidden_states, generated_tokens) where:
-            - new_hidden_states: Updated GRU hidden states, shape (7, hidden_dim)
+            Tuple of (updated_caches, generated_tokens) where:
+            - updated_caches: Updated KV caches
             - generated_tokens: Generated acoustic tokens, shape (7,)
         """
-        # Project context to hidden_dim
-        projected_d = self.context_proj(context_d)
-
         tokens_list = []
-        new_hidden_list = []
-        cumulative_emb_d = projected_d
+        updated_caches = []
+        dtype = context_d.dtype
+        layer_cumulative_d = jnp.zeros((self.hidden_dim,), dtype=dtype)
 
         for layer_idx in range(self.num_acoustic):
-            # SwiGLU layer for added capacity (expects 2D input)
-            swiglu_out_d = self.swiglu_layers[layer_idx](cumulative_emb_d[None, :])[0]
-            cumulative_emb_d = cumulative_emb_d + swiglu_out_d
+            # Get input embedding for this layer
+            input_emb_d = self.acoustic_embeds[layer_idx](prev_tokens_7[layer_idx]).astype(dtype)
 
-            # GRU input: cumulative embedding + prev token embedding
-            prev_emb_d = self.acoustic_embeds[layer_idx](prev_tokens_7[layer_idx])
-            gru_input_d = cumulative_emb_d + prev_emb_d
+            # Combine: context + lower layer conditioning (within this timestep) + input
+            # Note: Temporal dependencies are handled by the transformer's KV cache,
+            # not by accumulating embeddings across timesteps (which would mismatch training)
+            x_d = context_d + layer_cumulative_d + input_emb_d
 
-            # GRU step with hidden state from previous timestep
-            prev_hidden_d = hidden_states_7d[layer_idx]
-            new_hidden_d = self.acoustic_grus[layer_idx](gru_input_d, prev_hidden_d)
-            new_hidden_list.append(new_hidden_d)
+            # Run through transformer layers with caching (single timestep)
+            x_1d = x_d[None, :]  # Add sequence dimension
+            layer_caches = []
+            for t_idx, transformer_layer in enumerate(self.transformers[layer_idx]):
+                cache = caches[layer_idx][t_idx] if caches else None
+                x_1d, new_cache = transformer_layer(x_1d, cache=cache)
+                layer_caches.append(new_cache)
+            updated_caches.append(layer_caches)
 
-            # Compute logits and take argmax (excluding BOS/EOS from generation)
-            logits_v = new_hidden_d @ self.acoustic_heads[layer_idx].weight.T
-            # Mask out BOS/EOS tokens during generation
+            # Project to vocabulary and take argmax
+            logits_v = self.acoustic_heads[layer_idx](x_1d[0])
+            # Mask out BOS/EOS/PAD tokens during generation
             logits_v = logits_v.at[ACOUSTIC_BOS_TOKEN].set(-jnp.inf)
             logits_v = logits_v.at[ACOUSTIC_EOS_TOKEN].set(-jnp.inf)
+            logits_v = logits_v.at[ACOUSTIC_PAD_TOKEN].set(-jnp.inf)
             token = jnp.argmax(logits_v)
             tokens_list.append(token)
 
             # Add this layer's predicted embedding for conditioning upper layers
-            layer_emb_d = self.acoustic_embeds[layer_idx](token)
-            cumulative_emb_d = cumulative_emb_d + layer_emb_d
+            layer_emb_d = self.acoustic_embeds[layer_idx](token).astype(dtype)
+            layer_cumulative_d = layer_cumulative_d + layer_emb_d
 
-        return jnp.stack(new_hidden_list, axis=0), jnp.stack(tokens_list, axis=0)
+        return updated_caches, jnp.stack(tokens_list, axis=0)
 
     def generate(self, context_td: Array) -> Array:
         """Generate acoustic tokens given context vectors.
 
-        Uses scan to carry GRU hidden states across timesteps for temporal autoregression.
+        Uses incremental generation with KV caching for efficiency.
 
         Args:
             context_td: Dilated context vectors from T2S, shape (T, context_dim)
@@ -682,17 +675,30 @@ class S2AModel(eqx.Module):
         Returns:
             Generated acoustic tokens, shape (T, 7)
         """
-        # Initialize hidden states to zeros and prev tokens to BOS
-        init_hidden_7d = jnp.zeros((self.num_acoustic, self.hidden_dim))
+        dtype = context_td.dtype
+        seq_len = context_td.shape[0]
+
+        # Project context once
+        projected_td = jax.vmap(self.context_proj)(context_td)
+
+        # Initialize caches using TransformerBlock.init_cache for proper structure
+        # Use bfloat16 to match model weights dtype
+        init_caches: list[list[xax.TransformerBlockCache]] = [
+            [
+                self.transformers[q_idx][l_idx].init_cache(max_len=seq_len, dtype=dtype)
+                for l_idx in range(self.num_transformer_layers)
+            ]
+            for q_idx in range(self.num_acoustic)
+        ]
         init_tokens_7 = jnp.full((self.num_acoustic,), ACOUSTIC_BOS_TOKEN, dtype=jnp.int32)
 
-        def scan_fn(carry: tuple[Array, Array], ctx_d: Array) -> tuple[tuple[Array, Array], Array]:
-            hidden_7d, prev_tokens_7 = carry
-            new_hidden_7d, new_tokens_7 = self.generate_step(hidden_7d, ctx_d, prev_tokens_7)
-            return (new_hidden_7d, new_tokens_7), new_tokens_7
+        def scan_fn(carry: tuple[list, Array], ctx_d: Array) -> tuple[tuple[list, Array], Array]:
+            caches, prev_tokens_7 = carry
+            new_caches, new_tokens_7 = self.generate_step(caches, ctx_d, prev_tokens_7)
+            return (new_caches, new_tokens_7), new_tokens_7
 
-        # Scan over timesteps, carrying hidden state and previous tokens
-        _, tokens_t7 = jax.lax.scan(scan_fn, (init_hidden_7d, init_tokens_7), context_td)
+        # Scan over timesteps
+        _, tokens_t7 = jax.lax.scan(scan_fn, (init_caches, init_tokens_7), projected_td)
 
         return tokens_t7
 
@@ -711,6 +717,8 @@ class TwoPartTTSModel(eqx.Module):
         bpe_vocab_size: int,
         whisper_eos_token_id: int,
         s2a_hidden_dim: int | None = None,
+        s2a_num_transformer_layers: int = 2,
+        s2a_num_heads: int = 4,
         bpe_tokenizer: Tokenizer | None = None,
         key: PRNGKeyArray = None,
     ) -> "TwoPartTTSModel":
@@ -720,8 +728,10 @@ class TwoPartTTSModel(eqx.Module):
             llm: Pretrained LLM (with LoRA applied)
             bpe_vocab_size: Vocabulary size for BPE tokens
             whisper_eos_token_id: EOS token ID for Whisper transcription
-            s2a_hidden_dim: Hidden dimension for S2A stacked GRU. If None, uses Mimi's
+            s2a_hidden_dim: Hidden dimension for S2A transformers. If None, uses Mimi's
                 codebook_dim (256) to enable embedding initialization from Mimi.
+            s2a_num_transformer_layers: Number of transformer layers per S2A quantizer
+            s2a_num_heads: Number of attention heads in S2A transformers
             bpe_tokenizer: Optional BPE tokenizer for computing BPE embeddings from Mimi.
                 If provided, BPE embeddings are initialized as the mean of Mimi semantic
                 embeddings for each BPE token's constituent tokens.
@@ -770,6 +780,8 @@ class TwoPartTTSModel(eqx.Module):
             hidden_dim=s2a_hidden_dim,
             context_dim=llm.config.embed_dim,
             num_acoustic=NUM_ACOUSTIC_QUANTIZERS,
+            num_transformer_layers=s2a_num_transformer_layers,
+            num_heads=s2a_num_heads,
             key=k2,
             acoustic_embed_weights=acoustic_embed_weights,
         )
@@ -777,7 +789,6 @@ class TwoPartTTSModel(eqx.Module):
         whisper_transcriber = xax.WhisperTranscriber(
             model=whisper_model,
             eos_token_id=whisper_eos_token_id,
-            dtype=jnp.bfloat16,  # Match model dtype
         )
 
         return TwoPartTTSModel(t2s=t2s, s2a=s2a, mimi=mimi, whisper_transcriber=whisper_transcriber)
@@ -804,6 +815,8 @@ class Config(xax.SupervisedConfig):
 
     # Two-part architecture settings
     s2a_hidden_dim: int = xax.field(256, help="S2A hidden dimension (256 = Mimi codebook_dim)")
+    s2a_num_transformer_layers: int = xax.field(2, help="Number of transformer layers per S2A quantizer")
+    s2a_num_heads: int = xax.field(4, help="Number of attention heads in S2A transformers")
     t2s_weight: float = xax.field(1.0, help="Loss weight for T2S (semantic) loss")
     s2a_weight: float = xax.field(1.0, help="Loss weight for S2A (acoustic) loss")
     s2a_layer_weights: tuple[float, ...] = xax.field(
@@ -937,6 +950,8 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             bpe_vocab_size=self.config.bpe_vocab_size,
             whisper_eos_token_id=self.whisper_config.eos_token_id,
             s2a_hidden_dim=self.config.s2a_hidden_dim,
+            s2a_num_transformer_layers=self.config.s2a_num_transformer_layers,
+            s2a_num_heads=self.config.s2a_num_heads,
             bpe_tokenizer=bpe_tokenizer,
             key=k_model,
         )
@@ -1515,8 +1530,8 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 if __name__ == "__main__":
     LJSpeechTTS.launch(
         Config(
-            batch_size=128,
-            max_grad_norm=5.0,
+            batch_size=64,
+            max_grad_norm=10.0,
             gradient_accumulation_steps=2,
             log_heavy_every_n_seconds=60,
             # max_steps=60 * 60,  # 1 hour

@@ -899,36 +899,44 @@ class SelfAttentionBlock(eqx.Module):
         )
         implementation = "cudnn" if use_cudnn else None
 
-        if seq_len == 1:
-            # For single-token generation with cache, mask to only attend to valid positions
-            if cache is None:
-                attn_output = jax.nn.dot_product_attention(q, k, v, bias=bias, implementation=implementation)
-            else:
-                max_cache_len = k.shape[0]
-                # Mask: attend to positions 0 to new_position-1 (inclusive)
-                # new_position is p + 1 after adding the current token
-                valid_mask = jnp.arange(max_cache_len) < new_position
-                valid_mask = valid_mask[None, None, None, :]  # (1, 1, 1, max_cache_len)
-                attn_output = jax.nn.dot_product_attention(
-                    q,
-                    k,
-                    v,
-                    mask=valid_mask,
-                    bias=bias,
-                    implementation=implementation,
-                )
-
-        elif mask is not None:
+        if mask is not None:
             attn_output = jax.nn.dot_product_attention(q, k, v, mask=mask, bias=bias, implementation=implementation)
 
         elif cache is not None:
+            # When using cache, Q and K may have different lengths, so we need an explicit mask.
+            # is_causal=True assumes Q and K have the same length, which is wrong here.
+            max_cache_len = k.shape[0]
+            start_pos = new_position - seq_len
+
+            # Valid positions mask: only attend to filled cache positions
+            valid_mask = jnp.arange(max_cache_len) < new_position  # (cache_len,)
+
+            if self.causal:
+                # Causal mask: q[i] at position (start_pos + i) attends to k[j] if j <= start_pos + i
+                q_positions = jnp.arange(seq_len) + start_pos  # (seq_len,)
+                k_positions = jnp.arange(max_cache_len)  # (cache_len,)
+                causal_mask = k_positions[None, :] <= q_positions[:, None]  # (seq_len, cache_len)
+
+                # Combine valid and causal masks
+                combined_mask = valid_mask[None, :] & causal_mask  # (seq_len, cache_len)
+            else:
+                combined_mask = jnp.broadcast_to(valid_mask[None, :], (seq_len, max_cache_len))
+
+            # Apply sliding window if configured
+            if self.local_window_size is not None:
+                q_positions = jnp.arange(seq_len) + start_pos
+                k_positions = jnp.arange(max_cache_len)
+                # Only attend to keys within window: k_pos >= q_pos - window_size
+                window_mask = k_positions[None, :] >= (q_positions[:, None] - self.local_window_size)
+                combined_mask = combined_mask & window_mask
+
+            combined_mask = combined_mask[None, None, :, :]  # (1, 1, seq_len, cache_len)
             attn_output = jax.nn.dot_product_attention(
                 q,
                 k,
                 v,
+                mask=combined_mask,
                 bias=bias,
-                is_causal=self.causal,
-                local_window_size=(self.local_window_size, 0) if self.local_window_size is not None else None,
                 implementation=implementation,
             )
 
@@ -1031,8 +1039,13 @@ class CrossAttentionBlock(eqx.Module):
             rotary_emb=rotary_emb,
         )
 
-    def _reshape_for_multihead(self, x: Array) -> Array:
-        """Reshape from (seq_len, embed_dim) to (seq_len, num_heads, head_dim)."""
+    def _reshape_q(self, x: Array) -> Array:
+        """Reshape Q from (seq_len, q_dim) to (seq_len, num_heads, head_dim)."""
+        seq_len, _ = x.shape
+        return x.reshape(seq_len, self.num_heads, self.head_dim)
+
+    def _reshape_kv(self, x: Array) -> Array:
+        """Reshape K/V from (seq_len, kv_dim) to (seq_len, num_heads, head_dim)."""
         seq_len, _ = x.shape
         return x.reshape(seq_len, self.num_heads, self.head_dim)
 
@@ -1063,8 +1076,14 @@ class CrossAttentionBlock(eqx.Module):
         v, new_v_scales = _apply_linear_batched(self.v_proj, kv_sn, v_scales)
 
         # Reshape to multihead format
-        k = self._reshape_for_multihead(k)
-        v = self._reshape_for_multihead(v)
+        k = self._reshape_kv(k)
+        v = self._reshape_kv(v)
+
+        # Apply RoPE to K - cache stores post-RoPE K since positions are fixed
+        if self.rotary_emb is not None:
+            kv_seq_len = k.shape[0]
+            k_positions = jnp.arange(kv_seq_len)
+            k = self.rotary_emb.apply_rotary_embeddings(k, positions=k_positions)
 
         # Build updated FP8 scales
         updated_fp8_scales: Fp8ScalesCache | None = None
@@ -1106,18 +1125,21 @@ class CrossAttentionBlock(eqx.Module):
         # Project queries
         q_scales = fp8_scales.get("q_proj") if fp8_scales else None
         q, new_q_scales = _apply_linear_batched(self.q_proj, q_tn, q_scales)
-        q = self._reshape_for_multihead(q)
-        q_seq_len = q.shape[0]
+
+        # Reshape to multihead format
+        q = self._reshape_q(q)
 
         # Track updated scales
         new_k_scales = None
         new_v_scales = None
 
-        # Use cached key/value if provided
+        q_seq_len = q.shape[0]
+
+        # Use cached key/value if provided (cache stores post-RoPE K)
         if cache is not None:
-            k = cache["k"]
+            k = cache["k"]  # Already has RoPE applied
             v = cache["v"]
-            q_position = cache["position"]
+            start_pos = cache["position"]
         elif kv_sn is not None:
             chex.assert_rank(kv_sn, 2)
             k_scales = fp8_scales.get("k_proj") if fp8_scales else None
@@ -1125,26 +1147,30 @@ class CrossAttentionBlock(eqx.Module):
 
             k, new_k_scales = _apply_linear_batched(self.k_proj, kv_sn, k_scales)
             v, new_v_scales = _apply_linear_batched(self.v_proj, kv_sn, v_scales)
-            k = self._reshape_for_multihead(k)
-            v = self._reshape_for_multihead(v)
-            q_position = jnp.asarray(0)
+
+            # Reshape to multihead format
+            k = self._reshape_kv(k)
+            v = self._reshape_kv(v)
+
+            # Apply RoPE to K (will be stored in cache with RoPE applied)
+            if self.rotary_emb is not None:
+                kv_seq_len = k.shape[0]
+                k_positions = jnp.arange(kv_seq_len)
+                k = self.rotary_emb.apply_rotary_embeddings(k, positions=k_positions)
+
+            start_pos = jnp.asarray(0)
         else:
             raise ValueError("Either `cache` or `kv_sn` must be provided.")
 
-        # Apply rotary embeddings to queries and keys if enabled
-        if self.rotary_emb is None:
-            q_rot = q
-            k_rot = k
-        else:
-            q_positions = jnp.arange(q_seq_len) + q_position
-            k_positions = jnp.arange(k.shape[0])
-            q_rot = self.rotary_emb.apply_rotary_embeddings(q, positions=q_positions)
-            k_rot = self.rotary_emb.apply_rotary_embeddings(k, positions=k_positions)
+        # Apply rotary embeddings to queries
+        if self.rotary_emb is not None:
+            q_positions = jnp.arange(q_seq_len) + start_pos
+            q = self.rotary_emb.apply_rotary_embeddings(q, positions=q_positions)
 
         # Apply dot product attention
         attn_output = jax.nn.dot_product_attention(
-            q_rot,
-            k_rot,
+            q,
+            k,
             v,
             scale=1.0 / math.sqrt(self.head_dim),
             is_causal=False,
@@ -1170,7 +1196,8 @@ class CrossAttentionBlock(eqx.Module):
             if new_out_scales is not None:
                 updated_fp8_scales["output_proj"] = new_out_scales
 
-        return output, {"k": k, "v": v, "position": q_position + q_seq_len}, updated_fp8_scales
+        new_position = start_pos + q_seq_len
+        return output, {"k": k, "v": v, "position": new_position}, updated_fp8_scales
 
 
 NormLayer = eqx.nn.LayerNorm | RMSNorm
