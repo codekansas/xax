@@ -4,6 +4,7 @@ import functools
 import hashlib
 import inspect
 import logging
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from graphlib import TopologicalSorter
@@ -34,6 +35,12 @@ DatasetType = DatasetDict | Dataset | IterableDatasetDict | IterableDataset
 
 DEFAULT_HASH = "default"
 
+IGNORE_CACHE_ENV_VAR = "IGNORE_DATASET_CACHES"
+
+
+def ignore_cache_for_datasets() -> set[str]:
+    return set(d.strip() for d in os.environ.get(IGNORE_CACHE_ENV_VAR, "").split(",") if d.strip())
+
 
 def fix_object_dtype(x: Any) -> Any:  # noqa: ANN401
     """Fix dtype=object arrays."""
@@ -60,7 +67,6 @@ class DatasetFunction:
     dataset_fn: Callable[[], DatasetType]
     dependencies: frozenset[str]
     manual_hash: str | None
-    invalidate_cache: bool
 
 
 @jax.tree_util.register_dataclass
@@ -449,6 +455,8 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
         name: str,
         hash_val: str | None = None,
         generate: bool = False,
+        process_dependencies: bool = True,
+        ignore_cache: bool = False,
     ) -> DatasetType:
         """Loads a dataset from the cache or generates it if it doesn't exist.
 
@@ -460,6 +468,9 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
             generate: If set, we generate the dataset; otherwise, we show the
                 user a warning telling them to pre-generate the dataset before
                 running training.
+            process_dependencies: If set, we call `load_dataset` on the
+                dependencies of this function.
+            ignore_cache: If set, ignore the cached dataset and regenerate.
 
         Returns:
             The loaded dataset.
@@ -480,16 +491,20 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
         current_hash = self._get_dataset_hash(name)
         cache_path = self._get_dataset_path(name, current_hash)
 
-        # Check if we need to regenerate
-        should_regenerate = ds_fn.invalidate_cache or not cache_path.exists()
-
-        if not should_regenerate:
+        if cache_path.exists() and not ignore_cache:
             logger.info("Loading cached dataset '%s' from %s", name, cache_path)
             return load_from_disk(str(cache_path))
+        elif not ignore_cache:
+            logger.info("Dataset '%s' not found in %s; generating...", name, cache_path)
 
         # First, ensure all dependencies are built
-        for dep in ds_fn.dependencies:
-            self.load_dataset(dep, generate=generate)
+        if process_dependencies:
+            for dep in ds_fn.dependencies:
+                self.load_dataset(
+                    dep,
+                    generate=generate,
+                    process_dependencies=process_dependencies,
+                )
 
         if not generate:
             raise RuntimeError(
@@ -536,9 +551,21 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
         except Exception as e:
             raise ValueError(f"Circular dependency detected in dataset functions: {e}") from e
 
+        # Check that all the dataset names to ignore are valid names.
+        all_names = set(build_order)
+        ignore_cache_names = ignore_cache_for_datasets()
+        missing_ignore_cache = [name for name in ignore_cache_names if name not in all_names]
+        if missing_ignore_cache:
+            raise ValueError(f"{IGNORE_CACHE_ENV_VAR} specified invalid dataset names {sorted(missing_ignore_cache)}")
+
         # Build each dataset in order
         for name in build_order:
-            self.load_dataset(name, generate=True)
+            self.load_dataset(
+                name,
+                generate=True,
+                process_dependencies=False,
+                ignore_cache=name in ignore_cache_names,
+            )
 
     @functools.cached_property
     def dataset_cache_dir(self) -> Path:
@@ -636,7 +663,6 @@ def dataset_fn(
     dependencies: Collection[str] = (),
     hash: str | None = None,
     use_hash: bool = True,
-    invalidate_cache: bool = False,
 ) -> Callable[[Callable[..., DatasetType]], Callable[..., DatasetType]]:
     """Decorator for registering a function for generating a dataset.
 
@@ -659,8 +685,6 @@ def dataset_fn(
         use_hash: If true, we will invalidate the cache if we don't have a
             hashed version. This is simply shorthand for setting `hash` to
             a default string.
-        invalidate_cache: If true, this manually triggers a cache invalidation
-            (useful when testing).
 
     Returns:
         A decorator that registers the function as a dataset function.
@@ -676,7 +700,6 @@ def dataset_fn(
             "name": name,
             "dependencies": deps_set,
             "manual_hash": hash,
-            "invalidate_cache": invalidate_cache,
         }
         return fn
 
@@ -708,5 +731,4 @@ def _register_dataset_functions(instance: "DataloadersMixin") -> None:
                 dataset_fn=attr,
                 dependencies=metadata["dependencies"],
                 manual_hash=metadata["manual_hash"],
-                invalidate_cache=metadata["invalidate_cache"],
             )
