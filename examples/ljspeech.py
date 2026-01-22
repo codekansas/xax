@@ -528,11 +528,11 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             # Transcribe generated audio with Whisper
             transcript_tokens, _, _ = model.whisper_transcriber.transcribe(audio_t, max_tokens=64)
             metrics["transcript"] = xax.Tokens(transcript_tokens, tokenizer="whisper")
-            metrics["gt_transcript"] = xax.Tokens(gt_text_t, tokenizer="llm")
 
             # Also transcribe ground truth
             gt_transcript_tokens, _, _ = model.whisper_transcriber.transcribe(gt_audio_t, max_tokens=64)
             metrics["gt_transcript"] = xax.Tokens(gt_transcript_tokens, tokenizer="whisper")
+            metrics["gt_text"] = xax.Tokens(gt_text_t, tokenizer="llm")
 
         return loss, metrics
 
