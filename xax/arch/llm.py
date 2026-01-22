@@ -7,7 +7,7 @@ import sys
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import Iterator, Literal, overload
+from typing import Callable, Iterator, Literal, overload
 
 import chex
 import equinox as eqx
@@ -89,10 +89,22 @@ class LLM(eqx.Module):
     lm_head: eqx.nn.Linear
     config: LLMConfig
 
+    # These are used to support adding extra tokens to the vocabulary.
+    extra_embed: eqx.nn.Embedding | None = None
+    extra_lm_head: eqx.nn.Linear | None = None
+    tied_extra_embed: bool = eqx.field(static=True, default=False)
+
     @classmethod
-    def build(cls, config: LLMConfig, *, key: jax.Array) -> "LLM":
+    def build(
+        cls,
+        config: LLMConfig,
+        *,
+        extra_tokens: int | None = None,
+        tied_extra_embed: bool = False,
+        key: PRNGKeyArray,
+    ) -> "LLM":
         """Initialize LLM with random weights."""
-        k_emb, *block_keys, k_head = jax.random.split(key, config.num_layers + 2)
+        key, k_emb = jax.random.split(key)
         embed = eqx.nn.Embedding(config.vocab_size, config.embed_dim, key=k_emb)
         blocks: list[TransformerBlock] = []
         mlp_width = config.mlp_hidden_dim or (config.embed_dim * config.mlp_mult)
@@ -100,7 +112,7 @@ class LLM(eqx.Module):
         mlp_bias = config.mlp_bias
 
         for i in range(config.num_layers):
-            k_attn, k_mlp = jax.random.split(block_keys[i], 2)
+            key, k_attn, k_mlp = jax.random.split(key, 3)
 
             # Determine sliding window for this layer
             layer_window: int | None = None
@@ -149,8 +161,63 @@ class LLM(eqx.Module):
             )
 
         norm = RMSNorm.build(config.embed_dim, eps=config.rms_eps)
+        key, k_head = jax.random.split(key)
         lm_head = eqx.nn.Linear(config.embed_dim, config.vocab_size, use_bias=False, key=k_head)
-        return cls(embed=embed, blocks=tuple(blocks), norm=norm, lm_head=lm_head, config=config)
+
+        if extra_tokens is None:
+            return cls(
+                embed=embed,
+                blocks=tuple(blocks),
+                norm=norm,
+                lm_head=lm_head,
+                config=config,
+            )
+
+        # Adds extra embeddings for the extra tokens.
+        key, k_extra_embed, k_extra_lm_head = jax.random.split(key, 3)
+        extra_embed = eqx.nn.Embedding(
+            extra_tokens,
+            config.embed_dim,
+            key=k_extra_embed,
+            dtype=embed.weight.dtype,
+        )
+        extra_lm_head = (
+            None
+            if tied_extra_embed
+            else eqx.nn.Linear(
+                config.embed_dim,
+                extra_tokens,
+                use_bias=False,
+                dtype=lm_head.weight.dtype,
+                key=k_extra_lm_head,
+            )
+        )
+        return cls(
+            embed=embed,
+            blocks=tuple(blocks),
+            norm=norm,
+            lm_head=lm_head,
+            config=config,
+            extra_embed=extra_embed,
+            extra_lm_head=extra_lm_head,
+            tied_extra_embed=tied_extra_embed,
+        )
+
+    def embed_tokens(self, tokens_t: Array) -> Array:
+        if self.extra_embed is None:
+            return jax.vmap(self.embed)(tokens_t)
+        mask_t = tokens_t >= self.config.vocab_size
+        text_embeds_td = jax.vmap(self.embed)(jnp.clip(tokens_t, max=self.config.vocab_size - 1))
+        extra_embeds_td = jax.vmap(self.extra_embed)(jnp.clip(tokens_t - self.config.vocab_size, min=0))
+        return jnp.where(mask_t[:, None], extra_embeds_td, text_embeds_td)
+
+    def get_logits(self, hidden_td: Array) -> Array:
+        extra_head = self.extra_embed if self.tied_extra_embed else self.extra_lm_head
+        if extra_head is None:
+            return apply_linear(hidden_td, self.lm_head)
+        text_logits_tv = apply_linear(hidden_td, self.lm_head)
+        extra_logits_tv = apply_linear(hidden_td, extra_head)
+        return jnp.concatenate([text_logits_tv, extra_logits_tv], axis=1)
 
     def init_cache(self, max_len: int | None = None, dtype: jnp.dtype = jnp.bfloat16) -> list[TransformerBlockCache]:
         """Initialize KV cache for autoregressive generation.
@@ -197,7 +264,7 @@ class LLM(eqx.Module):
             Tuple of (hidden states, updated caches).
         """
         chex.assert_rank(tokens_t, 1)
-        x_tn = jax.vmap(self.embed)(tokens_t)
+        x_tn = self.embed_tokens(tokens_t)
         if caches is None:
             for block in self.blocks:
                 x_tn, cache = block.forward(x_tn, cache=None)
@@ -228,11 +295,43 @@ class LLM(eqx.Module):
     ) -> tuple[Array, list[TransformerBlockCache]] | Array:
         if caches is None:
             x_td = self.forward_hidden(tokens_t)
-            return apply_linear(x_td, self.lm_head)
+            return self.get_logits(x_td)
         else:
             x_td, cache = self.forward_hidden(tokens_t, caches=caches)
-            logits_tv = apply_linear(x_td, self.lm_head)
+            logits_tv = self.get_logits(x_td)
             return logits_tv, cache
+
+    def get_loss(
+        self,
+        tokens_t: Array,
+        targets_t: Array,
+        mask_t: Array | None = None,
+        chunk_size: int = 1,
+    ) -> Array:
+        hidden_td = self.forward_hidden(tokens_t)
+        return chunked_cross_entropy_loss(hidden_td, targets_t, self.get_logits, mask_t, chunk_size)
+
+    def get_accuracy(
+        self,
+        tokens_t: Array,
+        targets_t: Array,
+        mask_t: Array | None = None,
+        chunk_size: int = 1,
+    ) -> Array:
+        hidden_td = self.forward_hidden(tokens_t)
+        return chunked_cross_entropy_acc(hidden_td, targets_t, self.get_logits, mask_t, chunk_size)
+
+    def get_loss_and_accuracy(
+        self,
+        tokens_t: Array,
+        targets_t: Array,
+        mask_t: Array | None = None,
+        chunk_size: int = 1,
+    ) -> tuple[Array, Array]:
+        hidden_td = self.forward_hidden(tokens_t)
+        loss = chunked_cross_entropy_loss(hidden_td, targets_t, self.get_logits, mask_t, chunk_size)
+        accuracy = chunked_cross_entropy_acc(hidden_td, targets_t, self.get_logits, mask_t, chunk_size)
+        return loss, accuracy
 
 
 class CrossAttentionLLM(eqx.Module):
@@ -257,19 +356,22 @@ class CrossAttentionLLM(eqx.Module):
         config: LLMConfig,
         *,
         key: PRNGKeyArray,
+        extra_tokens: int | None = None,
     ) -> "CrossAttentionLLM":
         """Build CrossAttentionLLM with a shared cross-attention layer.
 
         Args:
             config: LLM configuration
             key: PRNG key for initialization
+            extra_tokens: Number of extra tokens to add to the vocabulary.
+                If None, no extra tokens are added.
 
         Returns:
             CrossAttentionLLM with shared cross-attention
         """
         k1, k2 = jax.random.split(key)
 
-        llm = LLM.build(config, key=k1)
+        llm = LLM.build(config, extra_tokens=extra_tokens, key=k1)
         cross_attn = CrossAttentionBlock.build(
             embed_dim=config.embed_dim,
             num_heads=config.q_heads,
@@ -488,6 +590,10 @@ class LLMRepo(Enum):
 def build_pretrained_llm(
     repo: LLMRepo,
     dtype: jnp.dtype | None = None,
+    *,
+    extra_tokens: int | None = None,
+    tied_extra_embed: bool = False,
+    key: PRNGKeyArray | None = None,
 ) -> LLM: ...
 
 
@@ -497,7 +603,9 @@ def build_pretrained_llm(
     dtype: jnp.dtype | None = None,
     *,
     use_cross_attention: Literal[True],
-    cross_attention_key: PRNGKeyArray | None = None,
+    key: PRNGKeyArray,
+    extra_tokens: int | None = None,
+    tied_extra_embed: bool = False,
 ) -> CrossAttentionLLM: ...
 
 
@@ -506,7 +614,9 @@ def build_pretrained_llm(
     dtype: jnp.dtype | None = None,
     *,
     use_cross_attention: bool = False,
-    cross_attention_key: PRNGKeyArray | None = None,
+    extra_tokens: int | None = None,
+    tied_extra_embed: bool = False,
+    key: PRNGKeyArray | None = None,
 ) -> LLM | CrossAttentionLLM:
     """Loads a pretrained model, optionally with cross-attention support.
 
@@ -522,19 +632,33 @@ def build_pretrained_llm(
         use_cross_attention: If True, wraps the LLM with a CrossAttentionLLM
             that adds a shared cross-attention layer. The cross-attention
             weights are randomly initialized.
-        cross_attention_key: PRNG key for initializing cross-attention weights.
-            Required if use_cross_attention is True. If not provided, defaults
+        extra_tokens: Number of extra tokens to add to the vocabulary. If None,
+            no extra tokens are added.
+        tied_extra_embed: If True, tie the extra embeddings to the main
+            embeddings. If False, use a separate embedding matrix for the extra
+            tokens.
+        key: PRNG key for initializing the model. If not provided, defaults
             to jax.random.key(0).
 
     Returns:
         LLM model with loaded weights, optionally wrapped with cross-attention.
     """
     config = hf_config_to_llm_config(cfg=load_hf_config(repo.value))
-    model_shape = eqx.filter_eval_shape(LLM.build, config, key=jax.random.key(0))
+    if key is None:
+        if use_cross_attention or extra_tokens is not None:
+            raise ValueError("key is required if use_cross_attention is True or extra_tokens is not None.")
+        key = jax.random.key(0)
+    model_shape = eqx.filter_eval_shape(
+        LLM.build,
+        config,
+        extra_tokens=extra_tokens,
+        tied_extra_embed=tied_extra_embed,
+        key=key,
+    )
     llm = load_hf_weights_into_llm(model_shape, repo.value, dtype=dtype)
 
     if use_cross_attention:
-        key = cross_attention_key if cross_attention_key is not None else jax.random.key(0)
+        assert key is not None, "key is required if use_cross_attention is True."
         return CrossAttentionLLM.from_llm(llm, key=key)
 
     return llm
@@ -548,7 +672,7 @@ def tie_embedding_and_head(model: LLM) -> LLM:
 def chunked_cross_entropy_loss(
     hidden_td: Array,
     targets_t: Array,
-    lm_head_weight: Array,
+    lm_head: Callable[[Array], Array],
     mask_t: Array | None = None,
     chunk_size: int = 1,
 ) -> Array:
@@ -570,7 +694,7 @@ def chunked_cross_entropy_loss(
     Args:
         hidden_td: Hidden states from model.forward_hidden(), shape (seq, hidden_dim)
         targets_t: Target token indices, shape (seq,)
-        lm_head_weight: The lm_head weight matrix, shape (vocab_size, hidden_dim)
+        lm_head: The lm_head function, shape (hidden_dim) -> (vocab_size)
         mask_t: Optional mask for valid positions, shape (seq,). If None, all positions are valid.
         chunk_size: Number of sequence positions to process at once.
 
@@ -606,10 +730,9 @@ def chunked_cross_entropy_loss(
 
         # Cast to float32 for numerical stability (inputs may be bfloat16)
         chunk_hidden_f32 = chunk_hidden.astype(jnp.float32)
-        lm_head_f32 = lm_head_weight.astype(jnp.float32)
 
         # Compute logits: (batch, chunk, hidden) @ (hidden, vocab) -> (batch, chunk, vocab)
-        chunk_logits = chunk_hidden_f32 @ lm_head_f32.T
+        chunk_logits = lm_head(chunk_hidden_f32)
 
         # log_softmax is numerically stable: log(softmax(x)) = x - max(x) - log(sum(exp(x - max(x))))
         log_probs = jax.nn.log_softmax(chunk_logits, axis=-1)
@@ -639,7 +762,7 @@ def chunked_cross_entropy_loss(
 def chunked_cross_entropy_acc(
     hidden_td: Array,
     targets_t: Array,
-    lm_head_weight: Array,
+    lm_head: Callable[[Array], Array],
     mask_t: Array | None = None,
     chunk_size: int = 1,
 ) -> Array:
@@ -651,7 +774,7 @@ def chunked_cross_entropy_acc(
     Args:
         hidden_td: Hidden states from model.forward_hidden(), shape (seq, hidden_dim)
         targets_t: Target token indices, shape (seq,)
-        lm_head_weight: The lm_head weight matrix, shape (vocab_size, hidden_dim)
+        lm_head: The lm_head function, shape (hidden_dim) -> (vocab_size)
         mask_t: Optional mask for valid positions, shape (seq,). If None, all positions are valid.
         chunk_size: Number of sequence positions to process at once.
 
@@ -687,10 +810,9 @@ def chunked_cross_entropy_acc(
 
         # Cast to float32 for numerical stability (inputs may be bfloat16)
         chunk_hidden_f32 = chunk_hidden.astype(jnp.float32)
-        lm_head_f32 = lm_head_weight.astype(jnp.float32)
 
         # Compute logits: (chunk, hidden) @ (hidden, vocab) -> (chunk, vocab)
-        chunk_logits = chunk_hidden_f32 @ lm_head_f32.T
+        chunk_logits = lm_head(chunk_hidden_f32)
 
         # Compute accuracy: check if argmax matches target
         predictions = jnp.argmax(chunk_logits, axis=-1)
@@ -1228,6 +1350,20 @@ def load_hf_weights_into_llm(
     final_gamma = _get_bias(state, "norm.weight", "model.norm.weight", "ln_f.weight")
     if final_gamma is not None:
         model = eqx.tree_at(lambda m: m.norm.weight, model, to_dtype_replicated(final_gamma))
+
+    # Initializes the extra embeddigns to random values.
+    if model.extra_embed is not None:
+        model = eqx.tree_at(
+            lambda m: m.extra_embed.weight,
+            model,
+            jax.random.normal(jax.random.key(0), model.extra_embed.weight.shape, dtype) * 0.01,
+        )
+    if model.extra_lm_head is not None:
+        model = eqx.tree_at(
+            lambda m: m.extra_lm_head.weight,
+            model,
+            jax.random.normal(jax.random.key(0), model.extra_lm_head.weight.shape, dtype) * 0.01,
+        )
 
     return model
 

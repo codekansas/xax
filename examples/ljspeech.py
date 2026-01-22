@@ -8,6 +8,7 @@ Architecture:
 - Audio embeddings and output head trained separately from text embeddings/logits
 """
 
+import functools
 import logging
 from dataclasses import dataclass
 from typing import Iterator, TypedDict, override
@@ -34,26 +35,18 @@ LJSPEECH_SAMPLE_RATE = 22050
 NUM_QUANTIZERS = 8  # Q0 (semantic) + Q1-Q7 (acoustic)
 
 # Special token string markers (for text tokenizer)
+TEXT_START_TOKEN = "<|text_start|>"
+TEXT_END_TOKEN = "<|text_end|>"
 AUDIO_START_TOKEN = "<|audio_start|>"
 AUDIO_END_TOKEN = "<|audio_end|>"
-
-# Audio BPE special token IDs
-AUDIO_BPE_PAD_TOKEN = 0
-AUDIO_BPE_UNK_TOKEN = 1
-AUDIO_BPE_BOS_TOKEN = 2
-AUDIO_BPE_EOS_TOKEN = 3
 
 # LoRA targets
 DEFAULT_LORA_TARGETS = ("q_proj", "v_proj", "gate", "up")
 
 
 class Batch(TypedDict):
-    input_ids: Array  # (batch, seq_len) - combined text + audio tokens
-    labels: Array  # (batch, seq_len) - targets for next-token prediction
+    codes: Array  # (batch, seq_len) - combined text + audio tokens
     loss_mask: Array  # (batch, seq_len) - mask for loss computation (audio only)
-    audio_mask: Array  # (batch, seq_len) - mask indicating audio token positions
-    audio_start_pos: Array  # (batch,) - position where audio starts
-    audio_codes: Array  # (batch, max_audio_frames, 8) - original audio codes for decoding
 
 
 class TTSModel(eqx.Module):
@@ -76,6 +69,8 @@ class TTSModel(eqx.Module):
     def build(
         llm: xax.LLM,
         audio_bpe_vocab_size: int,
+        audio_bpe_tokenizer: Tokenizer,
+        mimi: xax.MimiModel,
         key: PRNGKeyArray,
     ) -> "TTSModel":
         """Build TTS model from pretrained LLM.
@@ -83,6 +78,8 @@ class TTSModel(eqx.Module):
         Args:
             llm: Pretrained LLM (can have LoRA applied)
             audio_bpe_vocab_size: Vocabulary size for audio BPE tokens
+            audio_bpe_tokenizer: Tokenizer for decoding BPE tokens to Mimi values
+            mimi: Pretrained Mimi model for codebook embeddings
             key: PRNG key for initialization
 
         Returns:
@@ -91,8 +88,57 @@ class TTSModel(eqx.Module):
         k1, k2 = jax.random.split(key)
         embed_dim = llm.config.embed_dim
 
-        # Audio embedding and output head (not tied, since BPE vocab differs from LLM vocab)
-        audio_embed = eqx.nn.Embedding(audio_bpe_vocab_size, embed_dim, key=k1)
+        # Get Mimi codebook embeddings for all 8 quantizers
+        # Q0 is semantic, Q1-Q7 are acoustic
+        # Each codebook has shape (2048, 256)
+        base_char = 0xE000
+        mimi_codebook_size = xax.MIMI_CODEBOOK_SIZE
+        num_quantizers = NUM_QUANTIZERS
+
+        # Stack codebook embeddings: (8, 2048, 256)
+        codebook_embeds = []
+        # Semantic quantizer (Q0)
+        codebook_embeds.append(np.array(mimi.quantizer.semantic_rvq.layers[0].embeddings_kd))
+        # Acoustic quantizers (Q1-Q7)
+        for i in range(num_quantizers - 1):
+            codebook_embeds.append(np.array(mimi.quantizer.acoustic_rvq.layers[i].embeddings_kd))
+        codebook_embeds = np.stack(codebook_embeds, axis=0)  # (8, 2048, 256)
+
+        mimi_embed_dim = codebook_embeds.shape[-1]  # 256
+
+        # Create a projection from Mimi embed_dim (256) to LLM embed_dim (1024)
+        # Use random orthogonal initialization for the projection
+        proj_weight = jax.random.normal(k1, (embed_dim, mimi_embed_dim)) * (1.0 / np.sqrt(mimi_embed_dim))
+
+        # Build audio BPE embeddings by averaging projected Mimi codebook embeddings
+        # The flat codec sequence interleaves quantizers: [q0_t0, q1_t0, ..., q7_t0, q0_t1, ...]
+        audio_embed_weights = np.zeros((audio_bpe_vocab_size, embed_dim), dtype=np.float32)
+
+        for token_id in range(audio_bpe_vocab_size):
+            token_str = audio_bpe_tokenizer.id_to_token(token_id)
+            if token_str is None or len(token_str) == 0:
+                audio_embed_weights[token_id] = np.array(
+                    jax.random.normal(jax.random.fold_in(k2, token_id), (embed_dim,)) * 0.01
+                )
+                continue
+
+            # Decode BPE token to sequence of Mimi codec values
+            # Each position i in the flat sequence corresponds to quantizer (i % 8)
+            embeds_list = []
+            for pos, char in enumerate(token_str):
+                codec_value = ord(char) - base_char
+                codec_value = max(0, min(codec_value, mimi_codebook_size - 1))
+                quantizer_idx = pos % num_quantizers
+                # Get the embedding from the appropriate quantizer's codebook
+                mimi_embed = codebook_embeds[quantizer_idx, codec_value]  # (256,)
+                embeds_list.append(mimi_embed)
+
+            # Average the Mimi embeddings and project to LLM dimension
+            mean_mimi_embed = np.mean(np.stack(embeds_list, axis=0), axis=0)  # (256,)
+            projected_embed = proj_weight @ mean_mimi_embed  # (embed_dim,)
+            audio_embed_weights[token_id] = projected_embed
+
+        audio_embed = eqx.nn.Embedding(audio_bpe_vocab_size, embed_dim, weight=jnp.array(audio_embed_weights))
         audio_head = eqx.nn.Linear(embed_dim, audio_bpe_vocab_size, key=k2)
 
         return TTSModel(
@@ -103,127 +149,37 @@ class TTSModel(eqx.Module):
             text_vocab_size=llm.config.vocab_size,
         )
 
-    def embed_tokens(
-        self,
-        input_ids_t: Array,
-        audio_mask_t: Array,
-    ) -> Array:
-        """Embed tokens, using text embeddings for text and audio embeddings for audio.
-
-        Args:
-            input_ids_t: Token IDs, shape (T,). Text tokens are in [0, text_vocab_size),
-                audio tokens are offset by text_vocab_size.
-            audio_mask_t: Boolean mask, True for audio positions, shape (T,)
-
-        Returns:
-            Embeddings, shape (T, embed_dim)
-        """
-        # For text tokens, use the original LLM embeddings
-        text_embeds_td = jax.vmap(self.llm.embed)(input_ids_t)
-
-        # For audio tokens, subtract text_vocab_size to get audio BPE token ID,
-        # then look up in audio embeddings
-        audio_ids_t = jnp.maximum(input_ids_t - self.text_vocab_size, 0)
-        audio_embeds_td = jax.vmap(self.audio_embed)(audio_ids_t)
-
-        # Select based on audio_mask
-        embeds_td = jnp.where(audio_mask_t[:, None], audio_embeds_td, text_embeds_td)
-        return embeds_td
-
-    def forward(
-        self,
-        input_ids_t: Array,
-        audio_mask_t: Array,
-    ) -> tuple[Array, Array]:
-        """Forward pass returning separate text and audio logits.
-
-        Args:
-            input_ids_t: Token IDs, shape (T,)
-            audio_mask_t: Boolean mask for audio positions, shape (T,)
-
-        Returns:
-            Tuple of (text_logits, audio_logits) where:
-            - text_logits: shape (T, text_vocab_size)
-            - audio_logits: shape (T, audio_bpe_vocab_size)
-        """
-        # Get embeddings (mixed text/audio)
-        x_td = self.embed_tokens(input_ids_t, audio_mask_t)
-
-        # Run through LLM transformer blocks
-        for block in self.llm.blocks:
-            x_td, _ = block.forward(x_td, cache=None)
-
-        # Apply final norm
-        x_td = self.llm.norm(x_td)
-
-        # Compute both text and audio logits
-        text_logits_tv = self.llm.lm_head(x_td)
-        audio_logits_ta = jax.vmap(self.audio_head)(x_td)
-
-        return text_logits_tv, audio_logits_ta
-
     def generate_audio(
         self,
-        text_ids_s: Array,
-        audio_start_token: int,
+        prompt_tokens_s: Array,
         max_audio_tokens: int,
-        eos_token: int = AUDIO_BPE_EOS_TOKEN,
-    ) -> Array:
-        """Generate audio BPE tokens given text prefix.
+        audio_end_id: int,
+        key: PRNGKeyArray,
+    ) -> tuple[Array, Array]:
+        """Generate audio BPE tokens given text prefix using greedy decoding.
+
+        Builds a sequence [prompt] [audio_start] [generated...] and autoregressively
+        generates audio BPE tokens by running the forward pass and taking argmax
+        of the audio logits at each step.
 
         Args:
-            text_ids_s: Text token IDs including [TEXT_END], shape (S,)
-            audio_start_token: Token ID for audio start marker
+            prompt_tokens_s: Prompt token IDs, with shape (text_len + 2,)
             max_audio_tokens: Maximum number of audio tokens to generate
-            eos_token: Audio EOS token ID
+            audio_end_id: Audio EOS token ID
+            key: PRNG key for sampling
 
         Returns:
-            Generated audio BPE token IDs (without text_vocab_size offset), shape (max_audio_tokens,)
+            Tuple of (generated audio BPE token IDs, generated audio logits)
         """
-        # Build initial sequence: text + audio_start
-        text_len = text_ids_s.shape[0]
-        total_len = text_len + 1 + max_audio_tokens  # text + audio_start + audio
-
-        # Initialize sequence
-        tokens = jnp.zeros(total_len, dtype=jnp.int32)
-        tokens = tokens.at[:text_len].set(text_ids_s)
-        tokens = tokens.at[text_len].set(audio_start_token)
-
-        # Audio mask: False for text, True for audio positions
-        audio_mask = jnp.zeros(total_len, dtype=jnp.bool_)
-        audio_mask = audio_mask.at[text_len + 1 :].set(True)
-
-        # Generate autoregressively
-        def generate_step(idx: int, tokens_t: Array) -> Array:
-            # Forward pass
-            _, audio_logits_ta = self.forward(tokens_t, audio_mask)
-
-            # Get logits at position idx (predicting idx+1)
-            next_logits = audio_logits_ta[idx]
-
-            # Mask special tokens during generation (except EOS)
-            next_logits = next_logits.at[AUDIO_BPE_PAD_TOKEN].set(-jnp.inf)
-            next_logits = next_logits.at[AUDIO_BPE_UNK_TOKEN].set(-jnp.inf)
-            next_logits = next_logits.at[AUDIO_BPE_BOS_TOKEN].set(-jnp.inf)
-
-            next_token = jnp.argmax(next_logits)
-            # Store with text_vocab_size offset for proper embedding lookup
-            tokens_t = tokens_t.at[idx + 1].set(next_token + self.text_vocab_size)
-            return tokens_t
-
-        # Generate audio tokens
-        audio_start_idx = text_len  # Position of audio_start token
-        tokens = jax.lax.fori_loop(
-            audio_start_idx,
-            audio_start_idx + max_audio_tokens - 1,
-            generate_step,
-            tokens,
+        return xax.llm_generate_jit(
+            self.llm,
+            prompt_tokens_s,
+            audio_end_id,
+            max_audio_tokens,
+            temperature=0.8,
+            top_p=0.9,
+            key=key,
         )
-
-        # Extract audio tokens (remove text_vocab_size offset)
-        audio_tokens = tokens[text_len + 1 :] - self.text_vocab_size
-
-        return audio_tokens
 
 
 class FullTTSModel(eqx.Module):
@@ -236,18 +192,23 @@ class FullTTSModel(eqx.Module):
     @staticmethod
     def build(
         llm: xax.LLM,
-        audio_bpe_vocab_size: int,
+        audio_bpe_tokenizer: Tokenizer,
         whisper_eos_token_id: int,
         key: PRNGKeyArray,
     ) -> "FullTTSModel":
-        tts = TTSModel.build(llm, audio_bpe_vocab_size, key)
+        audio_bpe_vocab_size = audio_bpe_tokenizer.get_vocab_size()
         mimi = xax.build_pretrained_mimi()
+        tts = TTSModel.build(llm, audio_bpe_vocab_size, audio_bpe_tokenizer, mimi, key)
         whisper_model = xax.build_pretrained_whisper()
         whisper_transcriber = xax.WhisperTranscriber(
             model=whisper_model,
             eos_token_id=whisper_eos_token_id,
         )
-        return FullTTSModel(tts=tts, mimi=mimi, whisper_transcriber=whisper_transcriber)
+        return FullTTSModel(
+            tts=tts,
+            mimi=mimi,
+            whisper_transcriber=whisper_transcriber,
+        )
 
 
 def decode_audio_bpe_to_codes(
@@ -334,16 +295,12 @@ class Config(xax.SupervisedConfig):
     learning_rate: float = xax.field(5e-4, help="Peak learning rate")
     min_learning_rate: float = xax.field(1e-5, help="Minimum learning rate")
     warmup_steps: int = xax.field(50, help="Number of warmup steps")
-    max_text_length: int = xax.field(128, help="Maximum text token length")
     max_audio_frames: int = xax.field(256, help="Maximum audio frames")
     max_seq_length: int = xax.field(512, help="Maximum combined sequence length")
-
-    # Audio BPE settings
     audio_bpe_vocab_size: int = xax.field(151_669, help="Vocabulary size for audio BPE tokenizer")
-    max_audio_bpe_length: int = xax.field(256, help="Maximum audio BPE sequence length")
 
-    # Data settings
-    processed_data_path: str | None = xax.field(None, help="Path to pre-processed data")
+    # Eval settings.
+    eval_prompt: str = xax.field("Hello, world! I'm a TTS model.", help="Prompt to use for evaluation")
 
 
 class LJSpeechTTS(xax.SupervisedTask[Config]):
@@ -365,11 +322,20 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         # Load text tokenizer and add special tokens
         self.tokenizer = AutoTokenizer.from_pretrained(config.llm_repo.value)
 
-        # Add audio boundary tokens
-        special_tokens = [AUDIO_START_TOKEN, AUDIO_END_TOKEN]
-        self.tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
+        # Adds the special text tokens.
+        self.tokenizer.add_special_tokens({"additional_special_tokens": [TEXT_START_TOKEN, TEXT_END_TOKEN]})
+        self.text_start_id = self.tokenizer.convert_tokens_to_ids(TEXT_START_TOKEN)
+        self.text_end_id = self.tokenizer.convert_tokens_to_ids(TEXT_END_TOKEN)
+
+        # Adds the special audio tokens.
+        self.tokenizer.add_special_tokens({"additional_special_tokens": [AUDIO_START_TOKEN, AUDIO_END_TOKEN]})
         self.audio_start_id = self.tokenizer.convert_tokens_to_ids(AUDIO_START_TOKEN)
         self.audio_end_id = self.tokenizer.convert_tokens_to_ids(AUDIO_END_TOKEN)
+
+        # Reserves special tokens for all of the audio BPE tokens.
+        audio_bpe_tokens = [f"<|audio_bpe_{i}|>" for i in range(self.config.audio_bpe_vocab_size)]
+        self.tokenizer.add_tokens(audio_bpe_tokens)
+        self.first_audio_bpe_id = self.tokenizer.convert_tokens_to_ids(audio_bpe_tokens[0])
 
         # Load Whisper for ASR evaluation
         logger.info("Loading Whisper model for ASR evaluation")
@@ -377,29 +343,39 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         self.whisper_config = xax.load_whisper_config()
         self.whisper_tokenizer = WhisperTokenizerFast.from_pretrained(str(path))
 
-        # Audio BPE tokenizer and decode tables are loaded lazily
-        self.audio_bpe_tokenizer = None
-        self.audio_bpe_decode_table = None
-        self.audio_bpe_span_table = None
+        # Gets the eval prompt as tokens.
+        eval_prompt_tokens = self.tokenizer.encode(self.config.eval_prompt)
+        eval_prompt_tokens = np.concatenate(
+            [
+                [self.text_start_id],
+                eval_prompt_tokens,
+                [self.text_end_id, self.audio_start_id],
+            ]
+        )
+        self.eval_prompt_tokens = jnp.array(eval_prompt_tokens, dtype=jnp.int32)
 
-    def _load_audio_bpe_tokenizer(self) -> Tokenizer:
+    @functools.cached_property
+    def audio_bpe_tokenizer(self) -> Tokenizer:
         """Load audio BPE tokenizer from cache directory."""
-        if self.audio_bpe_tokenizer is None:
-            tokenizer_path = self.dataset_cache_dir / "audio_bpe_tokenizer.json"
-            if not tokenizer_path.exists():
-                raise FileNotFoundError(
-                    f"Audio BPE tokenizer not found at {tokenizer_path}. "
-                    "Run with --launcher dataset first to generate it."
-                )
-            self.audio_bpe_tokenizer = Tokenizer.from_file(str(tokenizer_path))
-        return self.audio_bpe_tokenizer
+        tokenizer_path = self.dataset_cache_dir / "audio_bpe_tokenizer.json"
+        if not tokenizer_path.exists():
+            raise FileNotFoundError(
+                f"Audio BPE tokenizer not found at {tokenizer_path}. Run with --launcher dataset first to generate it."
+            )
+        return Tokenizer.from_file(str(tokenizer_path))
 
-    def _build_audio_bpe_decode_tables(self) -> tuple[Array, Array]:
+    @property
+    def audio_bpe_decode_table(self) -> Array:
+        return self._audio_tables[0]
+
+    @property
+    def audio_bpe_span_table(self) -> Array:
+        return self._audio_tables[1]
+
+    @functools.cached_property
+    def _audio_tables(self) -> tuple[Array, Array]:
         """Build lookup tables for decoding audio BPE tokens to codec tokens."""
-        if self.audio_bpe_decode_table is not None and self.audio_bpe_span_table is not None:
-            return self.audio_bpe_decode_table, self.audio_bpe_span_table
-
-        tokenizer = self._load_audio_bpe_tokenizer()
+        tokenizer = self.audio_bpe_tokenizer
         vocab_size = tokenizer.get_vocab_size()
         base_char = 0xE000
 
@@ -414,13 +390,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         decode_table = np.zeros((vocab_size, max_span), dtype=np.int32)
         span_table = np.zeros(vocab_size, dtype=np.int32)
 
-        special_token_ids = {AUDIO_BPE_PAD_TOKEN, AUDIO_BPE_UNK_TOKEN, AUDIO_BPE_BOS_TOKEN, AUDIO_BPE_EOS_TOKEN}
-
         for token_id in range(vocab_size):
-            if token_id in special_token_ids:
-                span_table[token_id] = 0
-                continue
-
             token_str = tokenizer.id_to_token(token_id)
             if token_str is None:
                 span_table[token_id] = 0
@@ -432,78 +402,55 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             span_table[token_id] = span
             decode_table[token_id, :span] = flat_codes
 
-        self.audio_bpe_decode_table = jnp.array(decode_table)
-        self.audio_bpe_span_table = jnp.array(span_table)
+        audio_bpe_decode_table = jnp.array(decode_table)
+        audio_bpe_span_table = jnp.array(span_table)
         logger.info(
             "Built audio BPE decode tables: vocab_size=%d, max_span=%d",
             vocab_size,
             max_span,
         )
-        return self.audio_bpe_decode_table, self.audio_bpe_span_table
+        return audio_bpe_decode_table, audio_bpe_span_table
 
     @override
     def get_model(self, params: xax.InitParams) -> FullTTSModel:
-        # Build LLM with LoRA
-        llm = xax.build_pretrained_llm(self.config.llm_repo)
+        key = params.key
 
-        # Resize embeddings to account for new special tokens
-        new_vocab_size = len(self.tokenizer)
-        if new_vocab_size > llm.config.vocab_size:
-            logger.info("Resizing LLM embeddings from %d to %d", llm.config.vocab_size, new_vocab_size)
-            # Create new embedding matrix with random initialization for new tokens
-            old_embed = llm.embed.weight
-            k_embed = jax.random.fold_in(params.key, 42)
-            new_rows = jax.random.normal(k_embed, (new_vocab_size - llm.config.vocab_size, llm.config.embed_dim)) * 0.02
-            new_embed_weight = jnp.concatenate([old_embed, new_rows], axis=0)
-            new_embed = eqx.nn.Embedding(new_vocab_size, llm.config.embed_dim, weight=new_embed_weight)
+        key, llm_key = jax.random.split(key)
+        llm = xax.build_pretrained_llm(
+            self.config.llm_repo,
+            extra_tokens=self.config.audio_bpe_vocab_size,
+            tied_extra_embed=True,
+            key=llm_key,
+        )
 
-            # Update lm_head as well
-            old_head_weight = llm.lm_head.weight
-            old_head_bias = llm.lm_head.bias
-            k_head = jax.random.fold_in(params.key, 43)
-            new_head_rows = jax.random.normal(k_head, (new_vocab_size - llm.config.vocab_size, llm.config.embed_dim))
-            new_head_rows = new_head_rows * 0.02
-            new_head_weight = jnp.concatenate([old_head_weight, new_head_rows], axis=0)
-            new_head_bias_rows = jnp.zeros(new_vocab_size - llm.config.vocab_size)
-            new_head_bias = jnp.concatenate([old_head_bias, new_head_bias_rows]) if old_head_bias is not None else None
-            new_head = eqx.nn.Linear(
-                llm.config.embed_dim, new_vocab_size, key=k_head, use_bias=new_head_bias is not None
-            )
-            new_head = eqx.tree_at(lambda h: h.weight, new_head, new_head_weight)
-            if new_head_bias is not None:
-                new_head = eqx.tree_at(lambda h: h.bias, new_head, new_head_bias)
-
-            # Update config
-            new_config = eqx.tree_at(lambda c: c.vocab_size, llm.config, new_vocab_size)
-            llm = eqx.tree_at(lambda m: (m.embed, m.lm_head, m.config), llm, (new_embed, new_head, new_config))
-
+        key, lora_key = jax.random.split(key)
         llm = xax.loraize_by_path(
             llm,
             rank=self.config.lora_rank,
             include_suffixes=list(self.config.lora_targets) if self.config.lora_targets else None,
             alpha=self.config.lora_alpha,
             dropout_rate=self.config.lora_dropout,
-            key=params.key,
+            key=lora_key,
         )
 
-        # Load audio BPE tokenizer to get vocab size
-        audio_bpe_tokenizer = self._load_audio_bpe_tokenizer()
-        audio_bpe_vocab_size = audio_bpe_tokenizer.get_vocab_size()
-
-        k_model = jax.random.fold_in(params.key, 1)
+        key, mimi_key = jax.random.split(key)
         model = FullTTSModel.build(
             llm=llm,
-            audio_bpe_vocab_size=audio_bpe_vocab_size,
+            audio_bpe_tokenizer=self.audio_bpe_tokenizer,
             whisper_eos_token_id=self.whisper_config.eos_token_id,
-            key=k_model,
+            key=mimi_key,
         )
 
         return model
 
     @override
     def get_trainable_filter_spec(self, model: FullTTSModel) -> FullTTSModel:
-        # LLM: Only LoRA parameters are trainable (embeddings and head frozen)
+        # LLM LoRA parameters.
         llm_spec = xax.lora_filter_spec(model.tts.llm)
+
+        # Extra head and embeddings should be trainable too.
+        extra_embed_spec = jax.tree.map(lambda _: True, llm_spec.extra_embed)
+        llm_spec = eqx.tree_at(lambda m: m.extra_embed, llm_spec, extra_embed_spec)
 
         # Audio embeddings and head: trainable
         audio_embed_spec = jax.tree.map(lambda _: True, model.tts.audio_embed)
@@ -554,31 +501,19 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         heavy: bool,
         key: PRNGKeyArray,
     ) -> tuple[Array, dict[str, xax.Metric]]:
-        input_ids_bs = batch["input_ids"]
-        labels_bs = batch["labels"]
+        codes_bs = batch["codes"]
         loss_mask_bs = batch["loss_mask"]
-        audio_mask_bs = batch["audio_mask"]
 
         # Forward pass
-        _, audio_logits_bsa = jax.vmap(model.tts.forward)(input_ids_bs, audio_mask_bs)
+        loss, accuracy = jax.vmap(model.tts.llm.get_loss_and_accuracy, in_axes=(0, 0, 0, None))(
+            codes_bs[:, :-1],
+            codes_bs[:, 1:],
+            loss_mask_bs,
+            32,
+        )
 
-        # Compute loss only on audio tokens (where loss_mask is True)
-        # Shift labels and logits for next-token prediction
-        shifted_logits_bsa = audio_logits_bsa[:, :-1, :]
-        shifted_labels_bs = labels_bs[:, 1:]
-        shifted_mask_bs = loss_mask_bs[:, 1:]
-
-        # Labels for audio positions need offset removed
-        audio_labels_bs = shifted_labels_bs - model.tts.text_vocab_size
-        audio_labels_bs = jnp.maximum(audio_labels_bs, 0)  # Clamp negative
-
-        loss_bs = optax.softmax_cross_entropy_with_integer_labels(shifted_logits_bsa, audio_labels_bs)
-        loss = jnp.sum(loss_bs * shifted_mask_bs) / jnp.maximum(jnp.sum(shifted_mask_bs), 1)
-
-        # Accuracy
-        preds_bs = jnp.argmax(shifted_logits_bsa, axis=-1)
-        correct_bs = (preds_bs == audio_labels_bs) & shifted_mask_bs
-        accuracy = jnp.sum(correct_bs) / jnp.maximum(jnp.sum(shifted_mask_bs), 1)
+        loss = loss.mean()
+        accuracy = accuracy.mean()
 
         metrics: dict[str, xax.Metric] = {
             "loss": xax.Scalar(loss),
@@ -586,15 +521,14 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         }
 
         if heavy:
-            gen_key = jax.random.fold_in(key, state.num_steps)
-            decode_table, span_table = self._build_audio_bpe_decode_tables()
-            audio_t, gt_audio_t = self._generate_audio(model, batch, gen_key, decode_table, span_table)
+            audio_t, gt_audio_t, gt_text_t = self._generate_audio(model, batch, key)
             metrics["generated_audio"] = xax.Audio(audio_t, sample_rate=xax.MIMI_SAMPLE_RATE)
             metrics["real_audio"] = xax.Audio(gt_audio_t, sample_rate=xax.MIMI_SAMPLE_RATE)
 
             # Transcribe generated audio with Whisper
             transcript_tokens, _, _ = model.whisper_transcriber.transcribe(audio_t, max_tokens=64)
             metrics["transcript"] = xax.Tokens(transcript_tokens, tokenizer="whisper")
+            metrics["gt_transcript"] = xax.Tokens(gt_text_t, tokenizer="llm")
 
             # Also transcribe ground truth
             gt_transcript_tokens, _, _ = model.whisper_transcriber.transcribe(gt_audio_t, max_tokens=64)
@@ -607,53 +541,57 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         model: FullTTSModel,
         batch: Batch,
         key: PRNGKeyArray,
-        decode_table: Array,
-        span_table: Array,
-    ) -> tuple[Array, Array]:
+    ) -> tuple[Array, Array, Array]:
         """Generate audio using the model.
 
         Returns:
-            Tuple of (generated audio, ground truth audio)
+            Tuple of (generated audio, ground truth audio, ground truth text)
         """
-        # Get first sample
-        input_ids = batch["input_ids"][0]
-        audio_start_pos = batch["audio_start_pos"][0]
-        audio_codes_gt = batch["audio_codes"][0]  # (max_frames, 8)
-
-        # Extract text tokens (up to and including TEXT_END, which is just before audio_start)
-        text_ids = input_ids[:audio_start_pos]
-
-        # Generate audio BPE tokens
-        max_audio_bpe = self.config.max_audio_bpe_length
-        audio_bpe_tokens = model.tts.generate_audio(
-            text_ids,
-            audio_start_token=self.audio_start_id + model.tts.text_vocab_size,  # Offset for embedding lookup
+        # Generate audio BPE tokens from the eval prompt
+        max_audio_bpe = self.config.max_seq_length - len(self.eval_prompt_tokens)
+        audio_bpe_tokens, audio_bpe_length = model.tts.generate_audio(
+            prompt_tokens_s=self.eval_prompt_tokens,
             max_audio_tokens=max_audio_bpe,
-            eos_token=AUDIO_BPE_EOS_TOKEN,
+            audio_end_id=self.audio_end_id,
+            key=key,
         )
 
-        # Find actual length (first EOS or max)
-        eos_positions = jnp.where(audio_bpe_tokens == AUDIO_BPE_EOS_TOKEN, jnp.arange(max_audio_bpe), max_audio_bpe)
-        bpe_length = jnp.min(eos_positions)
-
         # Decode BPE to codec tokens
-        audio_codes_gen, num_frames = decode_audio_bpe_to_codes(
-            bpe_tokens_b=audio_bpe_tokens,
+        audio_codes_gen, _ = decode_audio_bpe_to_codes(
+            bpe_tokens_b=audio_bpe_tokens - self.first_audio_bpe_id,
+            bpe_length=audio_bpe_length,
+            decode_table_vs=self.audio_bpe_decode_table,
+            span_table_v=self.audio_bpe_span_table,
+            num_quantizers=self.config.num_quantizers,
+            max_frames=self.config.max_audio_frames,
+        )
+
+        # Get the ground truth codes from the batch.
+        gt_ids = batch["codes"][0]
+        gt_start_mask = gt_ids == self.audio_start_id
+        first_start_idx = jnp.where(gt_start_mask.any(), jnp.argmax(gt_start_mask), len(gt_ids))
+        gt_end_mask = gt_ids == self.audio_end_id
+        first_end_idx = jnp.where(gt_end_mask.any(), jnp.argmax(gt_end_mask), len(gt_ids))
+        gt_audio_ids = jax.lax.dynamic_slice(gt_ids, (first_start_idx,), (self.config.max_seq_length,))
+        bpe_length = first_end_idx - first_start_idx
+
+        gt_codes, _ = decode_audio_bpe_to_codes(
+            bpe_tokens_b=gt_audio_ids - self.first_audio_bpe_id,
             bpe_length=bpe_length,
-            decode_table_vs=decode_table,
-            span_table_v=span_table,
+            decode_table_vs=self.audio_bpe_decode_table,
+            span_table_v=self.audio_bpe_span_table,
             num_quantizers=self.config.num_quantizers,
             max_frames=self.config.max_audio_frames,
         )
 
         # Decode with Mimi
         audio_gen = model.mimi.decode(audio_codes_gen)
-
-        # Ground truth audio
-        gt_codes = audio_codes_gt.T  # (8, max_frames)
         audio_gt = model.mimi.decode(gt_codes)
 
-        return audio_gen[0], audio_gt[0]
+        # Parses the ground truth text.
+        gt_text_ids = jax.lax.dynamic_slice(gt_ids, (1,), (self.config.max_seq_length,))
+
+        return audio_gen[0], audio_gt[0], gt_text_ids
 
     @override
     def decode_tokens(self, tokens: np.ndarray, token_type: str) -> str:
@@ -665,7 +603,8 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
                 return self.whisper_tokenizer.decode(transcript_tokens, skip_special_tokens=True)
 
             case "llm":
-                return self.tokenizer.decode(token_list, skip_special_tokens=False)
+                transcript_tokens = [t for t in token_list if t < self.first_audio_bpe_id]
+                return self.tokenizer.decode(token_list, skip_special_tokens=True)
 
             case _:
                 raise ValueError(f"Invalid token type: {token_type}")
@@ -681,43 +620,22 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         Format: [TEXT] [AUDIO_START] [AUDIO_BPE] [AUDIO_END]
 
         Columns:
-        - input_ids: Combined text + audio token IDs (audio offset by text_vocab_size)
-        - labels: Same as input_ids (for next-token prediction)
+        - codes: Combined text + audio token IDs (audio offset by text_vocab_size)
         - loss_mask: True only for audio positions (we only train on audio prediction)
-        - audio_mask: True for audio token positions (for embedding selection)
-        - audio_start_pos: Position where audio starts
-        - audio_codes: Original codec tokens for ground truth decoding
         """
         ds = self.load_dataset("bpe")
-
-        max_text_len = self.config.max_text_length
-        max_audio_bpe_len = self.config.max_audio_bpe_length
         max_seq_len = self.config.max_seq_length
-        text_vocab_size = len(self.tokenizer)
 
         def prepare_sample(example: dict) -> dict:
-            # Text tokens
+            # Prepare tokens.
             text_tokens = np.array(example["text_tokens"], dtype=np.int32)
-            text_len = min(len(text_tokens), max_text_len)
-            text_tokens = text_tokens[:text_len]
+            text_tokens_with_special = np.concatenate([[self.text_start_id], text_tokens, [self.text_end_id]])
+            text_with_special_len = len(text_tokens_with_special)
+            audio_bpe = np.array(example["audio_bpe"], dtype=np.int32) + self.first_audio_bpe_id
+            audio_bpe_len = len(audio_bpe)
+            audio_bpe_with_special = np.concatenate([[self.audio_start_id], audio_bpe, [self.audio_end_id]])
 
-            # Audio BPE tokens with BOS/EOS
-            audio_bpe = np.array(example["audio_bpe"], dtype=np.int32)
-            audio_bpe_with_special = np.concatenate([[AUDIO_BPE_BOS_TOKEN], audio_bpe, [AUDIO_BPE_EOS_TOKEN]])
-            audio_bpe_len = min(len(audio_bpe_with_special), max_audio_bpe_len)
-            audio_bpe_with_special = audio_bpe_with_special[:audio_bpe_len]
-
-            # Build combined sequence: [TEXT] [AUDIO_START] [AUDIO_BPE] [AUDIO_END]
-            # Audio tokens are offset by text_vocab_size
-            audio_start_id = self.audio_start_id
-            audio_end_id = self.audio_end_id
-
-            seq_parts = [
-                text_tokens,  # Text
-                np.array([audio_start_id], dtype=np.int32),  # AUDIO_START
-                audio_bpe_with_special + text_vocab_size,  # Audio BPE (offset)
-                np.array([audio_end_id], dtype=np.int32),  # AUDIO_END
-            ]
+            seq_parts = [text_tokens_with_special, audio_bpe_with_special]
             sequence = np.concatenate(seq_parts)
 
             # Truncate to max_seq_len
@@ -725,45 +643,21 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             sequence = sequence[:seq_len]
 
             # Pad to max_seq_len
-            input_ids = np.zeros(max_seq_len, dtype=np.int32)
-            input_ids[:seq_len] = sequence
-
-            # Labels are the same (for next-token prediction)
-            labels = input_ids.copy()
-
-            # Audio start position (after text + AUDIO_START)
-            audio_start_pos = text_len + 1
+            codes = np.full(max_seq_len, self.tokenizer.pad_token_id, dtype=np.int32)
+            codes[:seq_len] = sequence
 
             # Loss mask: only on audio tokens (after AUDIO_START, excluding AUDIO_END)
-            loss_mask = np.zeros(max_seq_len, dtype=np.bool_)
-            audio_end_pos = audio_start_pos + audio_bpe_len
-            loss_mask[audio_start_pos:audio_end_pos] = True
+            loss_start = text_with_special_len + 1
+            loss_end_exclusive = loss_start + audio_bpe_len
+            loss_mask = np.zeros(max_seq_len - 1, dtype=np.bool_)
+            loss_mask[loss_start:loss_end_exclusive] = True
 
-            # Audio mask: True for audio token positions (for embedding lookup)
-            audio_mask = np.zeros(max_seq_len, dtype=np.bool_)
-            audio_mask[audio_start_pos:audio_end_pos] = True
-
-            # Keep original audio codes for ground truth generation
-            audio_codes = np.array(example["audio_codes"], dtype=np.int32)
-            max_audio_frames = self.config.max_audio_frames
-            if len(audio_codes) < max_audio_frames:
-                audio_codes = np.pad(audio_codes, ((0, max_audio_frames - len(audio_codes)), (0, 0)))
-            else:
-                audio_codes = audio_codes[:max_audio_frames]
-
-            return {
-                "input_ids": input_ids,
-                "labels": labels,
-                "loss_mask": loss_mask,
-                "audio_mask": audio_mask,
-                "audio_start_pos": np.int32(audio_start_pos),
-                "audio_codes": audio_codes,
-            }
+            return {"codes": codes, "loss_mask": loss_mask}
 
         result = ds.map(prepare_sample, desc="Preparing training data")
 
         # Remove unused columns
-        cols_to_keep = ["input_ids", "labels", "loss_mask", "audio_mask", "audio_start_pos", "audio_codes"]
+        cols_to_keep = ["codes", "loss_mask"]
         cols_to_remove = [c for c in result.column_names if c not in cols_to_keep]
         if cols_to_remove:
             result = result.remove_columns(cols_to_remove)
@@ -960,9 +854,9 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 if __name__ == "__main__":
     LJSpeechTTS.launch(
         Config(
-            batch_size=64,
-            max_grad_norm=10.0,
-            gradient_accumulation_steps=2,
+            batch_size=16,
+            max_grad_norm=5.0,
+            gradient_accumulation_steps=4,
             log_heavy_every_n_seconds=60,
             step_kind="second",
         ),

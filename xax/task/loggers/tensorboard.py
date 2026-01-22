@@ -64,6 +64,7 @@ class TensorboardLogger(LoggerImpl):
         self.files: dict[str, str] = {}
         self.writers = TensorboardWriters(log_directory=self.log_directory, flush_seconds=flush_seconds)
         self._started = False
+        self._thread: threading.Thread | None = None
 
         # For making log messages independent.
         self.error_step = 0
@@ -76,7 +77,9 @@ class TensorboardLogger(LoggerImpl):
             return
 
         if is_master():
-            threading.Thread(target=self.worker_thread, daemon=True).start()
+            atexit.register(self.cleanup)
+            self._thread = threading.Thread(target=self.worker_thread, daemon=True)
+            self._thread.start()
 
         self._started = True
 
@@ -160,13 +163,14 @@ class TensorboardLogger(LoggerImpl):
                 line_str = "".join(lines)
                 raise RuntimeError(f"Tensorboard failed to start:\n{line_str}")
 
-            atexit.register(self.cleanup)
-
     def cleanup(self) -> None:
         if self.proc is not None:
             self.proc.terminate()
             self.proc.wait()
             self.proc = None
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
 
     def __del__(self) -> None:
         self.cleanup()

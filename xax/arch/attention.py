@@ -27,7 +27,7 @@ from xax.nn.lora import LoRALinear
 from xax.utils.jax import scan as xax_scan
 
 
-def apply_linear(x: Array, linear: eqx.nn.Linear | Fp8Linear | LoRALinear) -> Array:
+def apply_linear(x: Array, linear: eqx.nn.Linear | Fp8Linear | LoRALinear | eqx.nn.Embedding) -> Array:
     """Apply linear layer with LoRA support.
 
     This function applies a linear transformation using einsum for better performance.
@@ -56,12 +56,17 @@ def apply_linear(x: Array, linear: eqx.nn.Linear | Fp8Linear | LoRALinear) -> Ar
         if isinstance(y, tuple):
             return y[0]
         return y
-    else:
+    elif isinstance(linear, eqx.nn.Linear):
         # Standard eqx.nn.Linear
         y = jnp.einsum("...d,od->...o", x, linear.weight)
         if linear.bias is not None:
             y = y + linear.bias
         return y
+    elif isinstance(linear, eqx.nn.Embedding):
+        # Standard eqx.nn.Embedding
+        return jnp.einsum("...d,od->...o", x, linear.weight)
+    else:
+        raise ValueError(f"Unsupported linear layer type: {type(linear)}")
 
 
 class RMSNorm(eqx.Module):

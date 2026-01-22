@@ -137,7 +137,7 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
         loss = jax.vmap(xax.chunked_cross_entropy_loss, in_axes=(0, 0, None, 0, None))(
             hidden_btd,
             targets_bt,
-            model.lm_head.weight,
+            model.lm_head,
             mask_bt,
             256,  # Chunk size
         )
@@ -154,7 +154,7 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
             accuracy = jax.vmap(xax.chunked_cross_entropy_acc, in_axes=(0, 0, None, 0, None))(
                 hidden_btd,
                 targets_bt,
-                model.lm_head.weight,
+                model.lm_head,
                 mask_bt,
                 256,
             )
