@@ -604,7 +604,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
             case "llm":
                 transcript_tokens = [t for t in token_list if t < self.first_audio_bpe_id]
-                return self.tokenizer.decode(token_list, skip_special_tokens=True)
+                return self.tokenizer.decode(transcript_tokens, skip_special_tokens=True)
 
             case _:
                 raise ValueError(f"Invalid token type: {token_type}")
