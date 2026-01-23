@@ -285,15 +285,15 @@ class Config(xax.SupervisedConfig):
     num_quantizers: int = xax.field(NUM_QUANTIZERS, help="Number of quantizers (8)")
 
     # LoRA settings
-    lora_rank: int = xax.field(16, help="Rank of LoRA decomposition")
-    lora_alpha: float = xax.field(16.0, help="LoRA alpha parameter")
+    lora_rank: int = xax.field(32, help="Rank of LoRA decomposition")
+    lora_alpha: float = xax.field(32.0, help="LoRA alpha parameter")
     lora_dropout: float = xax.field(0.0, help="Dropout rate for LoRA layers")
     lora_targets: tuple[str, ...] | None = xax.field(DEFAULT_LORA_TARGETS, help="Layer suffixes for LoRA")
 
     # Training settings
-    learning_rate: float = xax.field(5e-4, help="Peak learning rate")
+    learning_rate: float = xax.field(1.3e-3, help="Peak learning rate")
     min_learning_rate: float = xax.field(1e-5, help="Minimum learning rate")
-    warmup_steps: int = xax.field(50, help="Number of warmup steps")
+    warmup_steps: int = xax.field(15, help="Number of warmup steps")
     max_audio_frames: int = xax.field(256, help="Maximum audio frames")
     max_seq_length: int = xax.field(512, help="Maximum combined sequence length")
     audio_bpe_vocab_size: int = xax.field(151_669, help="Vocabulary size for audio BPE tokenizer")
@@ -493,7 +493,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         else:
             learning_rate_schedule = self.config.learning_rate
 
-        return optax.adamw(learning_rate=learning_rate_schedule, weight_decay=0.01)
+        return optax.adamw(learning_rate=learning_rate_schedule, weight_decay=0.001)
 
     @override
     def compute_loss(
@@ -861,9 +861,9 @@ if __name__ == "__main__":
     LJSpeechTTS.launch(
         Config(
             batch_size=16,
-            max_grad_norm=5.0,
-            gradient_accumulation_steps=4,
-            log_heavy_every_n_seconds=60,
+            max_grad_norm=2.0,
+            gradient_accumulation_steps=1,
+            log_heavy_every_n_seconds=300,
             step_kind="second",
         ),
     )
