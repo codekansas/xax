@@ -46,7 +46,6 @@ DEFAULT_LORA_TARGETS = ("q_proj", "v_proj", "gate", "up")
 
 class Batch(TypedDict):
     codes: Array  # (batch, seq_len) - combined text + audio tokens
-    loss_mask: Array  # (batch, seq_len) - mask for loss computation (audio only)
 
 
 class TTSModel(eqx.Module):
@@ -312,9 +311,13 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
     audio_bpe_decode_table: Array | None
     audio_bpe_span_table: Array | None
 
-    # Special token IDs (added to tokenizer)
+    text_start_id: int
+    text_end_id: int
     audio_start_id: int
     audio_end_id: int
+    first_audio_bpe_id: int
+    text_vocab_size: int
+    audio_bpe_vocab_size: int
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
@@ -502,23 +505,22 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         key: PRNGKeyArray,
     ) -> tuple[Array, dict[str, xax.Metric]]:
         codes_bs = batch["codes"]
-        loss_mask_bs = batch["loss_mask"]
+
+        # Splits into inputs and outputs.
+        tokens_bs, targets_bs = codes_bs[:, :-1], codes_bs[:, 1:]
+        mask_bs = targets_bs > self.text_end_id
 
         # Forward pass
         loss, accuracy = jax.vmap(model.tts.llm.get_loss_and_accuracy, in_axes=(0, 0, 0, None))(
-            codes_bs[:, :-1],
-            codes_bs[:, 1:],
-            loss_mask_bs,
+            tokens_bs,
+            targets_bs,
+            mask_bs,
             32,
         )
 
         loss = loss.mean()
         accuracy = accuracy.mean()
-
-        metrics: dict[str, xax.Metric] = {
-            "loss": xax.Scalar(loss),
-            "accuracy": xax.Scalar(accuracy),
-        }
+        metrics: dict[str, xax.Metric] = {"loss": xax.Scalar(loss), "accuracy": xax.Scalar(accuracy)}
 
         if heavy:
             audio_t, gt_audio_t, gt_text_t = self._generate_audio(model, batch, key)
@@ -556,10 +558,19 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             key=key,
         )
 
-        # Decode BPE to codec tokens
+        # Strip prompt prefix and EOS from generated tokens before decoding.
+        prompt_len = len(self.eval_prompt_tokens)
+        gen_tokens = audio_bpe_tokens[prompt_len:]
+        gen_length = audio_bpe_length - prompt_len
+
+        # Exclude EOS token if it was generated (audio_end_id is not a BPE token).
+        last_idx = jnp.clip(gen_length - 1, 0)
+        has_eos = gen_tokens[last_idx] == self.audio_end_id
+        gen_length = gen_length - has_eos.astype(jnp.int32)
+
         audio_codes_gen, _ = decode_audio_bpe_to_codes(
-            bpe_tokens_b=audio_bpe_tokens - self.first_audio_bpe_id,
-            bpe_length=audio_bpe_length,
+            bpe_tokens_b=gen_tokens - self.first_audio_bpe_id,
+            bpe_length=gen_length,
             decode_table_vs=self.audio_bpe_decode_table,
             span_table_v=self.audio_bpe_span_table,
             num_quantizers=self.config.num_quantizers,
@@ -572,8 +583,11 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         first_start_idx = jnp.where(gt_start_mask.any(), jnp.argmax(gt_start_mask), len(gt_ids))
         gt_end_mask = gt_ids == self.audio_end_id
         first_end_idx = jnp.where(gt_end_mask.any(), jnp.argmax(gt_end_mask), len(gt_ids))
-        gt_audio_ids = jax.lax.dynamic_slice(gt_ids, (first_start_idx,), (self.config.max_seq_length,))
-        bpe_length = first_end_idx - first_start_idx
+        # Roll array so audio BPE tokens (after AUDIO_START) are at position 0.
+        # dynamic_slice can't be used here because the slice size equals the array
+        # size, which causes the start index to always clip to 0.
+        gt_audio_ids = jnp.roll(gt_ids, -(first_start_idx + 1))
+        bpe_length = first_end_idx - first_start_idx - 1
 
         gt_codes, _ = decode_audio_bpe_to_codes(
             bpe_tokens_b=gt_audio_ids - self.first_audio_bpe_id,
@@ -630,9 +644,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             # Prepare tokens.
             text_tokens = np.array(example["text_tokens"], dtype=np.int32)
             text_tokens_with_special = np.concatenate([[self.text_start_id], text_tokens, [self.text_end_id]])
-            text_with_special_len = len(text_tokens_with_special)
             audio_bpe = np.array(example["audio_bpe"], dtype=np.int32) + self.first_audio_bpe_id
-            audio_bpe_len = len(audio_bpe)
             audio_bpe_with_special = np.concatenate([[self.audio_start_id], audio_bpe, [self.audio_end_id]])
 
             seq_parts = [text_tokens_with_special, audio_bpe_with_special]
@@ -646,18 +658,12 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             codes = np.full(max_seq_len, self.tokenizer.pad_token_id, dtype=np.int32)
             codes[:seq_len] = sequence
 
-            # Loss mask: only on audio tokens (after AUDIO_START, excluding AUDIO_END)
-            loss_start = text_with_special_len + 1
-            loss_end_exclusive = loss_start + audio_bpe_len
-            loss_mask = np.zeros(max_seq_len - 1, dtype=np.bool_)
-            loss_mask[loss_start:loss_end_exclusive] = True
-
-            return {"codes": codes, "loss_mask": loss_mask}
+            return {"codes": codes}
 
         result = ds.map(prepare_sample, desc="Preparing training data")
 
         # Remove unused columns
-        cols_to_keep = ["codes", "loss_mask"]
+        cols_to_keep = ["codes"]
         cols_to_remove = [c for c in result.column_names if c not in cols_to_keep]
         if cols_to_remove:
             result = result.remove_columns(cols_to_remove)
