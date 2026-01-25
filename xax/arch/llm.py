@@ -1536,7 +1536,7 @@ def llm_generate_jit(
 
         # Forward pass on full buffer - recompute everything each step
         key, subkey = jax.random.split(key)
-        logits_tv, caches = model.forward(tokens_t, context_tn=context_tn, caches=caches)
+        logits_tv, caches = model.forward(tokens_t[:-1], context_tn=context_tn, caches=caches)
         logits = logits_tv[..., cur_pos - 1, :]
 
         key, subkey = jax.random.split(key)

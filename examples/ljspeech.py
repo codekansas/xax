@@ -233,11 +233,11 @@ class ResidualModel(eqx.Module):
         max_frames: int,
         key: PRNGKeyArray,
     ) -> Array:
-        all_codes = [q0_codes_t[:-1]]
+        all_codes = [q0_codes_t]
         start_t = jnp.array([AUDIO_BOS_TOKEN_ID])
 
         # Project LLM context vectors.
-        x_td = jax.vmap(self.hidden_proj)(stretched_hidden_td[:-1])
+        x_td = jax.vmap(self.hidden_proj)(stretched_hidden_td)
 
         for layer_idx in range(1, NUM_QUANTIZERS):
             llm = self.layer_llms[layer_idx - 1]
@@ -252,13 +252,13 @@ class ResidualModel(eqx.Module):
                 llm,
                 start_t,
                 eos_id=AUDIO_EOS_TOKEN_ID,
-                max_new_tokens=max_frames - 2,  # Remove BOS token and final next token
+                max_new_tokens=max_frames,
                 context_tn=x_td,
                 temperature=0.8,
                 top_p=0.9,
                 key=layer_key,
             )
-            all_codes.append(pred_tokens_t)
+            all_codes.append(pred_tokens_t[1:])
 
         return jnp.stack(all_codes, axis=0)
 
