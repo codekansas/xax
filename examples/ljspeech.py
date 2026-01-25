@@ -200,6 +200,11 @@ class ResidualModel(eqx.Module):
         mask_t = audio_codes_ft[0, 1:] != AUDIO_PAD_TOKEN_ID
 
         # First-layer embeddings.
+        # stretched_hidden_td[f] = hidden for frame f (frame-indexed)
+        # audio_codes_ft[q, p] = code at seq_pos p (seq-pos-indexed, BOS at 0)
+        # Using [:-1] on stretched_hidden gives frames 0 to T-1.
+        # Using [1:] on audio_codes gives seq_pos 1 to T = frames 0 to T-1.
+        # Both align at frame index i.
         x_td = jax.vmap(self.hidden_proj)(stretched_hidden_td[:-1])
 
         losses = []
@@ -233,6 +238,9 @@ class ResidualModel(eqx.Module):
         max_frames: int,
         key: PRNGKeyArray,
     ) -> Array:
+        # Both stretched_hidden_td and q0_codes_t are frame-indexed:
+        # stretched_hidden_td[f] = hidden for frame f
+        # q0_codes_t[f] = Q0 code for frame f
         all_codes = [q0_codes_t]
         start_t = jnp.array([AUDIO_BOS_TOKEN_ID])
 
@@ -825,13 +833,13 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         )
 
         # Decode with Mimi
-        all_codes_ft = all_codes_ft.clip(max=xax.MIMI_CODEBOOK_SIZE)
+        all_codes_ft = all_codes_ft.clip(max=xax.MIMI_CODEBOOK_SIZE - 1)
         audio_gen = model.mimi.decode(all_codes_ft)
 
-        # Get ground truth audio from batch
+        # Get ground truth audio from batch.
         gt_codes_tf = batch["audio_codes"][0]  # (T, 8)
-        gt_codes_ft = gt_codes_tf[1:max_frames, :].T  # (8, max_frames)
-        gt_codes_ft = gt_codes_ft.clip(max=xax.MIMI_CODEBOOK_SIZE)
+        gt_codes_ft = gt_codes_tf[1:max_frames, :].T
+        gt_codes_ft = gt_codes_ft.clip(max=xax.MIMI_CODEBOOK_SIZE - 1)
         audio_gt = model.mimi.decode(gt_codes_ft)
 
         # Parse ground truth text
