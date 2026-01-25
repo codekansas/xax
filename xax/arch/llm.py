@@ -1534,7 +1534,7 @@ def llm_generate_jit(
     ) -> tuple[Array, Array, Array, Array, list[TransformerBlockCache]]:
         tokens_t, cur_pos, key, _, caches = state
 
-        # Forward pass on full buffer - recompute everything each step
+        # Forward pass on full buffer, passing caches around.
         key, subkey = jax.random.split(key)
         logits_tv, caches = model.forward(tokens_t[:-1], context_tn=context_tn, caches=caches)
         logits = logits_tv[..., cur_pos - 1, :]

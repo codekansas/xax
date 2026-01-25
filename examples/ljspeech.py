@@ -830,7 +830,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
         # Get ground truth audio from batch
         gt_codes_tf = batch["audio_codes"][0]  # (T, 8)
-        gt_codes_ft = gt_codes_tf[:max_frames, :].T  # (8, max_frames)
+        gt_codes_ft = gt_codes_tf[1:max_frames, :].T  # (8, max_frames)
         gt_codes_ft = gt_codes_ft.clip(max=xax.MIMI_CODEBOOK_SIZE)
         audio_gt = model.mimi.decode(gt_codes_ft)
 
