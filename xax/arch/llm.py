@@ -87,7 +87,7 @@ class LLM(eqx.Module):
     blocks: tuple[TransformerBlock, ...]
     norm: RMSNorm
     lm_head: eqx.nn.Linear
-    config: LLMConfig
+    config: LLMConfig = eqx.field(static=True)
 
     # These are used to support adding extra tokens to the vocabulary.
     extra_embed: eqx.nn.Embedding | None = None
@@ -235,12 +235,17 @@ class LLM(eqx.Module):
         return caches
 
     @overload
-    def forward_hidden(self, tokens_t: Array) -> Array: ...
+    def forward_hidden(
+        self,
+        tokens_t: Array,
+        context_tn: Array | None = None,
+    ) -> Array: ...
 
     @overload
     def forward_hidden(
         self,
         tokens_t: Array,
+        context_tn: Array | None = None,
         *,
         caches: list[TransformerBlockCache],
     ) -> tuple[Array, list[TransformerBlockCache]]: ...
@@ -248,6 +253,7 @@ class LLM(eqx.Module):
     def forward_hidden(
         self,
         tokens_t: Array,
+        context_tn: Array | None = None,
         *,
         caches: list[TransformerBlockCache] | None = None,
     ) -> tuple[Array, list[TransformerBlockCache]] | Array:
@@ -258,6 +264,7 @@ class LLM(eqx.Module):
 
         Args:
             tokens_t: Tokens, shape (seq_len,).
+            context_tn: Contextual embeddings, shape (seq_len, context_dim).
             caches: List of KV caches, one per layer.
 
         Returns:
@@ -265,6 +272,8 @@ class LLM(eqx.Module):
         """
         chex.assert_rank(tokens_t, 1)
         x_tn = self.embed_tokens(tokens_t)
+        if context_tn is not None:
+            x_tn = context_tn + x_tn
         if caches is None:
             for block in self.blocks:
                 x_tn, cache = block.forward(x_tn, cache=None)
@@ -277,12 +286,18 @@ class LLM(eqx.Module):
             return self.norm(x_tn), caches_out
 
     @overload
-    def forward(self, tokens_t: Array) -> Array: ...
+    def forward(
+        self,
+        tokens_t: Array,
+        *,
+        context_tn: Array | None = None,
+    ) -> Array: ...
 
     @overload
     def forward(
         self,
         tokens_t: Array,
+        context_tn: Array | None = None,
         *,
         caches: list[TransformerBlockCache],
     ) -> tuple[Array, list[TransformerBlockCache]]: ...
@@ -290,14 +305,22 @@ class LLM(eqx.Module):
     def forward(
         self,
         tokens_t: Array,
+        context_tn: Array | None = None,
         *,
         caches: list[TransformerBlockCache] | None = None,
     ) -> tuple[Array, list[TransformerBlockCache]] | Array:
         if caches is None:
-            x_td = self.forward_hidden(tokens_t)
+            x_td = self.forward_hidden(
+                tokens_t,
+                context_tn=context_tn,
+            )
             return self.get_logits(x_td)
         else:
-            x_td, cache = self.forward_hidden(tokens_t, caches=caches)
+            x_td, cache = self.forward_hidden(
+                tokens_t,
+                context_tn=context_tn,
+                caches=caches,
+            )
             logits_tv = self.get_logits(x_td)
             return logits_tv, cache
 
@@ -305,33 +328,36 @@ class LLM(eqx.Module):
         self,
         tokens_t: Array,
         targets_t: Array,
+        context_tn: Array | None = None,
         mask_t: Array | None = None,
         chunk_size: int = 1,
     ) -> Array:
-        hidden_td = self.forward_hidden(tokens_t)
+        hidden_td = self.forward_hidden(tokens_t, context_tn=context_tn)
         return chunked_cross_entropy_loss(hidden_td, targets_t, self.get_logits, mask_t, chunk_size)
 
     def get_accuracy(
         self,
         tokens_t: Array,
         targets_t: Array,
+        context_tn: Array | None = None,
         mask_t: Array | None = None,
         chunk_size: int = 1,
     ) -> Array:
-        hidden_td = self.forward_hidden(tokens_t)
+        hidden_td = self.forward_hidden(tokens_t, context_tn=context_tn)
         return chunked_cross_entropy_acc(hidden_td, targets_t, self.get_logits, mask_t, chunk_size)
 
     def get_loss_and_accuracy(
         self,
         tokens_t: Array,
         targets_t: Array,
+        context_tn: Array | None = None,
         mask_t: Array | None = None,
         chunk_size: int = 1,
-    ) -> tuple[Array, Array]:
-        hidden_td = self.forward_hidden(tokens_t)
+    ) -> tuple[Array, Array, Array]:
+        hidden_td = self.forward_hidden(tokens_t, context_tn=context_tn)
         loss = chunked_cross_entropy_loss(hidden_td, targets_t, self.get_logits, mask_t, chunk_size)
         accuracy = chunked_cross_entropy_acc(hidden_td, targets_t, self.get_logits, mask_t, chunk_size)
-        return loss, accuracy
+        return loss, accuracy, hidden_td
 
 
 class CrossAttentionLLM(eqx.Module):
@@ -445,13 +471,14 @@ class CrossAttentionLLM(eqx.Module):
         return self_caches, cross_cache
 
     @overload
-    def forward_hidden(self, tokens_t: Array) -> Array: ...
+    def forward_hidden(self, tokens_t: Array, *, context_tn: Array | None = None) -> Array: ...
 
     @overload
     def forward_hidden(
         self,
         tokens_t: Array,
         *,
+        context_tn: Array | None = None,
         encoder_output_sn: Array,
     ) -> Array: ...
 
@@ -460,6 +487,7 @@ class CrossAttentionLLM(eqx.Module):
         self,
         tokens_t: Array,
         *,
+        context_tn: Array | None = None,
         caches: list[TransformerBlockCache],
         cross_cache: AttentionCache,
     ) -> tuple[Array, list[TransformerBlockCache], AttentionCache]: ...
@@ -469,6 +497,7 @@ class CrossAttentionLLM(eqx.Module):
         tokens_t: Array,
         *,
         encoder_output_sn: Array | None = None,
+        context_tn: Array | None = None,
         caches: list[TransformerBlockCache] | None = None,
         cross_cache: AttentionCache | None = None,
     ) -> tuple[Array, list[TransformerBlockCache], AttentionCache] | Array:
@@ -485,7 +514,9 @@ class CrossAttentionLLM(eqx.Module):
             Hidden states and updated caches if caching, else just hidden states
         """
         chex.assert_rank(tokens_t, 1)
-        x_tn = jax.vmap(self.llm.embed)(tokens_t)
+        x_tn = self.llm.embed_tokens(tokens_t)
+        if context_tn is not None:
+            x_tn = context_tn + x_tn
 
         if caches is None:
             # No caching - simple forward pass
@@ -525,13 +556,19 @@ class CrossAttentionLLM(eqx.Module):
             return self.llm.norm(x_tn), caches_out, updated_cross_cache  # type: ignore[return-value]
 
     @overload
-    def forward(self, tokens_t: Array) -> Array: ...
+    def forward(
+        self,
+        tokens_t: Array,
+        *,
+        context_tn: Array | None = None,
+    ) -> Array: ...
 
     @overload
     def forward(
         self,
         tokens_t: Array,
         *,
+        context_tn: Array | None = None,
         encoder_output_sn: Array,
     ) -> Array: ...
 
@@ -540,6 +577,7 @@ class CrossAttentionLLM(eqx.Module):
         self,
         tokens_t: Array,
         *,
+        context_tn: Array | None = None,
         caches: list[TransformerBlockCache],
         cross_cache: AttentionCache,
     ) -> tuple[Array, list[TransformerBlockCache], AttentionCache]: ...
@@ -548,6 +586,7 @@ class CrossAttentionLLM(eqx.Module):
         self,
         tokens_t: Array,
         *,
+        context_tn: Array | None = None,
         encoder_output_sn: Array | None = None,
         caches: list[TransformerBlockCache] | None = None,
         cross_cache: AttentionCache | None = None,
@@ -556,6 +595,7 @@ class CrossAttentionLLM(eqx.Module):
 
         Args:
             tokens_t: Input token IDs, shape (seq_len,)
+            context_tn: Contextual embeddings, shape (seq_len, context_dim).
             encoder_output_sn: Encoder output for cross-attention
             caches: Self-attention KV caches per layer
             cross_cache: Cross-attention KV cache
@@ -564,11 +604,16 @@ class CrossAttentionLLM(eqx.Module):
             Logits and updated caches if caching, else just logits
         """
         if caches is None:
-            x_td = self.forward_hidden(tokens_t, encoder_output_sn=encoder_output_sn)
+            x_td = self.forward_hidden(
+                tokens_t,
+                context_tn=context_tn,
+                encoder_output_sn=encoder_output_sn,
+            )
             return apply_linear(x_td, self.llm.lm_head)
         else:
             x_td, caches_out, cross_cache_out = self.forward_hidden(
                 tokens_t,
+                context_tn=context_tn,
                 encoder_output_sn=encoder_output_sn,
                 caches=caches,
                 cross_cache=cross_cache,
@@ -695,7 +740,9 @@ def chunked_cross_entropy_loss(
         hidden_td: Hidden states from model.forward_hidden(), shape (seq, hidden_dim)
         targets_t: Target token indices, shape (seq,)
         lm_head: The lm_head function, shape (hidden_dim) -> (vocab_size)
-        mask_t: Optional mask for valid positions, shape (seq,). If None, all positions are valid.
+        mask_t: Optional mask for valid positions, shape (seq,). If None,
+            all positions are valid. "True" indicates that the value is
+            included in the loss computation.
         chunk_size: Number of sequence positions to process at once.
 
     Returns:
@@ -1374,18 +1421,23 @@ def llm_generate(
     eos_id: int | None,
     max_new_tokens: int = 20,
     *,
+    context_tn: Array | None = None,
     temperature: float = 0.7,
     top_p: float = 0.9,
+    key: PRNGKeyArray | None = None,
 ) -> list[int]:
     """Sampling-based decoding for quick sanity checks (non-JIT version)."""
+    if key is None:
+        key = jax.random.key(0)
     tokens_arr, final_len = xax_filter_jit(llm_generate_jit)(
         model,
         jnp.array(tokens, dtype=jnp.int32),
         eos_id if eos_id is not None else -1,
         max_new_tokens,
+        context_tn,
         temperature,
         top_p,
-        jax.random.key(0),
+        key,
     )
     return tokens_arr[: int(final_len)].tolist()
 
@@ -1441,10 +1493,27 @@ def llm_generate_jit(
     tokens_t: Array,
     eos_id: int,
     max_new_tokens: int,
+    context_tn: Array | None,
     temperature: float,
     top_p: float,
     key: PRNGKeyArray,
 ) -> tuple[Array, Array]:
+    """JIT-compiled autoregressive generation with optional context.
+
+    Args:
+        model: The LLM model.
+        tokens_t: Initial token sequence, shape (initial_len,).
+        eos_id: End-of-sequence token ID (-1 to disable).
+        max_new_tokens: Maximum number of new tokens to generate.
+        context_tn: Optional contextual embeddings, shape (max_len, context_dim).
+            Must be padded to max_len = initial_len + max_new_tokens if provided.
+        temperature: Sampling temperature.
+        top_p: Top-p (nucleus) sampling probability.
+        key: PRNG key for sampling.
+
+    Returns:
+        Tuple of (generated tokens, final sequence length).
+    """
     initial_len = tokens_t.shape[-1]
     max_len = initial_len + max_new_tokens
 
@@ -1467,7 +1536,7 @@ def llm_generate_jit(
 
         # Forward pass on full buffer - recompute everything each step
         key, subkey = jax.random.split(key)
-        logits_tv, caches = model.forward(tokens_t, caches=caches)
+        logits_tv, caches = model.forward(tokens_t, context_tn=context_tn, caches=caches)
         logits = logits_tv[..., cur_pos - 1, :]
 
         key, subkey = jax.random.split(key)
@@ -1487,6 +1556,7 @@ def llm_generate_stream(
     eos_id: int | None,
     max_new_tokens: int = 256,
     *,
+    context_tn: Array | None = None,
     temperature: float = 0.7,
     top_p: float = 0.9,
     key: PRNGKeyArray | None = None,
@@ -1501,6 +1571,8 @@ def llm_generate_stream(
         tokens: Initial token sequence as a list of integers.
         eos_id: End-of-sequence token ID (None to disable).
         max_new_tokens: Maximum number of new tokens to generate.
+        context_tn: Optional contextual embeddings, shape (max_len, context_dim).
+            Must be padded to max_len = len(tokens) + max_new_tokens if provided.
         temperature: Sampling temperature (>0).
         top_p: Top-p (nucleus) sampling probability.
         key: Optional PRNG key for sampling (defaults to key(0)).
@@ -1525,16 +1597,17 @@ def llm_generate_stream(
     def step(
         model: LLM,
         tokens_t: Array,
+        context_tn: Array | None,
         caches: list[TransformerBlockCache],
         key: PRNGKeyArray,
     ) -> tuple[Array, list[TransformerBlockCache], PRNGKeyArray]:
-        logits_tv, caches = model.forward(tokens_t, caches=caches)
+        logits_tv, caches = model.forward(tokens_t, context_tn=context_tn, caches=caches)
         logits_1v = logits_tv[..., -1:, :]
         key, subkey = jax.random.split(key)
         next_token_1 = _sample_next_token(logits_1v, temperature, top_p, subkey, num_samples=1)[..., 0]
         return next_token_1, caches, key
 
-    next_token_1, caches, key = step(model, tokens_t, caches, key)
+    next_token_1, caches, key = step(model, tokens_t, context_tn, caches, key)
     next_token_int = int(next_token_1.item())
 
     # Check EOS
@@ -1543,10 +1616,10 @@ def llm_generate_stream(
 
     yield next_token_int
 
-    # Continue generating
+    # Continue generating - context_tn is only used for initial forward pass with caching
     for _ in range(max_new_tokens - 1):
-        # Forward with cache
-        next_token_1, caches, key = step(model, next_token_1, caches, key)
+        # Forward with cache - no context needed since it's already incorporated
+        next_token_1, caches, key = step(model, next_token_1, None, caches, key)
         next_token_int = int(next_token_1.item())
 
         # Check EOS

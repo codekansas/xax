@@ -170,6 +170,7 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
                 prompt_tokens,
                 eos_id,
                 max_new_tokens=64,
+                context_tn=None,
                 temperature=0.8,
                 top_p=0.9,
                 key=gen_key,
