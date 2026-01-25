@@ -70,96 +70,7 @@ class SemanticTTSModel(eqx.Module):
     Audio BPE tokens (learned on Q0 only) use separate learned embeddings/output head.
     """
 
-    llm: xax.LLM  # Base LLM with LoRA
-    audio_embed: eqx.nn.Embedding  # Embeddings for audio BPE tokens
-    audio_head: eqx.nn.Linear  # Output projection for audio BPE tokens
-    audio_bpe_vocab_size: int = eqx.field(static=True)
-    text_vocab_size: int = eqx.field(static=True)
-
-    @staticmethod
-    def build(
-        llm: xax.LLM,
-        audio_bpe_vocab_size: int,
-        audio_bpe_tokenizer: Tokenizer,
-        mimi: xax.MimiModel,
-        key: PRNGKeyArray,
-    ) -> "SemanticTTSModel":
-        """Build semantic TTS model from pretrained LLM.
-
-        Args:
-            llm: Pretrained LLM (can have LoRA applied)
-            audio_bpe_vocab_size: Vocabulary size for audio BPE tokens
-            audio_bpe_tokenizer: Tokenizer for decoding BPE tokens to Q0 codes
-            mimi: Pretrained Mimi model for codebook embeddings
-            key: PRNG key for initialization
-
-        Returns:
-            SemanticTTSModel instance
-        """
-        k1, k2 = jax.random.split(key)
-        embed_dim = llm.config.embed_dim
-
-        # Get Q0 (semantic) codebook embeddings only
-        # Shape: (2048, 256)
-        base_char = 0xE000
-        mimi_codebook_size = xax.MIMI_CODEBOOK_SIZE
-        q0_embeddings = np.array(mimi.quantizer.semantic_rvq.layers[0].embeddings_kd)  # (2048, 256)
-        mimi_embed_dim = q0_embeddings.shape[-1]  # 256
-
-        # Create a projection from Mimi embed_dim (256) to LLM embed_dim (1024)
-        proj_weight = jax.random.normal(k1, (embed_dim, mimi_embed_dim)) * (1.0 / np.sqrt(mimi_embed_dim))
-
-        # Build audio BPE embeddings by averaging projected Q0 codebook embeddings
-        # BPE tokens represent sequences of Q0 codes only
-        audio_embed_weights = np.zeros((audio_bpe_vocab_size, embed_dim), dtype=np.float32)
-
-        for token_id in range(audio_bpe_vocab_size):
-            token_str = audio_bpe_tokenizer.id_to_token(token_id)
-            if token_str is None or len(token_str) == 0:
-                audio_embed_weights[token_id] = np.array(
-                    jax.random.normal(jax.random.fold_in(k2, token_id), (embed_dim,)) * 0.01
-                )
-                continue
-
-            # Decode BPE token to sequence of Q0 codec values
-            embeds_list = []
-            for char in token_str:
-                codec_value = ord(char) - base_char
-                codec_value = max(0, min(codec_value, mimi_codebook_size - 1))
-                # Get Q0 embedding
-                mimi_embed = q0_embeddings[codec_value]  # (256,)
-                embeds_list.append(mimi_embed)
-
-            # Average the Q0 embeddings and project to LLM dimension
-            mean_mimi_embed = np.mean(np.stack(embeds_list, axis=0), axis=0)  # (256,)
-            projected_embed = proj_weight @ mean_mimi_embed  # (embed_dim,)
-            audio_embed_weights[token_id] = projected_embed
-
-        audio_embed = eqx.nn.Embedding(audio_bpe_vocab_size, embed_dim, weight=jnp.array(audio_embed_weights))
-        audio_head = eqx.nn.Linear(embed_dim, audio_bpe_vocab_size, key=k2)
-
-        return SemanticTTSModel(
-            llm=llm,
-            audio_embed=audio_embed,
-            audio_head=audio_head,
-            audio_bpe_vocab_size=audio_bpe_vocab_size,
-            text_vocab_size=llm.config.vocab_size,
-        )
-
-    def forward_with_hidden(self, tokens_s: Array) -> tuple[Array, Array]:
-        """Forward pass returning both logits and pre-logit hidden states.
-
-        Args:
-            tokens_s: Token IDs, shape (seq_len,)
-
-        Returns:
-            Tuple of (logits_sv, hidden_sd) where:
-            - logits_sv: Output logits, shape (seq_len, vocab_size)
-            - hidden_sd: Hidden states before logits head, shape (seq_len, embed_dim)
-        """
-        hidden_sd = self.llm.forward_hidden(tokens_s)
-        logits_sv = self.llm.get_logits(hidden_sd)
-        return logits_sv, hidden_sd
+    llm: xax.LLM
 
     def generate_audio(
         self,
@@ -207,6 +118,7 @@ class ResidualModel(eqx.Module):
 
     hidden_proj: eqx.nn.Linear
     layer_llms: tuple[xax.LLM, ...]
+    codebook_embeddings: tuple[eqx.nn.Embedding, ...]
 
     @staticmethod
     def build(
@@ -248,16 +160,23 @@ class ResidualModel(eqx.Module):
             mlp_hidden_dim=mlp_dim,
         )
 
-        # Build 7 LLMs for Q1-Q7
+        # Build 8 LLMs for Q0-Q7
         layer_llms = []
-        for _ in range(1, NUM_QUANTIZERS):
+        codebook_embeddings = []
+        for idx in range(NUM_QUANTIZERS):
             key, layer_key = jax.random.split(key)
             llm = xax.LLM.build(llm_config, key=layer_key)
             layer_llms.append(llm)
 
+            if idx < NUM_QUANTIZERS - 1:
+                key, emb_key = jax.random.split(key)
+                emb = eqx.nn.Embedding(AUDIO_VOCAB_SIZE, embed_dim, key=emb_key)
+                codebook_embeddings.append(emb)
+
         return ResidualModel(
             hidden_proj=hidden_proj,
             layer_llms=tuple(layer_llms),
+            codebook_embeddings=tuple(codebook_embeddings),
         )
 
     def compute_loss(
@@ -280,14 +199,20 @@ class ResidualModel(eqx.Module):
         # Common mask for all layers.
         mask_t = audio_codes_ft[0, 1:] != AUDIO_PAD_TOKEN_ID
 
-        # Project LLM context vectors.
+        # First-layer embeddings.
         x_td = jax.vmap(self.hidden_proj)(stretched_hidden_td[:-1])
+        x_td = self.layer_llms[0].forward_hidden(audio_codes_ft[0, :-1], context_tn=x_td)
 
         losses = []
         accuracies = []
 
         for layer_idx in range(1, NUM_QUANTIZERS):
-            llm = self.layer_llms[layer_idx - 1]
+            llm = self.layer_llms[layer_idx]
+
+            # Adds the previous layer's token embeddings.
+            emb = self.codebook_embeddings[layer_idx - 1]
+            emb_td = jax.vmap(emb)(audio_codes_ft[layer_idx - 1, 1:])
+            x_td = x_td + emb_td
 
             tokens_t = audio_codes_ft[layer_idx, :-1]
             targets_t = audio_codes_ft[layer_idx, 1:]
@@ -310,14 +235,19 @@ class ResidualModel(eqx.Module):
         key: PRNGKeyArray,
     ) -> Array:
         all_codes = [q0_codes_t[:-1]]
+        start_t = jnp.array([AUDIO_BOS_TOKEN_ID])
 
         # Project LLM context vectors.
         x_td = jax.vmap(self.hidden_proj)(stretched_hidden_td[:-1])
-
-        start_t = jnp.array([AUDIO_BOS_TOKEN_ID])
+        x_td = self.layer_llms[0].forward_hidden(jnp.concatenate([start_t, q0_codes_t[:-2]]), x_td)
 
         for layer_idx in range(1, NUM_QUANTIZERS):
-            llm = self.layer_llms[layer_idx - 1]
+            llm = self.layer_llms[layer_idx]
+
+            # Adds the previous layer's token embeddings.
+            emb = self.codebook_embeddings[layer_idx - 1]
+            emb_td = jax.vmap(emb)(all_codes[-1])
+            x_td = x_td + emb_td
 
             key, layer_key = jax.random.split(key)
             pred_tokens_t, _ = xax.llm_generate_jit(
@@ -334,7 +264,7 @@ class ResidualModel(eqx.Module):
 
             # Gets the next hidden embeddings.
             input_tokens_t = jnp.concatenate([start_t, pred_tokens_t[:-1]])
-            x_td = llm.forward_hidden(input_tokens_t, x_td)
+            x_td = llm.forward_hidden(input_tokens_t, context_tn=x_td)
 
         return jnp.stack(all_codes, axis=0)
 
@@ -354,19 +284,16 @@ class FullTTSModel(eqx.Module):
     @staticmethod
     def build(
         llm: xax.LLM,
-        audio_bpe_tokenizer: Tokenizer,
         whisper_eos_token_id: int,
         key: PRNGKeyArray,
     ) -> "FullTTSModel":
-        k1, k2 = jax.random.split(key)
-        audio_bpe_vocab_size = audio_bpe_tokenizer.get_vocab_size()
         mimi = xax.build_pretrained_mimi()
 
         # Build Stage 1: Semantic model
-        semantic = SemanticTTSModel.build(llm, audio_bpe_vocab_size, audio_bpe_tokenizer, mimi, k1)
+        semantic = SemanticTTSModel(llm)
 
         # Build Stage 2: Residual model
-        residual = ResidualModel.build(llm.config.embed_dim, key=k2)
+        residual = ResidualModel.build(llm.config.embed_dim, key=key)
 
         whisper_model = xax.build_pretrained_whisper()
         whisper_transcriber = xax.WhisperTranscriber(
@@ -481,17 +408,17 @@ def stretch_hidden_states(
 
 @dataclass
 class Config(xax.SupervisedConfig):
-    # Model settings
+    # Model settings.
     llm_repo: xax.LLMRepo = xax.field(xax.LLMRepo.QWEN3_600M, help="Pretrained model")
     num_quantizers: int = xax.field(NUM_QUANTIZERS, help="Number of quantizers (8)")
 
-    # LoRA settings
-    lora_rank: int = xax.field(32, help="Rank of LoRA decomposition")
-    lora_alpha: float = xax.field(32.0, help="LoRA alpha parameter")
+    # LoRA settings.
+    lora_rank: int = xax.field(16, help="Rank of LoRA decomposition")
+    lora_alpha: float = xax.field(16.0, help="LoRA alpha parameter")
     lora_dropout: float = xax.field(0.0, help="Dropout rate for LoRA layers")
     lora_targets: tuple[str, ...] | None = xax.field(DEFAULT_LORA_TARGETS, help="Layer suffixes for LoRA")
 
-    # Training settings
+    # Training settings.
     learning_rate: float = xax.field(3e-4, help="Peak learning rate")
     warmup_steps: int = xax.field(100, help="Number of warmup steps")
     audio_bpe_vocab_size: int = xax.field(151_669, help="Vocabulary size for audio BPE tokenizer")
@@ -657,7 +584,6 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         key, mimi_key = jax.random.split(key)
         model = FullTTSModel.build(
             llm=llm,
-            audio_bpe_tokenizer=self.audio_bpe_tokenizer,
             whisper_eos_token_id=self.whisper_config.eos_token_id,
             key=mimi_key,
         )
@@ -674,17 +600,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         extra_embed_spec = jax.tree.map(lambda _: True, llm_spec.extra_embed)
         llm_spec = eqx.tree_at(lambda m: m.extra_embed, llm_spec, extra_embed_spec)
 
-        # Audio embeddings and head: trainable
-        audio_embed_spec = jax.tree.map(lambda _: True, model.semantic.audio_embed)
-        audio_head_spec = jax.tree.map(lambda _: True, model.semantic.audio_head)
-
-        semantic_spec = SemanticTTSModel(
-            llm=llm_spec,
-            audio_embed=audio_embed_spec,
-            audio_head=audio_head_spec,
-            audio_bpe_vocab_size=model.semantic.audio_bpe_vocab_size,
-            text_vocab_size=model.semantic.text_vocab_size,
-        )
+        semantic_spec = SemanticTTSModel(llm=llm_spec)
 
         # Stage 2: Residual model - all trainable except frozen Mimi codebook embeddings
         residual_spec = jax.tree.map(lambda x: eqx.is_inexact_array(x), model.residual)
