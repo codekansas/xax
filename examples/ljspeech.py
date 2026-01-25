@@ -163,15 +163,15 @@ class ResidualModel(eqx.Module):
         # Build 8 LLMs for Q0-Q7
         layer_llms = []
         codebook_embeddings = []
-        for idx in range(NUM_QUANTIZERS):
+        for _ in range(1, NUM_QUANTIZERS):
             key, layer_key = jax.random.split(key)
             llm = xax.LLM.build(llm_config, key=layer_key)
             layer_llms.append(llm)
 
-            if idx < NUM_QUANTIZERS - 1:
-                key, emb_key = jax.random.split(key)
-                emb = eqx.nn.Embedding(AUDIO_VOCAB_SIZE, embed_dim, key=emb_key)
-                codebook_embeddings.append(emb)
+            key, emb_key = jax.random.split(key)
+            weight = jax.random.normal(emb_key, (AUDIO_VOCAB_SIZE, embed_dim)) * 0.02
+            emb = eqx.nn.Embedding(AUDIO_VOCAB_SIZE, embed_dim, weight=weight)
+            codebook_embeddings.append(emb)
 
         return ResidualModel(
             hidden_proj=hidden_proj,
@@ -201,13 +201,12 @@ class ResidualModel(eqx.Module):
 
         # First-layer embeddings.
         x_td = jax.vmap(self.hidden_proj)(stretched_hidden_td[:-1])
-        x_td = self.layer_llms[0].forward_hidden(audio_codes_ft[0, :-1], context_tn=x_td)
 
         losses = []
         accuracies = []
 
         for layer_idx in range(1, NUM_QUANTIZERS):
-            llm = self.layer_llms[layer_idx]
+            llm = self.layer_llms[layer_idx - 1]
 
             # Adds the previous layer's token embeddings.
             emb = self.codebook_embeddings[layer_idx - 1]
@@ -217,7 +216,7 @@ class ResidualModel(eqx.Module):
             tokens_t = audio_codes_ft[layer_idx, :-1]
             targets_t = audio_codes_ft[layer_idx, 1:]
 
-            loss, accuracy, x_td = llm.get_loss_and_accuracy(tokens_t, targets_t, context_tn=x_td, mask_t=mask_t)
+            loss, accuracy, _ = llm.get_loss_and_accuracy(tokens_t, targets_t, context_tn=x_td, mask_t=mask_t)
             losses.append(loss)
             accuracies.append(accuracy)
 
@@ -239,10 +238,9 @@ class ResidualModel(eqx.Module):
 
         # Project LLM context vectors.
         x_td = jax.vmap(self.hidden_proj)(stretched_hidden_td[:-1])
-        x_td = self.layer_llms[0].forward_hidden(jnp.concatenate([start_t, q0_codes_t[:-2]]), x_td)
 
         for layer_idx in range(1, NUM_QUANTIZERS):
-            llm = self.layer_llms[layer_idx]
+            llm = self.layer_llms[layer_idx - 1]
 
             # Adds the previous layer's token embeddings.
             emb = self.codebook_embeddings[layer_idx - 1]
@@ -261,10 +259,6 @@ class ResidualModel(eqx.Module):
                 key=layer_key,
             )
             all_codes.append(pred_tokens_t)
-
-            # Gets the next hidden embeddings.
-            input_tokens_t = jnp.concatenate([start_t, pred_tokens_t[:-1]])
-            x_td = llm.forward_hidden(input_tokens_t, context_tn=x_td)
 
         return jnp.stack(all_codes, axis=0)
 
