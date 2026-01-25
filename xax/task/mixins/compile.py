@@ -51,7 +51,7 @@ class CompileOptions:
 
     # JAX logging options
     logging_level: str = field(
-        value="INFO",
+        value="WARNING",
         help="JAX logging verbosity level",
     )
 

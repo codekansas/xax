@@ -85,16 +85,10 @@ class SupervisedMixin(
         """
         raise NotImplementedError("`compute_loss` must be implemented by the subclass")
 
-    def decode_tokens(self, tokens: Array | np.ndarray) -> str:
-        raise NotImplementedError(
-            "When using a Tokens metric you must implement the `decode_tokens` method "
-            "to convert to a string which can be logged."
-        )
-
     def log_step(self, metrics: FrozenDict[str, Metric], state: State, heavy: bool) -> None:
         for k, v in metrics.items():
             try:
-                self.logger.log_metric(k, v, decode_tokens=self.decode_tokens)
+                self.logger.log_metric(k, v)
             except Exception as e:
                 raise ValueError(f"Error logging metric {k}") from e
         self.log_state_timers(state)

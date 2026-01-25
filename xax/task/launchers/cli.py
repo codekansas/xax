@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Literal, get_args
 
 from xax.task.base import RawConfigType
 from xax.task.launchers.base import BaseLauncher
+from xax.task.launchers.dataset import DatasetLauncher
 from xax.task.launchers.multi_cpu import MultiCpuLauncher
 from xax.task.launchers.multi_device import MultiDeviceLauncher
 from xax.task.launchers.single_device import SingleDeviceLauncher
@@ -14,7 +15,7 @@ if TYPE_CHECKING:
     from xax.task.mixins.runnable import Config, RunnableMixin
 
 
-LauncherChoice = Literal["single", "multi", "multi_cpu"]
+LauncherChoice = Literal["single", "s", "multi", "m", "multi_cpu", "mc", "dataset", "d"]
 
 
 class CliLauncher(BaseLauncher):
@@ -38,11 +39,17 @@ class CliLauncher(BaseLauncher):
         use_cli_next: bool | list[str] = False if not use_cli else cli_args_rest
 
         match launcher_choice:
-            case "single":
+            case "single" | "s":
                 SingleDeviceLauncher().launch(task, *cfgs, use_cli=use_cli_next)
-            case "multi":
+            case "multi" | "m":
                 MultiDeviceLauncher().launch(task, *cfgs, use_cli=use_cli_next)
-            case "multi_cpu":
+            case "multi_cpu" | "mc":
                 MultiCpuLauncher().launch(task, *cfgs, use_cli=use_cli_next)
+            case "dataset" | "d":
+                from xax.task.mixins.data_loader import DataloadersMixin  # noqa: PLC0415
+
+                if not issubclass(task, DataloadersMixin):
+                    raise ValueError("The task must be a subclass of DataloadersMixin to use the dataset launcher.")
+                DatasetLauncher().launch(task, *cfgs, use_cli=use_cli_next)
             case _:
                 raise ValueError(f"Invalid launcher choice: {launcher_choice}")

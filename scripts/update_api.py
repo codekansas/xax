@@ -20,24 +20,47 @@ def main() -> None:
 
     os.environ["XAX_IMPORT_ALL"] = "1"
 
-    import xax
+    import xax  # noqa: PLC0415
+
+    def resolve_module_name(attr_name: str, obj: object) -> str | None:
+        if inspect.ismodule(obj):
+            return obj.__name__
+        if inspect.isfunction(obj) or inspect.ismethod(obj) or inspect.isclass(obj):
+            return inspect.unwrap(obj).__module__
+        module_name = getattr(obj, "__module__", None)
+        if isinstance(module_name, str) and module_name.startswith("xax."):
+            return module_name
+        for name, module in sys.modules.items():
+            if not name.startswith("xax."):
+                continue
+            if getattr(module, attr_name, object()) is obj:
+                return name
+        return None
 
     location_map = {}
     for mod in dir(xax):
         if mod.startswith("_"):
             continue
+        obj = getattr(xax, mod)
+        module_name = resolve_module_name(mod, obj)
+        if module_name is not None:
+            if module_name == "xax":
+                continue
+            if module_name.startswith("xax."):
+                location_map[mod] = module_name[len("xax.") :]
+                continue
         try:
-            location = Path(inspect.getfile(getattr(xax, mod)))
-            if location.name == "__init__.py":
-                continue
-            try:
-                relative_path = location.relative_to(root_dir)
-                import_line = ".".join(relative_path.parts)
-                assert import_line.endswith(".py")
-                import_line = import_line[: -len(".py")]
-                location_map[mod] = import_line
-            except Exception:
-                continue
+            location = Path(inspect.getfile(obj))
+        except Exception:
+            continue
+        if location.name == "__init__.py":
+            continue
+        try:
+            relative_path = location.relative_to(root_dir)
+            import_line = ".".join(relative_path.parts)
+            assert import_line.endswith(".py")
+            import_line = import_line[: -len(".py")]
+            location_map[mod] = import_line
         except Exception:
             continue
 
