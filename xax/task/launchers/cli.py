@@ -9,13 +9,14 @@ from xax.task.launchers.base import BaseLauncher
 from xax.task.launchers.dataset import DatasetLauncher
 from xax.task.launchers.multi_cpu import MultiCpuLauncher
 from xax.task.launchers.multi_device import MultiDeviceLauncher
+from xax.task.launchers.queued import QueuedLauncher
 from xax.task.launchers.single_device import SingleDeviceLauncher
 
 if TYPE_CHECKING:
     from xax.task.mixins.runnable import Config, RunnableMixin
 
 
-LauncherChoice = Literal["single", "s", "multi", "m", "multi_cpu", "mc", "dataset", "d"]
+LauncherChoice = Literal["single", "s", "multi", "m", "multi_cpu", "mc", "dataset", "d", "queued", "q"]
 
 
 class CliLauncher(BaseLauncher):
@@ -51,5 +52,7 @@ class CliLauncher(BaseLauncher):
                 if not issubclass(task, DataloadersMixin):
                     raise ValueError("The task must be a subclass of DataloadersMixin to use the dataset launcher.")
                 DatasetLauncher().launch(task, *cfgs, use_cli=use_cli_next)
+            case "queued" | "q":
+                QueuedLauncher().launch(task, *cfgs, use_cli=use_cli_next)
             case _:
                 raise ValueError(f"Invalid launcher choice: {launcher_choice}")

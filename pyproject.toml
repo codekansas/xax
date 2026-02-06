@@ -42,6 +42,10 @@ dependencies = [
 
 Repository = "https://github.com/codekansas/xax"
 
+[project.scripts]
+
+xax = "xax.cli.main:main"
+
 [project.optional-dependencies]
 
 dev = [
@@ -103,7 +107,18 @@ include = ["xax*"]
 
 [tool.setuptools.package-data]
 
-xax = ["*.py", "*.txt", "py.typed"]
+xax = [
+    "*.py",
+    "*.txt",
+    "py.typed",
+    "agents/**/*.md",
+    "agents/**/*.txt",
+    "agents/**/*.json",
+    "agents/**/*.yaml",
+    "agents/**/*.yml",
+    "agents/**/*.csv",
+    "agents/**/*.py",
+]
 
 [tool.setuptools.dynamic]
 

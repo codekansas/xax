@@ -15,10 +15,10 @@ from xax.task.mixins.checkpointing import load_ckpt
 from xax.utils.text import colored, show_info
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(prog="xax edit-config")
     parser.add_argument("ckpt_path", type=Path)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # Loads the config from the checkpoint.
     config = load_ckpt(args.ckpt_path, part="config")

@@ -89,7 +89,9 @@ class Experiment:
 
 @dataclass(kw_only=True)
 class Directories:
-    run: str = field(II("oc.env:RUN_DIR"), help="The run directory")
+    runs: str = field(II("oc.env:RUNS_DIR"), help="Directory containing all training runs")
+    run: str = field(II("oc.env:RUN_DIR"), help="Deprecated alias for `directories.runs`")
+    experiments: str = field(II("oc.env:EXPERIMENTS_DIR"), help="Directory containing experiment-monitor sessions")
     data: str = field(II("oc.env:DATA_DIR"), help="The data directory")
     pretrained_models: str = field(II("oc.env:MODEL_DIR"), help="The models directory")
 
@@ -115,18 +117,41 @@ class UserConfig:
 
 
 def user_config_path() -> Path:
-    xaxrc_path_raw = os.environ.get("XAXRC_PATH", "~/.xax.yml")
-    xaxrc_path = Path(xaxrc_path_raw).expanduser()
-    return xaxrc_path
+    if (xaxrc_path_raw := os.environ.get("XAXRC_PATH")) is not None:
+        xaxrc_path = Path(xaxrc_path_raw).expanduser()
+        if xaxrc_path.suffix in (".yml", ".yaml"):
+            return xaxrc_path
+        return xaxrc_path / "config.yml"
+    return get_user_global_dir() / "config.yml"
+
+
+def legacy_user_config_path() -> Path:
+    return Path("~/.xax.yml").expanduser()
+
+
+def get_user_global_dir() -> Path:
+    if (xax_home_raw := os.environ.get("XAX_HOME")) is not None:
+        return Path(xax_home_raw).expanduser()
+    if (xaxrc_path_raw := os.environ.get("XAXRC_PATH")) is not None:
+        xaxrc_path = Path(xaxrc_path_raw).expanduser()
+        if xaxrc_path.suffix in (".yml", ".yaml"):
+            return xaxrc_path.parent
+        return xaxrc_path
+    return Path("~/.xax").expanduser()
 
 
 @functools.lru_cache(maxsize=None)
 def _load_user_config_cached() -> UserConfig:
     xaxrc_path = user_config_path()
+    xaxrc_path.parent.mkdir(parents=True, exist_ok=True)
     base_cfg = OmegaConf.structured(UserConfig)
 
     # Writes the config file.
     if xaxrc_path.exists():
+        cfg = OmegaConf.merge(base_cfg, OmegaConf.load(xaxrc_path))
+    elif "XAXRC_PATH" not in os.environ and (legacy_path := legacy_user_config_path()).exists():
+        show_error(f"Migrating legacy config from {legacy_path} to {xaxrc_path}", important=True)
+        legacy_path.replace(xaxrc_path)
         cfg = OmegaConf.merge(base_cfg, OmegaConf.load(xaxrc_path))
     else:
         show_error(f"No config file was found in {xaxrc_path}; writing one...", important=True)
@@ -142,7 +167,7 @@ def _load_user_config_cached() -> UserConfig:
 
 
 def load_user_config() -> UserConfig:
-    """Loads the ``~/.xax.yml`` configuration file.
+    """Loads the user configuration file (default: ``~/.xax/config.yml``).
 
     Returns:
         The loaded configuration.
@@ -150,12 +175,28 @@ def load_user_config() -> UserConfig:
     return _load_user_config_cached()
 
 
-def get_run_dir() -> Path | None:
+def get_runs_dir() -> Path | None:
     config = load_user_config().directories
+    if not is_missing(config, "runs"):
+        (runs_dir := Path(config.runs)).mkdir(parents=True, exist_ok=True)
+        return runs_dir
     if is_missing(config, "run"):
         return None
     (run_dir := Path(config.run)).mkdir(parents=True, exist_ok=True)
     return run_dir
+
+
+def get_run_dir() -> Path | None:
+    """Deprecated alias for `get_runs_dir`."""
+    return get_runs_dir()
+
+
+def get_experiments_dir() -> Path | None:
+    config = load_user_config().directories
+    if is_missing(config, "experiments"):
+        return None
+    (experiments_dir := Path(config.experiments)).mkdir(parents=True, exist_ok=True)
+    return experiments_dir
 
 
 def get_data_dir() -> Path:

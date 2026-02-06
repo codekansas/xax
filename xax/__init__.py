@@ -83,8 +83,10 @@ __all__ = [
     "UserConfig",
     "field",
     "get_data_dir",
+    "get_experiments_dir",
     "get_pretrained_models_dir",
     "get_run_dir",
+    "get_runs_dir",
     "load_user_config",
     "State",
     "StepKind",
@@ -146,6 +148,7 @@ __all__ = [
     "CliLauncher",
     "MultiCpuLauncher",
     "MultiDeviceLauncher",
+    "QueuedLauncher",
     "SingleDeviceLauncher",
     "Audio",
     "Distribution",
@@ -370,8 +373,10 @@ NAME_MAP: dict[str, str] = {
     "UserConfig": "core.conf",
     "field": "core.conf",
     "get_data_dir": "core.conf",
+    "get_experiments_dir": "core.conf",
     "get_pretrained_models_dir": "core.conf",
     "get_run_dir": "core.conf",
+    "get_runs_dir": "core.conf",
     "load_user_config": "core.conf",
     "State": "core.state",
     "StepKind": "core.state",
@@ -433,6 +438,7 @@ NAME_MAP: dict[str, str] = {
     "CliLauncher": "task.launchers.cli",
     "MultiCpuLauncher": "task.launchers.multi_cpu",
     "MultiDeviceLauncher": "task.launchers.multi_device",
+    "QueuedLauncher": "task.launchers.queued",
     "SingleDeviceLauncher": "task.launchers.single_device",
     "Audio": "task.logger",
     "Distribution": "task.logger",
@@ -648,8 +654,10 @@ if IMPORT_ALL or TYPE_CHECKING:
         UserConfig,
         field,
         get_data_dir,
+        get_experiments_dir,
         get_pretrained_models_dir,
         get_run_dir,
+        get_runs_dir,
         load_user_config,
     )
     from xax.core.state import Batch, Output, State, StepKind, cast_step_kind
@@ -707,6 +715,7 @@ if IMPORT_ALL or TYPE_CHECKING:
     from xax.task.launchers.cli import CliLauncher
     from xax.task.launchers.multi_cpu import MultiCpuLauncher
     from xax.task.launchers.multi_device import MultiDeviceLauncher
+    from xax.task.launchers.queued import QueuedLauncher
     from xax.task.launchers.single_device import SingleDeviceLauncher
     from xax.task.logger import (
         Audio,
