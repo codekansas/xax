@@ -3,6 +3,7 @@
 import atexit
 import logging
 import os
+import random
 import re
 import subprocess
 import threading
@@ -63,6 +64,7 @@ class TensorboardLogger(LoggerImpl):
         self.files: dict[str, str] = {}
         self.writers = TensorboardWriters(log_directory=self.log_directory, flush_seconds=flush_seconds)
         self._started = False
+        self._thread: threading.Thread | None = None
 
         # For making log messages independent.
         self.error_step = 0
@@ -75,7 +77,9 @@ class TensorboardLogger(LoggerImpl):
             return
 
         if is_master():
-            threading.Thread(target=self.worker_thread, daemon=True).start()
+            atexit.register(self.cleanup)
+            self._thread = threading.Thread(target=self.worker_thread, daemon=True)
+            self._thread.start()
 
         self._started = True
 
@@ -86,10 +90,18 @@ class TensorboardLogger(LoggerImpl):
         time.sleep(self.wait_seconds)
 
         port = int(os.environ.get("TENSORBOARD_PORT", DEFAULT_TENSORBOARD_PORT))
+        change_ports = bool(int(os.environ.get("TENSORBOARD_CHANGE_PORT", "1")))
+
+        rng = random.Random(42)
 
         while port_is_busy(port):
-            logger.warning("Port %s is busy, waiting...", port)
-            time.sleep(10)
+            if change_ports:
+                new_port = rng.randint(6000, 9000)
+                logger.warning("Port %s is busy, checking port %d...", port, new_port)
+                port = new_port
+            else:
+                logger.warning("Port %s is busy, waiting...", port)
+                time.sleep(10)
 
         def make_localhost(s: str) -> str:
             if self.use_localhost:
@@ -151,13 +163,14 @@ class TensorboardLogger(LoggerImpl):
                 line_str = "".join(lines)
                 raise RuntimeError(f"Tensorboard failed to start:\n{line_str}")
 
-            atexit.register(self.cleanup)
-
     def cleanup(self) -> None:
         if self.proc is not None:
             self.proc.terminate()
             self.proc.wait()
             self.proc = None
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
 
     def __del__(self) -> None:
         self.cleanup()

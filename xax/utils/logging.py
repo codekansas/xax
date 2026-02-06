@@ -7,7 +7,6 @@ import sys
 from typing import Any
 
 from jaxtyping import Array
-from omegaconf import OmegaConf
 
 from xax.core.conf import load_user_config
 from xax.utils.jax import to_scalar
@@ -195,7 +194,10 @@ def configure_logging(
     root_logger.addHandler(stream_handler)
 
     if debug is None:
-        root_logger.setLevel(logging._nameToLevel[config.log_level])
+        configured_level = str(config.log_level).upper()
+        if configured_level not in logging._nameToLevel:
+            raise ValueError(f"Invalid log level {config.log_level!r}")
+        root_logger.setLevel(logging._nameToLevel[configured_level])
     else:
         root_logger.setLevel(logging.DEBUG if debug else logging.INFO)
 
@@ -232,9 +234,6 @@ def get_unused_port(default: int | None = None) -> int:
     sock = socket.socket()
     sock.bind(("", 0))
     return sock.getsockname()[1]
-
-
-OmegaConf.register_new_resolver("xax.unused_port", get_unused_port, replace=True)
 
 
 def port_is_busy(port: int) -> int:

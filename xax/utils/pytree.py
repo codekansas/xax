@@ -57,7 +57,7 @@ def flatten_pytree(pytree: PyTree, flatten_size: int) -> PyTree:
 def pytree_has_nans(pytree: PyTree) -> Array:
     """Check if a pytree has any NaNs."""
     has_nans = jax.tree_util.tree_reduce(
-        lambda a, b: jnp.logical_or(a, b),
+        jnp.logical_or,
         jax.tree.map(lambda x: jnp.any(jnp.isnan(x)), pytree),
     )
     return has_nans
