@@ -194,7 +194,10 @@ def configure_logging(
     root_logger.addHandler(stream_handler)
 
     if debug is None:
-        root_logger.setLevel(logging._nameToLevel[config.log_level])
+        configured_level = str(config.log_level).upper()
+        if configured_level not in logging._nameToLevel:
+            raise ValueError(f"Invalid log level {config.log_level!r}")
+        root_logger.setLevel(logging._nameToLevel[configured_level])
     else:
         root_logger.setLevel(logging.DEBUG if debug else logging.INFO)
 

@@ -27,6 +27,7 @@ from xax.utils.structured_config import (
     load_yaml,
     parse_override_token,
     render_dataclass_help,
+    resolve_interpolations,
     to_primitive,
     to_yaml_text,
 )
@@ -250,6 +251,7 @@ class BaseTask(Generic[Config]):
                 key, value = parse_override_token(override_token)
                 apply_dotted_override(cfg_payload, key, value)
 
+        cfg_payload = resolve_interpolations(cfg_payload)
         config = dataclass_from_mapping(config_class, cfg_payload)
         if missing_paths := _missing_field_paths(config):
             missing_list = ", ".join(missing_paths)

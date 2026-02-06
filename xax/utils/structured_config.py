@@ -2,9 +2,11 @@
 
 import dataclasses
 import enum
+import os
+import re
 from pathlib import Path
 from types import UnionType
-from typing import Any, TypeGuard, TypeVar, Union, cast, get_args, get_origin
+from typing import Any, Literal, TypeGuard, TypeVar, Union, cast, get_args, get_origin
 
 import yaml
 
@@ -75,6 +77,111 @@ def deep_merge(base: object, override: object) -> object:
     return override
 
 
+_INTERPOLATION_RE = re.compile(r"\$\{([^{}]+)\}")
+
+
+def _lookup_path(payload: object, path_parts: tuple[str, ...]) -> object:
+    cursor = payload
+    for part in path_parts:
+        if isinstance(cursor, dict):
+            cursor_dict = {str(key): item for key, item in cursor.items()}
+            if part not in cursor_dict:
+                raise KeyError(f"Unknown interpolation key: {'.'.join(path_parts)}")
+            cursor = cursor_dict[part]
+            continue
+        if isinstance(cursor, list):
+            if not part.isdigit():
+                raise KeyError(f"Interpolation index must be an integer: {part!r}")
+            item_idx = int(part)
+            if item_idx < 0 or item_idx >= len(cursor):
+                raise KeyError(f"Interpolation index out of range: {item_idx}")
+            cursor = cursor[item_idx]
+            continue
+        raise KeyError(f"Cannot interpolate into value of type {type(cursor)!r}")
+    return cursor
+
+
+def resolve_interpolations(payload: dict[str, object]) -> dict[str, object]:
+    """Resolves OmegaConf-like interpolations in a payload.
+
+    Supported forms:
+    - ``${oc.env:VAR}``
+    - ``${oc.env:VAR,default}``
+    - ``${foo.bar}`` (dotted lookup in the same merged payload)
+    """
+    root_payload: dict[str, object] = {str(key): value for key, value in payload.items()}
+    cache: dict[tuple[str, ...], object] = {}
+    resolving: set[tuple[str, ...]] = set()
+
+    def resolve_path(path_parts: tuple[str, ...]) -> object:
+        if path_parts in cache:
+            return cache[path_parts]
+        if path_parts in resolving:
+            path_str = ".".join(path_parts)
+            raise ValueError(f"Circular interpolation detected at {path_str!r}")
+
+        resolving.add(path_parts)
+        raw_value = _lookup_path(root_payload, path_parts)
+        resolved_value = resolve_value(raw_value, path_parts)
+        cache[path_parts] = resolved_value
+        resolving.remove(path_parts)
+        return resolved_value
+
+    def resolve_expr(expr: str, current_path: tuple[str, ...]) -> object:
+        expr = expr.strip()
+        if expr.startswith("oc.env:"):
+            payload_expr = expr.removeprefix("oc.env:").strip()
+            env_name, env_default = payload_expr.split(",", maxsplit=1) if "," in payload_expr else (payload_expr, None)
+            env_name = env_name.strip()
+            if not env_name:
+                raise ValueError("Environment interpolation must specify a variable name")
+            env_value = os.environ.get(env_name)
+            if env_value is not None:
+                return env_value
+            if env_default is None:
+                raise KeyError(f"Missing required environment variable: {env_name}")
+            default_value = yaml.safe_load(env_default.strip())
+            return resolve_value(default_value, current_path)
+
+        ref_parts = tuple(part.strip() for part in expr.split(".") if part.strip())
+        if not ref_parts:
+            raise ValueError(f"Invalid interpolation expression: {expr!r}")
+        return resolve_path(ref_parts)
+
+    def resolve_string(value: str, current_path: tuple[str, ...]) -> object:
+        matches = list(_INTERPOLATION_RE.finditer(value))
+        if not matches:
+            return value
+
+        # Preserve non-string referenced values when the entire field is one interpolation token.
+        if len(matches) == 1 and matches[0].span() == (0, len(value)):
+            return resolve_expr(matches[0].group(1), current_path)
+
+        resolved_parts: list[str] = []
+        cursor = 0
+        for match in matches:
+            resolved_parts.append(value[cursor : match.start()])
+            replacement = resolve_expr(match.group(1), current_path)
+            resolved_parts.append(str(replacement))
+            cursor = match.end()
+        resolved_parts.append(value[cursor:])
+        return "".join(resolved_parts)
+
+    def resolve_value(value: object, current_path: tuple[str, ...]) -> object:
+        if isinstance(value, dict):
+            return {str(key): resolve_value(item, current_path + (str(key),)) for key, item in value.items()}
+        if isinstance(value, list):
+            return [resolve_value(item, current_path + (str(item_idx),)) for item_idx, item in enumerate(value)]
+        if isinstance(value, str):
+            return resolve_string(value, current_path)
+        return value
+
+    resolved = resolve_value(root_payload, ())
+    if not isinstance(resolved, dict):
+        raise TypeError(f"Expected resolved payload to be a mapping, got {type(resolved)!r}")
+    return {str(key): value for key, value in resolved.items()}
+
+
 def _coerce_bool(value: object) -> bool:
     if isinstance(value, bool):
         return value
@@ -114,6 +221,18 @@ def coerce_value(value: object, annotation: object) -> object:
             except Exception:
                 continue
         raise TypeError(f"Value {value!r} does not match union type {annotation!r}")
+    if origin is Literal:
+        options = get_args(annotation)
+        for option in options:
+            if value == option:
+                return option
+            try:
+                coerced = coerce_value(value, type(option))
+            except Exception:
+                continue
+            if coerced == option:
+                return option
+        raise TypeError(f"Value {value!r} does not match literal options {options!r}")
 
     if origin is list:
         if not isinstance(value, list):
@@ -261,6 +380,7 @@ def merge_config_sources(
         if not isinstance(merged, dict):
             raise TypeError(f"Expected merged payload to be a mapping, got {type(merged)!r}")
         merged_payload = {str(key): item for key, item in merged.items()}
+    merged_payload = resolve_interpolations(merged_payload)
     return dataclass_from_mapping(config_type, merged_payload)
 
 
@@ -276,6 +396,8 @@ def _annotation_to_name(annotation: object) -> str:
     origin = get_origin(annotation)
     if origin in (Union, UnionType):
         return " | ".join(_annotation_to_name(option) for option in get_args(annotation))
+    if origin is Literal:
+        return f"Literal[{', '.join(repr(option) for option in get_args(annotation))}]"
     if origin is list:
         (item_type,) = get_args(annotation)
         return f"list[{_annotation_to_name(item_type)}]"
