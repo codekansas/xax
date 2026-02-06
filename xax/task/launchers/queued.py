@@ -1,25 +1,34 @@
-"""Defines a launcher that queues jobs for a local observer process."""
+"""Defines a launcher that queues jobs for the queue observer process."""
 
-import argparse
 import inspect
 import shutil
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast, get_args
-
-from omegaconf import OmegaConf
+from typing import TYPE_CHECKING, Literal, get_args
 
 from xax.task.base import RawConfigType
 from xax.task.launchers.base import BaseLauncher
 from xax.task.launchers.queue_state import enqueue_job, is_observer_active
+from xax.utils.cli_args import ARGPARSE_DEST_METADATA_KEY, parse_known_args_as
 from xax.utils.experiments import stage_environment
 from xax.utils.logging import LOG_STATUS, configure_logging
+from xax.utils.structured_config import save_yaml
 
 if TYPE_CHECKING:
     from xax.task.mixins.runnable import Config, RunnableMixin
 
 
 QueuedTargetLauncher = Literal["single", "s", "multi", "m", "multi_cpu", "mc", "dataset", "d"]
+
+
+@dataclass(frozen=True)
+class QueuedCliArgs:
+    queued_launcher: QueuedTargetLauncher = field(
+        default="multi",
+        metadata={ARGPARSE_DEST_METADATA_KEY: "queued_launcher"},
+    )
+    queue_position: int | None = field(default=None, metadata={ARGPARSE_DEST_METADATA_KEY: "queue_position"})
 
 
 def _canonical_launcher(choice: QueuedTargetLauncher) -> str:
@@ -69,6 +78,13 @@ def _stage_task_environment(task_obj: object, staged_code_dir: Path) -> None:
         shutil.copyfile(source_path, target_file)
 
 
+def _parse_queue_cli_args(cli_args: list[str]) -> tuple[QueuedCliArgs, list[str]]:
+    queue_args, task_cli_args = parse_known_args_as(QueuedCliArgs, cli_args)
+    if queue_args.queued_launcher not in get_args(QueuedTargetLauncher):
+        raise ValueError(f"Unsupported queued target launcher: {queue_args.queued_launcher}")
+    return queue_args, task_cli_args
+
+
 class QueuedLauncher(BaseLauncher):
     def launch(
         self,
@@ -77,26 +93,16 @@ class QueuedLauncher(BaseLauncher):
         use_cli: bool | list[str] = True,
     ) -> None:
         if not is_observer_active():
-            raise RuntimeError("Queued observer is not active. Start it with: xax queue start")
+            raise RuntimeError(
+                "Queued observer is not active. Install and start the user service with "
+                "`xax queue install-service --enable --start` (or `xax queue start` after install)."
+            )
 
         args = use_cli if isinstance(use_cli, list) else sys.argv[1:]
-        parser = argparse.ArgumentParser(add_help=False)
-        parser.add_argument(
-            "--queued-launcher",
-            choices=get_args(QueuedTargetLauncher),
-            default="multi",
-            help="Launcher used by the observer when running this queued job",
-        )
-        parser.add_argument(
-            "--queue-position",
-            type=int,
-            default=None,
-            help="Optional 1-based queue position. Omit to append to the back of the queue.",
-        )
-        queue_args, task_cli_args = parser.parse_known_intermixed_args(args=args)
+        queue_args, task_cli_args = _parse_queue_cli_args(args)
         use_cli_next: bool | list[str] = False if not use_cli else task_cli_args
 
-        target_launcher = cast(QueuedTargetLauncher, queue_args.queued_launcher)
+        target_launcher = queue_args.queued_launcher
         if target_launcher in ("dataset", "d"):
             from xax.task.mixins.data_loader import DataloadersMixin  # noqa: PLC0415
 
@@ -111,8 +117,7 @@ class QueuedLauncher(BaseLauncher):
         staged_code_dir = exp_dir / "code"
         observer_log_path = exp_dir / "queue_observer.log"
 
-        resolved_cfg = OmegaConf.structured(task_obj.config)
-        OmegaConf.save(resolved_cfg, config_path)
+        save_yaml(config_path, task_obj.config)
         _stage_task_environment(task_obj, staged_code_dir)
 
         if queue_args.queue_position is not None and queue_args.queue_position < 1:

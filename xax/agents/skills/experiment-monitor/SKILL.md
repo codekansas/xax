@@ -59,7 +59,11 @@ Use this skill when the user wants an iterative experimentation loop:
 
 - Prefer the project’s queue-management CLI.
 - If it can emit a JSON payload with a `jobs` list, use `scripts/sync_queue_status.py`.
+- For GPU training jobs, queue with:
+  - `--launcher queued --queued-launcher single`
+  This runs one queued job at a time while using a single-device launcher for the job itself.
 - Current `xax` fallback:
+  - `xax queue install-service --enable --start`
   - `xax queue status --json`
   - `xax queue metrics <job_id> --json`
 - If the queue CLI schema changes, map it to the log schema in `references/table-schema.md`.

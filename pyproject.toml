@@ -27,7 +27,7 @@ dependencies = [
     "pillow",
 
     # Configuration and project management
-    "omegaconf",
+    "pyyaml",
     "gitpython",
 
     # Monitoring and logging

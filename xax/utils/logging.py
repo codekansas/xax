@@ -7,7 +7,6 @@ import sys
 from typing import Any
 
 from jaxtyping import Array
-from omegaconf import OmegaConf
 
 from xax.core.conf import load_user_config
 from xax.utils.jax import to_scalar
@@ -232,9 +231,6 @@ def get_unused_port(default: int | None = None) -> int:
     sock = socket.socket()
     sock.bind(("", 0))
     return sock.getsockname()[1]
-
-
-OmegaConf.register_new_resolver("xax.unused_port", get_unused_port, replace=True)
 
 
 def port_is_busy(port: int) -> int:

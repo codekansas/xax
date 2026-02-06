@@ -109,7 +109,7 @@ class WandbLogger(LoggerImpl):
         self.mode: WandbConfigMode = config.mode
 
         # Set wandb directory if run_directory is provided
-        self.wandb_dir = Path(config.run_directory).expanduser().resolve() / "wandb"
+        self.wandb_dir = Path(run_directory).expanduser().resolve() / "wandb"
         self.wandb_dir.mkdir(parents=True, exist_ok=True)
 
         self._started = False

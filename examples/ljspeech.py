@@ -15,7 +15,7 @@ import functools
 import json
 import logging
 from dataclasses import dataclass
-from typing import Iterator, TypedDict, override
+from typing import Iterator, TypedDict, cast, override
 
 import equinox as eqx
 import jax
@@ -287,7 +287,12 @@ class FullTTSModel(eqx.Module):
     def build(
         llm: xax.LLM,
         whisper_eos_token_id: int,
+        *,
         key: PRNGKeyArray,
+        residual_head_dim: int = RESIDUAL_HEAD_DIM,
+        residual_num_heads: int = RESIDUAL_NUM_HEADS,
+        residual_num_layers: int = RESIDUAL_NUM_LAYERS,
+        residual_mlp_dim: int = RESIDUAL_MLP_DIM,
     ) -> "FullTTSModel":
         mimi = xax.build_pretrained_mimi()
 
@@ -295,7 +300,14 @@ class FullTTSModel(eqx.Module):
         semantic = SemanticTTSModel(llm)
 
         # Build Stage 2: Residual model
-        residual = ResidualModel.build(llm.config.embed_dim, key=key)
+        residual = ResidualModel.build(
+            llm.config.embed_dim,
+            head_dim=residual_head_dim,
+            num_heads=residual_num_heads,
+            num_layers=residual_num_layers,
+            mlp_dim=residual_mlp_dim,
+            key=key,
+        )
 
         whisper_model = xax.build_pretrained_whisper()
         whisper_transcriber = xax.WhisperTranscriber(
@@ -413,6 +425,12 @@ class Config(xax.SupervisedConfig):
     # Model settings.
     llm_repo: xax.LLMRepo = xax.field(xax.LLMRepo.QWEN3_600M, help="Pretrained model")
     num_quantizers: int = xax.field(NUM_QUANTIZERS, help="Number of quantizers (8)")
+    residual_head_dim: int = xax.field(RESIDUAL_HEAD_DIM, help="Residual model attention head dimension")
+    residual_num_heads: int = xax.field(RESIDUAL_NUM_HEADS, help="Residual model number of attention heads")
+    residual_num_layers: int = xax.field(RESIDUAL_NUM_LAYERS, help="Residual model number of layers")
+    residual_mlp_dim: int = xax.field(RESIDUAL_MLP_DIM, help="Residual model MLP dimension")
+    semantic_loss_weight: float = xax.field(1.0, help="Weight for stage-1 semantic loss in total loss")
+    acoustic_loss_weight: float = xax.field(1.0, help="Weight for stage-2 acoustic loss in total loss")
 
     # LoRA settings.
     lora_rank: int = xax.field(16, help="Rank of LoRA decomposition")
@@ -587,6 +605,10 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         model = FullTTSModel.build(
             llm=llm,
             whisper_eos_token_id=self.whisper_config.eos_token_id,
+            residual_head_dim=self.config.residual_head_dim,
+            residual_num_heads=self.config.residual_num_heads,
+            residual_num_layers=self.config.residual_num_layers,
+            residual_mlp_dim=self.config.residual_mlp_dim,
             key=mimi_key,
         )
 
@@ -605,7 +627,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         semantic_spec = SemanticTTSModel(llm=llm_spec)
 
         # Stage 2: Residual model - all trainable except frozen Mimi codebook embeddings
-        residual_spec = jax.tree.map(lambda x: eqx.is_inexact_array(x), model.residual)
+        residual_spec = jax.tree.map(eqx.is_inexact_array, model.residual)
 
         # Mimi and Whisper: Frozen
         mimi_spec = jax.tree.map(lambda _: False, model.mimi)
@@ -668,12 +690,17 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         stage2_loss = stage2_loss.mean()
         stage2_acc = stage2_acc.mean()
 
-        # Total loss is sum of both stages
-        total_loss = stage1_loss + stage2_loss
+        # Weighted total loss allows balancing semantic/acoustic priorities.
+        weighted_stage1_loss = self.config.semantic_loss_weight * stage1_loss
+        weighted_stage2_loss = self.config.acoustic_loss_weight * stage2_loss
+        total_loss = weighted_stage1_loss + weighted_stage2_loss
         metrics: dict[str, xax.Metric] = {
             "loss": xax.Scalar(total_loss),
             "stage1_loss": xax.Scalar(stage1_loss),
             "stage2_loss": xax.Scalar(stage2_loss),
+            "weighted_stage1_loss": xax.Scalar(weighted_stage1_loss),
+            "weighted_stage2_loss": xax.Scalar(weighted_stage2_loss),
+            "unweighted_total_loss": xax.Scalar(stage1_loss + stage2_loss),
             "stage1_accuracy": xax.Scalar(stage1_acc),
             "stage2_accuracy": xax.Scalar(stage2_acc),
         }
@@ -866,7 +893,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
     @override
     def get_dataset(self) -> Dataset:
-        return self.load_dataset("train")
+        return cast(Dataset, self.load_dataset("train"))
 
     @xax.dataset_fn("train", dependencies=["unpadded"], use_hash=False)
     def train_dataset(self) -> Dataset:
@@ -876,7 +903,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         - codes: Padded text + audio token IDs, shape (max_seq_len,)
         - audio_codes: Padded audio codes, shape (max_audio_frames, 8)
         """
-        ds = self.load_dataset("unpadded")
+        ds = cast(Dataset, self.load_dataset("unpadded"))
 
         code_lengths = np.array([len(c) for c in ds["codes"]])
         audio_lengths = np.array([len(c) for c in ds["audio_codes"]])
@@ -918,7 +945,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
             return {"codes": codes, "audio_codes": audio_codes}
 
-        ds = ds.map(pad_sample, desc="Padding to 95th percentile")
+        ds = cast(Dataset, ds.map(pad_sample, desc="Padding to 95th percentile"))
 
         return ds
 
@@ -932,7 +959,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         - codes: Combined text + audio token IDs (variable length)
         - audio_codes: Full audio codes (T, 8) for Stage 2 training (variable length)
         """
-        ds = self.load_dataset("bpe")
+        ds = cast(Dataset, self.load_dataset("bpe"))
 
         def prepare_sample(example: dict) -> dict:
             # Prepare tokens
@@ -951,7 +978,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
             return {"codes": codes, "audio_codes": audio_codes}
 
-        result = ds.map(prepare_sample, desc="Preparing unpadded sequences")
+        result = cast(Dataset, ds.map(prepare_sample, desc="Preparing unpadded sequences"))
 
         # Remove unused columns
         cols_to_keep = ["codes", "audio_codes"]
@@ -975,7 +1002,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         - audio_bpe: shape (T_bpe,) - BPE-encoded Q0 codes
         - bpe_spans: shape (T_bpe,) - number of Q0 codes each BPE token represents
         """
-        ds = self.load_dataset("tokenized")
+        ds = cast(Dataset, self.load_dataset("tokenized"))
 
         # Map Q0 codec values to unique unicode characters
         base_char = 0xE000
@@ -1000,7 +1027,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             audio_chars = codes_to_chars_q0_only(audio_codes)
             return {"audio_chars": audio_chars}
 
-        ds_with_chars = ds.map(get_audio_chars, desc="Extracting Q0 codec tokens")
+        ds_with_chars = cast(Dataset, ds.map(get_audio_chars, desc="Extracting Q0 codec tokens"))
 
         # Step 2: Train BPE tokenizer on Q0 codes only
         logger.info("Training BPE tokenizer on Q0 (semantic) codec tokens...")
@@ -1045,16 +1072,18 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
             return {"audio_bpe": audio_bpe, "bpe_spans": bpe_spans}
 
-        ds_bpe = ds.map(apply_bpe, desc="Applying BPE")
+        ds_bpe = cast(Dataset, ds.map(apply_bpe, desc="Applying BPE"))
 
         # Remove temporary columns
         if "audio_chars" in ds_bpe.column_names:
-            ds_bpe = ds_bpe.remove_columns(["audio_chars"])
+            ds_bpe = cast(Dataset, ds_bpe.remove_columns(["audio_chars"]))
 
         # Log compression statistics
         # For Q0-only, original count is just the number of Q0 tokens (T frames)
-        total_original_q0 = sum(len(np.asarray(ex["audio_codes"])) for ex in ds_bpe)
-        total_bpe = sum(len(ex["audio_bpe"]) for ex in ds_bpe)
+        audio_codes_column = cast(list[object], ds_bpe["audio_codes"])
+        audio_bpe_column = cast(list[object], ds_bpe["audio_bpe"])
+        total_original_q0 = sum(len(np.asarray(audio_codes)) for audio_codes in audio_codes_column)
+        total_bpe = sum(len(np.asarray(audio_bpe)) for audio_bpe in audio_bpe_column)
         compression_ratio = total_original_q0 / total_bpe if total_bpe > 0 else 0
         logger.info(
             "Q0-only BPE compression: %d -> %d tokens (%.2fx compression)",
@@ -1089,7 +1118,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             return {"resampled_audio": audio, "audio_length": len(audio)}
 
         logger.info("Stage 1: Resampling audio on CPU (parallel)...")
-        resampled_ds = raw_ds.map(resample_audio, num_proc=32, desc="Resampling audio")
+        resampled_ds = cast(Dataset, raw_ds.map(resample_audio, num_proc=32, desc="Resampling audio"))
 
         # Stage 2: GPU-batched Mimi encoding
         logger.info("Stage 2: Encoding audio with Mimi on GPU (batched)...")
@@ -1134,12 +1163,15 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
             return outputs
 
-        ds = resampled_ds.map(
-            encode_and_tokenize_batch,
-            batched=True,
-            batch_size=32,
-            remove_columns=resampled_ds.column_names,
-            desc="Encoding with Mimi",
+        ds = cast(
+            Dataset,
+            resampled_ds.map(
+                encode_and_tokenize_batch,
+                batched=True,
+                batch_size=32,
+                remove_columns=resampled_ds.column_names,
+                desc="Encoding with Mimi",
+            ),
         )
 
         logger.info("Dataset preprocessing complete. %d samples", len(ds))

@@ -1,11 +1,12 @@
 """Installs bundled Codex skills into a local `.agents` directory."""
 
-import argparse
 import shutil
+import sys
+from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
-from typing import Callable
 
+from xax.utils.cli_args import ARGPARSE_DEST_METADATA_KEY, parse_args_as, render_help_text
 from xax.utils.logging import LOG_STATUS, configure_logging
 
 
@@ -59,29 +60,27 @@ def install_bundled_skills(destination_agents_dir: Path, *, commit_to_git: bool 
     return copied_entry_count
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="xax install-skills",
-        description="Install bundled xax Codex skills into a local .agents directory.",
-    )
-    parser.add_argument(
-        "--dest",
-        type=Path,
+@dataclass(frozen=True)
+class InstallSkillsArgs:
+    destination_agents_dir: Path = field(
         default=Path(".agents"),
-        help="Destination agents directory. Defaults to ./.agents in the current working directory.",
+        metadata={
+            ARGPARSE_DEST_METADATA_KEY: "dest",
+            "help": "Destination agents directory. Defaults to ./.agents in the current working directory.",
+        },
     )
-    parser.add_argument(
-        "--commit-to-git",
-        action="store_true",
-        help="Allow installed skill directories to be committed; by default, new skills get a `.gitignore` with `*`.",
+    commit_to_git: bool = field(
+        default=False,
+        metadata={
+            "help": "Allow installed skill directories to be committed; by default, new skills get `.gitignore`.",
+        },
     )
-    return parser
 
 
-def _command_install(args: argparse.Namespace) -> int:
+def _command_install(args: InstallSkillsArgs) -> int:
     logger = configure_logging(prefix="skills")
 
-    destination_agents_dir = args.dest.expanduser()
+    destination_agents_dir = args.destination_agents_dir.expanduser()
     if not destination_agents_dir.is_absolute():
         destination_agents_dir = (Path.cwd() / destination_agents_dir).resolve()
 
@@ -97,13 +96,21 @@ def _command_install(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = _build_parser()
-    args = parser.parse_args(argv)
-
-    command_fn: Callable[[argparse.Namespace], int] = _command_install
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    if any(token in ("-h", "--help") for token in argv_list):
+        sys.stdout.write(
+            render_help_text(
+                InstallSkillsArgs,
+                prog="xax install-skills",
+                description="Install bundled xax Codex skills into a local .agents directory.",
+            )
+            + "\n"
+        )
+        raise SystemExit(0)
+    parsed_args = parse_args_as(InstallSkillsArgs, argv_list)
 
     try:
-        return_code = int(command_fn(args))
+        return_code = int(_command_install(parsed_args))
     except KeyboardInterrupt:
         return_code = 130
     except Exception as error:

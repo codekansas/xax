@@ -1,6 +1,5 @@
 """Top-level `xax` CLI entrypoint with delegated subcommands."""
 
-import argparse
 import sys
 from dataclasses import dataclass
 from typing import Callable
@@ -16,23 +15,22 @@ class _Subcommand:
 
 
 SUBCOMMANDS: tuple[_Subcommand, ...] = (
-    _Subcommand(name="queue", help="Manage the local queued launcher observer and jobs", delegate=queue.main),
+    _Subcommand(name="queue", help="Manage queued jobs and the user systemd observer service", delegate=queue.main),
     _Subcommand(name="install-skills", help="Install bundled Codex skills into .agents", delegate=install_skills.main),
     _Subcommand(name="edit-config", help="Edit checkpoint configs in-place", delegate=edit_config.main),
 )
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    subcommand_choices = [subcommand.name for subcommand in SUBCOMMANDS]
-    subcommand_help = "\n".join([f"  {subcommand.name:14s} {subcommand.help}" for subcommand in SUBCOMMANDS])
-    parser = argparse.ArgumentParser(
-        prog="xax",
-        description="Top-level CLI for xax utilities.",
-        epilog=f"Subcommands:\n{subcommand_help}",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument("command", choices=subcommand_choices, help="Subcommand to run")
-    return parser
+def _build_parser() -> str:
+    lines = [
+        "Usage: xax <command> [args]",
+        "",
+        "Top-level CLI for xax utilities.",
+        "",
+        "Commands:",
+    ]
+    lines.extend([f"  {subcommand.name:14s} {subcommand.help}" for subcommand in SUBCOMMANDS])
+    return "\n".join(lines)
 
 
 def _exit_code_from_system_exit(code: object) -> int:
@@ -44,10 +42,10 @@ def _exit_code_from_system_exit(code: object) -> int:
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = _build_parser()
+    help_text = _build_parser()
     argv_list = list(sys.argv[1:] if argv is None else argv)
     if not argv_list or argv_list[0] in ("-h", "--help"):
-        parser.print_help()
+        sys.stdout.write(help_text + "\n")
         raise SystemExit(0)
 
     command = argv_list[0]
@@ -58,8 +56,10 @@ def main(argv: list[str] | None = None) -> None:
             delegate = subcommand.delegate
             break
     if delegate is None:
-        parser.error(f"invalid choice: {command!r} (choose from {[subcommand.name for subcommand in SUBCOMMANDS]})")
-    assert delegate is not None
+        sys.stderr.write(
+            f"Invalid subcommand {command!r}. Choose one of: {[subcommand.name for subcommand in SUBCOMMANDS]}\n"
+        )
+        raise SystemExit(2)
 
     try:
         delegate(subcommand_argv)

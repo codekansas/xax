@@ -18,7 +18,6 @@ import jax.numpy as jnp
 import numpy as np
 from datasets import Dataset, DatasetDict, IterableDataset, IterableDatasetDict, load_from_disk
 from jax.sharding import NamedSharding, PartitionSpec as P
-from omegaconf import II
 
 from xax.core.conf import field, get_data_dir
 from xax.core.state import Batch
@@ -58,7 +57,7 @@ def _hash_function(fn: Callable) -> str:
         source = inspect.getsource(fn)
     except (OSError, TypeError):
         # Fallback if source is not available
-        source = fn.__name__
+        source = getattr(fn, "__name__", fn.__class__.__name__)
     return hashlib.sha256(source.encode()).hexdigest()[:16]
 
 
@@ -76,7 +75,7 @@ class DataloadersConfig(ProcessConfig, BaseConfig):
     prefetch_buffer_size: int = field(16, help="Number of batches to prefetch in background thread")
     load_in_memory: bool = field(False, help="Load entire dataset into device memory for maximum throughput")
     raise_dataloader_errors: bool = field(False, help="If set, raise dataloader errors inside the worker processes")
-    dataset_workers: int = field(II("xax.num_workers:-1"), help="Number of workers for loading training samples")
+    dataset_workers: int = field(-1, help="Number of workers for loading training samples")
     shuffle_seed: int = field(1337, help="Seed for the shuffle")
     debug_dataloader: bool = field(False, help="Debug dataloaders")
 

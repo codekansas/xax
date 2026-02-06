@@ -1,13 +1,45 @@
 """Upserts experiment rows in a canonical experiment log CSV."""
 
-import argparse
 import json
 import logging
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from experiment_log_lib import STATUS_CHOICES, read_rows, resolve_log_path, upsert_row, write_rows
 
+from xax.utils.cli_args import parse_args_as
+
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class UpsertExperimentArgs:
+    experiment_id: str
+    log_path: Path | None = None
+    experiment_name: str | None = field(default=None, metadata={"help": "Experiment session name"})
+    experiments_dir: Path | None = field(default=None, metadata={"help": "Override experiments root directory"})
+    parent_experiment_id: str | None = None
+    queue_job_id: str | None = None
+    status: str | None = None
+    task_key: str | None = None
+    command: str | None = None
+    config_path: str | None = None
+    exp_dir: str | None = None
+    objective_metric: str | None = None
+    objective_mode: str | None = None
+    objective_value: float | None = None
+    hypothesis: str | None = None
+    change_summary: str | None = None
+    result_summary: str | None = None
+    next_action: str | None = None
+    started_at: str | None = None
+    ended_at: str | None = None
+    owner: str | None = None
+    notes: str | None = None
+    metrics_json: str | None = None
+    metrics_json_file: Path | None = None
+    metric: list[str] = field(default_factory=list)
 
 
 def _parse_metric_pairs(metric_pairs: list[str]) -> dict[str, str]:
@@ -41,48 +73,13 @@ def _load_metrics_json(metrics_json: str | None, metrics_json_file: Path | None)
     return {str(key): value for key, value in payload.items()}
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Upsert one experiment row in experiment_log.csv",
-    )
-    parser.add_argument("--log-path", type=Path, default=None)
-    parser.add_argument("--experiment-name", default=None, help="Experiment session name")
-    parser.add_argument("--experiments-dir", type=Path, default=None, help="Override experiments root directory")
-    parser.add_argument("--experiment-id", required=True)
-    parser.add_argument("--parent-experiment-id", default=None)
-    parser.add_argument("--queue-job-id", default=None)
-    parser.add_argument("--status", choices=STATUS_CHOICES, default=None)
-    parser.add_argument("--task-key", default=None)
-    parser.add_argument("--command", default=None)
-    parser.add_argument("--config-path", default=None)
-    parser.add_argument("--exp-dir", default=None)
-    parser.add_argument("--objective-metric", default=None)
-    parser.add_argument("--objective-mode", choices=("max", "min"), default=None)
-    parser.add_argument("--objective-value", type=float, default=None)
-    parser.add_argument("--hypothesis", default=None)
-    parser.add_argument("--change-summary", default=None)
-    parser.add_argument("--result-summary", default=None)
-    parser.add_argument("--next-action", default=None)
-    parser.add_argument("--started-at", default=None, help="ISO timestamp")
-    parser.add_argument("--ended-at", default=None, help="ISO timestamp")
-    parser.add_argument("--owner", default=None)
-    parser.add_argument("--notes", default=None)
-    parser.add_argument("--metrics-json", default=None, help="JSON object literal")
-    parser.add_argument("--metrics-json-file", type=Path, default=None, help="Path to JSON object file")
-    parser.add_argument(
-        "--metric",
-        action="append",
-        default=[],
-        metavar="NAME=VALUE",
-        help="Additional metric key/value pair; can be repeated",
-    )
-    return parser
-
-
 def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    parser = _build_parser()
-    args = parser.parse_args(argv)
+    args = parse_args_as(UpsertExperimentArgs, list(sys.argv[1:] if argv is None else argv))
+    if args.status is not None and args.status not in STATUS_CHOICES:
+        raise ValueError(f"--status must be one of: {', '.join(STATUS_CHOICES)}")
+    if args.objective_mode is not None and args.objective_mode not in ("max", "min"):
+        raise ValueError("--objective-mode must be one of: max, min")
 
     base_metrics = _load_metrics_json(args.metrics_json, args.metrics_json_file)
     metric_pairs = _parse_metric_pairs(list(args.metric))

@@ -21,7 +21,6 @@ from typing import (
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
 from jax.sharding import NamedSharding, PartitionSpec
 from jaxtyping import Array, PRNGKeyArray, PyTree

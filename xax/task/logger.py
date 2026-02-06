@@ -867,7 +867,7 @@ class Logger:
                 value.value,
                 namespace=namespace,
                 secondary=value.secondary,
-                token_type=value.tokenizer,
+                token_type="default" if value.tokenizer is None else value.tokenizer,
             )
         elif isinstance(value, Image):
             self.log_image(key, value.image, namespace=namespace, target_resolution=value.target_resolution)
@@ -1056,6 +1056,7 @@ class Logger:
         """
         if self.decode_tokens is None:
             raise ValueError("decode_tokens must be provided when logging Tokens")
+        decode_tokens = self.decode_tokens
 
         if not self.active:
             raise RuntimeError("The logger is not active")
@@ -1065,7 +1066,7 @@ class Logger:
         def value_future() -> LogString:
             tokens = value() if callable(value) else value
             tokens_np = to_numpy(tokens)
-            string_value = self.decode_tokens(tokens_np, token_type)
+            string_value = decode_tokens(tokens_np, token_type)
             return LogString(value=string_value, secondary=secondary)
 
         self.strings[namespace][key] = value_future

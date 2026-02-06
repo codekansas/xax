@@ -16,7 +16,6 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jaxtyping import Array, PRNGKeyArray
-from omegaconf import MISSING
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field as PydanticField
 
 from xax.arch.attention import (
@@ -29,7 +28,7 @@ from xax.arch.attention import (
     TransformerBlockCache,
     apply_linear,
 )
-from xax.core.conf import field
+from xax.core.conf import MISSING, field
 from xax.utils.jax import filter_jit as xax_filter_jit
 
 try:
@@ -489,8 +488,9 @@ class CrossAttentionLLM(eqx.Module):
         *,
         context_tn: Array | None = None,
         caches: list[TransformerBlockCache],
-        cross_cache: AttentionCache,
-    ) -> tuple[Array, list[TransformerBlockCache], AttentionCache]: ...
+        cross_cache: AttentionCache | None = None,
+        encoder_output_sn: Array | None = None,
+    ) -> tuple[Array, list[TransformerBlockCache], AttentionCache | None]: ...
 
     def forward_hidden(
         self,
@@ -500,13 +500,14 @@ class CrossAttentionLLM(eqx.Module):
         context_tn: Array | None = None,
         caches: list[TransformerBlockCache] | None = None,
         cross_cache: AttentionCache | None = None,
-    ) -> tuple[Array, list[TransformerBlockCache], AttentionCache] | Array:
+    ) -> tuple[Array, list[TransformerBlockCache], AttentionCache | None] | Array:
         """Forward pass with cross-attention to encoder output.
 
         Args:
             tokens_t: Input token IDs, shape (seq_len,)
             encoder_output_sn: Encoder output for cross-attention,
                 shape (encoder_seq_len, embed_dim). Required if no cross_cache.
+            context_tn: Optional conditioning embeddings to add to token embeddings.
             caches: Self-attention KV caches per layer
             cross_cache: Cross-attention KV cache (precomputed from encoder)
 
@@ -553,7 +554,7 @@ class CrossAttentionLLM(eqx.Module):
                     )
                     x_tn = x_tn + cross_out
 
-            return self.llm.norm(x_tn), caches_out, updated_cross_cache  # type: ignore[return-value]
+            return self.llm.norm(x_tn), caches_out, updated_cross_cache
 
     @overload
     def forward(
@@ -579,8 +580,9 @@ class CrossAttentionLLM(eqx.Module):
         *,
         context_tn: Array | None = None,
         caches: list[TransformerBlockCache],
-        cross_cache: AttentionCache,
-    ) -> tuple[Array, list[TransformerBlockCache], AttentionCache]: ...
+        cross_cache: AttentionCache | None = None,
+        encoder_output_sn: Array | None = None,
+    ) -> tuple[Array, list[TransformerBlockCache], AttentionCache | None]: ...
 
     def forward(
         self,
@@ -590,7 +592,7 @@ class CrossAttentionLLM(eqx.Module):
         encoder_output_sn: Array | None = None,
         caches: list[TransformerBlockCache] | None = None,
         cross_cache: AttentionCache | None = None,
-    ) -> tuple[Array, list[TransformerBlockCache], AttentionCache] | Array:
+    ) -> tuple[Array, list[TransformerBlockCache], AttentionCache | None] | Array:
         """Forward pass returning logits.
 
         Args:
@@ -604,11 +606,10 @@ class CrossAttentionLLM(eqx.Module):
             Logits and updated caches if caching, else just logits
         """
         if caches is None:
-            x_td = self.forward_hidden(
-                tokens_t,
-                context_tn=context_tn,
-                encoder_output_sn=encoder_output_sn,
-            )
+            if encoder_output_sn is None:
+                x_td = self.forward_hidden(tokens_t, context_tn=context_tn)
+            else:
+                x_td = self.forward_hidden(tokens_t, context_tn=context_tn, encoder_output_sn=encoder_output_sn)
             return apply_linear(x_td, self.llm.lm_head)
         else:
             x_td, caches_out, cross_cache_out = self.forward_hidden(

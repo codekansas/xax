@@ -1,27 +1,27 @@
 """Renders a markdown experiment report from experiment_log.csv."""
 
-import argparse
 import logging
+import sys
 from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from experiment_log_lib import read_rows, resolve_log_path, resolve_report_path, utc_now_iso
 
+from xax.utils.cli_args import parse_args_as
+
 logger = logging.getLogger(__name__)
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Render experiment report markdown from experiment_log.csv",
-    )
-    parser.add_argument("--log-path", type=Path, default=None)
-    parser.add_argument("--output-path", type=Path, default=None)
-    parser.add_argument("--experiment-name", default=None, help="Experiment session name")
-    parser.add_argument("--experiments-dir", type=Path, default=None, help="Override experiments root directory")
-    parser.add_argument("--title", default="Experiment Monitor Report")
-    parser.add_argument("--max-rows", type=int, default=25)
-    parser.add_argument("--objective-mode", choices=("auto", "max", "min"), default="auto")
-    return parser
+@dataclass(frozen=True)
+class RenderReportArgs:
+    log_path: Path | None = None
+    output_path: Path | None = None
+    experiment_name: str | None = field(default=None, metadata={"help": "Experiment session name"})
+    experiments_dir: Path | None = field(default=None, metadata={"help": "Override experiments root directory"})
+    title: str = "Experiment Monitor Report"
+    max_rows: int = 25
+    objective_mode: str = "auto"
 
 
 def _escape_cell(cell: str) -> str:
@@ -52,8 +52,9 @@ def _get_best_completed_row(rows: list[dict[str, str]], objective_mode: str) -> 
 
 def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    parser = _build_parser()
-    args = parser.parse_args(argv)
+    args = parse_args_as(RenderReportArgs, list(sys.argv[1:] if argv is None else argv))
+    if args.objective_mode not in ("auto", "max", "min"):
+        raise ValueError("--objective-mode must be one of: auto, max, min")
 
     log_path = resolve_log_path(
         args.log_path,

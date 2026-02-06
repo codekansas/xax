@@ -1,25 +1,25 @@
 """Syncs queue-status JSON payloads into experiment_log.csv."""
 
-import argparse
 import json
 import logging
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from experiment_log_lib import epoch_seconds_to_iso, read_rows, resolve_log_path, upsert_row, write_rows
 
+from xax.utils.cli_args import parse_args_as
+
 logger = logging.getLogger(__name__)
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Sync queue status JSON into experiment_log.csv",
-    )
-    parser.add_argument("--status-json", type=Path, required=True, help="Path to queue status JSON payload")
-    parser.add_argument("--log-path", type=Path, default=None)
-    parser.add_argument("--experiment-name", default=None, help="Experiment session name")
-    parser.add_argument("--experiments-dir", type=Path, default=None, help="Override experiments root directory")
-    parser.add_argument("--owner", default=None, help="Optional owner to apply to imported rows")
-    return parser
+@dataclass(frozen=True)
+class SyncQueueStatusArgs:
+    status_json: Path = field(metadata={"help": "Path to queue status JSON payload"})
+    log_path: Path | None = None
+    experiment_name: str | None = field(default=None, metadata={"help": "Experiment session name"})
+    experiments_dir: Path | None = field(default=None, metadata={"help": "Override experiments root directory"})
+    owner: str | None = field(default=None, metadata={"help": "Optional owner to apply to imported rows"})
 
 
 def _get_experiment_id(job_payload: dict[str, object]) -> str | None:
@@ -47,8 +47,7 @@ def _as_float(payload: dict[str, object], key: str) -> float | None:
 
 def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    parser = _build_parser()
-    args = parser.parse_args(argv)
+    args = parse_args_as(SyncQueueStatusArgs, list(sys.argv[1:] if argv is None else argv))
 
     status_payload_raw = json.loads(args.status_json.read_text(encoding="utf-8"))
     if not isinstance(status_payload_raw, dict):

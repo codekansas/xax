@@ -1,6 +1,5 @@
-"""CLI for managing the local queued launcher observer and job queue."""
+"""CLI for managing queued jobs and the systemd-backed queue observer."""
 
-import argparse
 import json
 import logging
 import os
@@ -11,9 +10,9 @@ import subprocess
 import sys
 import time
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, cast
+from typing import Literal
 
 import psutil
 from tensorboard.backend.event_processing import event_accumulator
@@ -52,12 +51,18 @@ from xax.task.launchers.queue_state import (
 )
 from xax.task.launchers.single_device import SingleDeviceLauncher
 from xax.task.mixins.runnable import RunnableMixin
+from xax.utils.cli_args import (
+    ARGPARSE_DEST_METADATA_KEY,
+    CLI_POSITIONAL_METADATA_KEY,
+    parse_args_as,
+)
 from xax.utils.logging import LOG_STATUS, configure_logging
 
 DEFAULT_POLL_SECONDS = 2.0
 DEFAULT_HEARTBEAT_SECONDS = 3.0
 DEFAULT_TENSORBOARD_PORT = 9249
 DEFAULT_PROCESS_GRACE_SECONDS = 10.0
+DEFAULT_SERVICE_NAME = "xax-queue-observer"
 
 OOM_PATTERNS = (
     re.compile(r"cuda.*out of memory", re.IGNORECASE),
@@ -74,6 +79,87 @@ class MetricPoint:
     wall_time: float
     value: float
     source: str
+
+
+@dataclass(frozen=True)
+class ObserverArgs:
+    poll_seconds: float = DEFAULT_POLL_SECONDS
+    heartbeat_seconds: float = DEFAULT_HEARTBEAT_SECONDS
+    once: bool = False
+
+
+@dataclass(frozen=True)
+class QueueStatusArgs:
+    recent: int = 10
+    as_json: bool = field(default=False, metadata={ARGPARSE_DEST_METADATA_KEY: "json"})
+
+
+@dataclass(frozen=True)
+class MoveJobArgs:
+    job_id: str = field(metadata={CLI_POSITIONAL_METADATA_KEY: True})
+    position: int = field(metadata={CLI_POSITIONAL_METADATA_KEY: True})
+
+
+@dataclass(frozen=True)
+class CancelJobArgs:
+    job_id: str = field(metadata={CLI_POSITIONAL_METADATA_KEY: True})
+
+
+@dataclass(frozen=True)
+class KillJobArgs:
+    signal_name: str = field(default="TERM", metadata={ARGPARSE_DEST_METADATA_KEY: "signal"})
+    grace_seconds: float = 10.0
+
+
+@dataclass(frozen=True)
+class TailJobArgs:
+    job_id: str = field(metadata={CLI_POSITIONAL_METADATA_KEY: True})
+    kind: Literal["observer", "task"] = "observer"
+    lines: int = 100
+    follow: bool = False
+
+
+@dataclass(frozen=True)
+class TensorboardArgs:
+    job_ids: list[str] = field(default_factory=list, metadata={CLI_POSITIONAL_METADATA_KEY: True})
+    all_jobs: bool = field(default=False, metadata={ARGPARSE_DEST_METADATA_KEY: "all"})
+    port: int = DEFAULT_TENSORBOARD_PORT
+    bind_all: bool = False
+
+
+@dataclass(frozen=True)
+class MetricsArgs:
+    job_id: str = field(metadata={CLI_POSITIONAL_METADATA_KEY: True})
+    tag: str | None = None
+    last: int | None = None
+    as_json: bool = field(default=False, metadata={ARGPARSE_DEST_METADATA_KEY: "json"})
+
+
+@dataclass(frozen=True)
+class ServiceInstallArgs:
+    name: str = DEFAULT_SERVICE_NAME
+    force: bool = False
+    enable: bool = False
+    start: bool = False
+
+
+@dataclass(frozen=True)
+class ServiceActionArgs:
+    name: str = DEFAULT_SERVICE_NAME
+
+
+@dataclass(frozen=True)
+class SystemdArgs:
+    name: str = DEFAULT_SERVICE_NAME
+    install: bool = False
+    force: bool = False
+    enable: bool = False
+    start: bool = False
+
+
+@dataclass(frozen=True)
+class RunJobArgs:
+    job_id: str = field(metadata={ARGPARSE_DEST_METADATA_KEY: "job_id"})
 
 
 def _get_launcher(launcher_name: str) -> BaseLauncher:
@@ -257,7 +343,7 @@ def _spawn_job_process(
 
     command = [sys.executable, "-m", "xax.cli.queue", "_run-job", "--job-id", job_id]
     env = os.environ.copy()
-    if (pythonpath := env.get("PYTHONPATH")):
+    if pythonpath := env.get("PYTHONPATH"):
         env["PYTHONPATH"] = f"{stage_dir}{os.pathsep}{pythonpath}"
     else:
         env["PYTHONPATH"] = str(stage_dir)
@@ -328,7 +414,7 @@ def _spawn_job_process(
     return return_code, error, oom_detected
 
 
-def _command_start(args: argparse.Namespace) -> int:
+def _command_observer(args: ObserverArgs) -> int:
     logger = configure_logging(prefix="queue")
     observer_pid = os.getpid()
     register_observer(observer_pid, status="idle")
@@ -393,13 +479,13 @@ def _serialize_jobs_for_output(jobs: list[QueuedJob]) -> list[dict]:
     return jobs_payload
 
 
-def _command_status(args: argparse.Namespace) -> int:
+def _command_status(args: QueueStatusArgs) -> int:
     logger = configure_logging(prefix="queue")
     state = read_queue_state()
     observer_info = read_observer_info()
     jobs = list_jobs()
 
-    if args.json:
+    if args.as_json:
         queue_paths = get_queue_paths()
         payload = {
             "observer_active": is_observer_active(ttl_seconds=OBSERVER_HEARTBEAT_TTL_SECONDS),
@@ -460,7 +546,7 @@ def _command_status(args: argparse.Namespace) -> int:
     return 0
 
 
-def _command_move(args: argparse.Namespace) -> int:
+def _command_move(args: MoveJobArgs) -> int:
     position_idx = args.position - 1
     if position_idx < 0:
         raise ValueError("--position must be >= 1")
@@ -470,7 +556,7 @@ def _command_move(args: argparse.Namespace) -> int:
     return 0
 
 
-def _command_cancel(args: argparse.Namespace) -> int:
+def _command_cancel(args: CancelJobArgs) -> int:
     cancelled_job = cancel_queued_job(args.job_id)
     logger = configure_logging(prefix="queue")
     logger.log(LOG_STATUS, "Cancelled queued job %s [%s]", cancelled_job["job_id"], cancelled_job["task_key"])
@@ -487,7 +573,7 @@ def _signal_from_name(name: str) -> signal.Signals:
     return signum_raw
 
 
-def _command_kill(args: argparse.Namespace) -> int:
+def _command_kill(args: KillJobArgs) -> int:
     logger = configure_logging(prefix="queue")
     running_job = get_running_job()
     if running_job is None:
@@ -499,7 +585,7 @@ def _command_kill(args: argparse.Namespace) -> int:
         logger.warning("Running job %s has no process metadata", running_job["job_id"])
         return 1
 
-    signum = _signal_from_name(args.signal)
+    signum = _signal_from_name(args.signal_name)
     if process_group_id is not None:
         _kill_process_group(process_group_id, signum)
     elif pid is not None:
@@ -512,7 +598,7 @@ def _command_kill(args: argparse.Namespace) -> int:
         process_group_id,
     )
 
-    if args.signal.upper() != "KILL" and args.grace_seconds > 0:
+    if args.signal_name.upper() != "KILL" and args.grace_seconds > 0:
         deadline_s = time.time() + args.grace_seconds
         while time.time() < deadline_s:
             pid_live = pid is not None and _is_pid_live(pid)
@@ -559,7 +645,7 @@ def _tail_file(path: Path, lines: int, follow: bool) -> int:
                 time.sleep(0.5)
 
 
-def _command_tail(args: argparse.Namespace) -> int:
+def _command_tail(args: TailJobArgs) -> int:
     job = get_job(args.job_id)
     if job is None:
         raise ValueError(f"Unknown job id: {args.job_id}")
@@ -585,8 +671,8 @@ def _resolve_jobs_for_tensorboard(job_ids: list[str], include_all: bool) -> list
     return [job for job in jobs if job is not None]
 
 
-def _command_tensorboard(args: argparse.Namespace) -> int:
-    jobs = _resolve_jobs_for_tensorboard(args.job_ids, include_all=args.all)
+def _command_tensorboard(args: TensorboardArgs) -> int:
+    jobs = _resolve_jobs_for_tensorboard(args.job_ids, include_all=args.all_jobs)
     logdir_specs: list[str] = []
     for job in jobs:
         tensorboard_dir = (Path(job["exp_dir"]).expanduser().resolve() / "tensorboard").resolve()
@@ -674,7 +760,7 @@ def _collect_metric_points(tensorboard_root: Path) -> list[MetricPoint]:
     return points
 
 
-def _command_metrics(args: argparse.Namespace) -> int:
+def _command_metrics(args: MetricsArgs) -> int:
     job = get_job(args.job_id)
     if job is None:
         raise ValueError(f"Unknown job id: {args.job_id}")
@@ -697,7 +783,7 @@ def _command_metrics(args: argparse.Namespace) -> int:
             points.extend(grouped_values[-args.last :])
         points.sort(key=lambda point: (point.tag, point.step, point.wall_time))
 
-    if args.json:
+    if args.as_json:
         payload = [asdict(point) for point in points]
         sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
         return 0
@@ -718,7 +804,7 @@ def _command_metrics(args: argparse.Namespace) -> int:
     return 0
 
 
-def _command_cleanup(_: argparse.Namespace) -> int:
+def _command_cleanup() -> int:
     logger = configure_logging(prefix="queue")
     _cleanup_stale_processes(logger)
     recovered_job = recover_orphaned_running_job(reason="Recovered orphaned running job during manual cleanup")
@@ -738,7 +824,7 @@ def _service_unit_text(service_name: str) -> str:
             "",
             "[Service]",
             "Type=simple",
-            f"ExecStart={sys.executable} -m xax.cli.main queue start",
+            f"ExecStart={sys.executable} -m xax.cli.main queue _observer",
             f"ExecStopPost={sys.executable} -m xax.cli.main queue cleanup",
             "Restart=always",
             "RestartSec=2s",
@@ -757,19 +843,24 @@ def _service_unit_text(service_name: str) -> str:
     )
 
 
-def _run_systemctl_command(*argv: str) -> int:
+def _run_systemctl_command(*argv: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["systemctl", "--user", *argv],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _run_systemctl_command_required(*argv: str) -> subprocess.CompletedProcess[str]:
     if shutil.which("systemctl") is None:
-        return 0
-    proc = subprocess.run(["systemctl", "--user", *argv], check=False)
-    return proc.returncode
+        raise RuntimeError("systemctl is not available; queue service commands require user systemd")
+    return _run_systemctl_command(*argv)
 
 
-def _command_systemd(args: argparse.Namespace) -> int:
+def _command_install_service(args: ServiceInstallArgs) -> int:
     service_name = args.name
     unit_text = _service_unit_text(service_name)
-    if not args.install:
-        sys.stdout.write(unit_text + "\n")
-        return 0
 
     service_dir = Path("~/.config/systemd/user").expanduser().resolve()
     service_dir.mkdir(parents=True, exist_ok=True)
@@ -785,104 +876,163 @@ def _command_systemd(args: argparse.Namespace) -> int:
         logger.warning("systemctl not found; install completed but service was not enabled/started")
         return 0
 
-    if _run_systemctl_command("daemon-reload") != 0:
-        return 1
+    daemon_reload_proc = _run_systemctl_command("daemon-reload")
+    if daemon_reload_proc.returncode != 0:
+        error_message = daemon_reload_proc.stderr.strip() or daemon_reload_proc.stdout.strip()
+        raise RuntimeError(f"systemctl daemon-reload failed: {error_message}")
     if args.enable and args.start:
-        return _run_systemctl_command("enable", "--now", f"{service_name}.service")
+        enable_now_proc = _run_systemctl_command("enable", "--now", f"{service_name}.service")
+        if enable_now_proc.returncode != 0:
+            error_message = enable_now_proc.stderr.strip() or enable_now_proc.stdout.strip()
+            raise RuntimeError(f"systemctl enable --now failed: {error_message}")
+        return 0
     if args.enable:
-        return _run_systemctl_command("enable", f"{service_name}.service")
+        enable_proc = _run_systemctl_command("enable", f"{service_name}.service")
+        if enable_proc.returncode != 0:
+            error_message = enable_proc.stderr.strip() or enable_proc.stdout.strip()
+            raise RuntimeError(f"systemctl enable failed: {error_message}")
+        return 0
     if args.start:
-        return _run_systemctl_command("start", f"{service_name}.service")
+        start_proc = _run_systemctl_command("start", f"{service_name}.service")
+        if start_proc.returncode != 0:
+            error_message = start_proc.stderr.strip() or start_proc.stdout.strip()
+            raise RuntimeError(f"systemctl start failed: {error_message}")
+        return 0
     return 0
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="xax queue",
-        description="Manage the local xax queued launcher observer and queued jobs.",
-    )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+def _command_print_service(args: ServiceActionArgs) -> int:
+    sys.stdout.write(_service_unit_text(args.name) + "\n")
+    return 0
 
-    start_parser = subparsers.add_parser("start", help="Start the queue observer loop")
-    start_parser.add_argument("--poll-seconds", type=float, default=DEFAULT_POLL_SECONDS)
-    start_parser.add_argument("--heartbeat-seconds", type=float, default=DEFAULT_HEARTBEAT_SECONDS)
-    start_parser.add_argument("--once", action="store_true", help="Run at most one queued job and then exit")
-    start_parser.set_defaults(func=_command_start)
 
-    status_parser = subparsers.add_parser("status", help="Show observer status and queued jobs")
-    status_parser.add_argument("--recent", type=int, default=10, help="How many recent finished jobs to show")
-    status_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
-    status_parser.set_defaults(func=_command_status)
+def _command_service_action(action: str, args: ServiceActionArgs) -> int:
+    logger = configure_logging(prefix="queue")
+    service = f"{args.name}.service"
+    proc = _run_systemctl_command_required(action, service)
+    if proc.returncode != 0:
+        error_message = proc.stderr.strip() or proc.stdout.strip()
+        raise RuntimeError(f"systemctl --user {action} {service} failed: {error_message}")
+    logger.log(LOG_STATUS, "Service %s: %s", action, service)
+    return 0
 
-    list_parser = subparsers.add_parser("list", help="Alias for `status`")
-    list_parser.add_argument("--recent", type=int, default=10, help="How many recent finished jobs to show")
-    list_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
-    list_parser.set_defaults(func=_command_status)
 
-    move_parser = subparsers.add_parser("move", help="Move a queued job to a new queue position")
-    move_parser.add_argument("job_id", help="Queued job id, e.g. job-0000001")
-    move_parser.add_argument("position", type=int, help="1-based queue position")
-    move_parser.set_defaults(func=_command_move)
+COMMAND_HELP: dict[str, str] = {
+    "start": "Usage: xax queue start [--name SERVICE]",
+    "stop": "Usage: xax queue stop [--name SERVICE]",
+    "restart": "Usage: xax queue restart [--name SERVICE]",
+    "status": "Usage: xax queue status [--recent N] [--json]",
+    "list": "Usage: xax queue list [--recent N] [--json]",
+    "move": "Usage: xax queue move <job_id> <position>",
+    "cancel": "Usage: xax queue cancel <job_id>",
+    "kill": "Usage: xax queue kill [--signal TERM|INT|KILL] [--grace-seconds 10]",
+    "tail": "Usage: xax queue tail <job_id> [--kind observer|task] [--lines 100] [--follow]",
+    "tensorboard": "Usage: xax queue tensorboard [job_id ...] [--all] [--port 9249] [--bind-all]",
+    "metrics": "Usage: xax queue metrics <job_id> [--tag TAG] [--last N] [--json]",
+    "cleanup": "Usage: xax queue cleanup",
+    "install-service": "Usage: xax queue install-service [--name SERVICE] [--force] [--enable] [--start]",
+    "systemd": "Usage: xax queue systemd [--name SERVICE] [--install] [--force] [--enable] [--start]",
+    "_observer": "Usage: xax queue _observer [--poll-seconds 2.0] [--heartbeat-seconds 3.0] [--once]",
+    "_run-job": "Usage: xax queue _run-job --job-id <job_id>",
+}
 
-    cancel_parser = subparsers.add_parser("cancel", help="Cancel a queued job that has not started")
-    cancel_parser.add_argument("job_id")
-    cancel_parser.set_defaults(func=_command_cancel)
+VISIBLE_COMMANDS: tuple[str, ...] = (
+    "start",
+    "stop",
+    "restart",
+    "status",
+    "list",
+    "move",
+    "cancel",
+    "kill",
+    "tail",
+    "tensorboard",
+    "metrics",
+    "cleanup",
+    "install-service",
+    "systemd",
+)
 
-    kill_parser = subparsers.add_parser("kill", help="Kill the currently running queued job")
-    kill_parser.add_argument("--signal", default="TERM", help="Signal name: TERM, INT, KILL, ...")
-    kill_parser.add_argument("--grace-seconds", type=float, default=10.0)
-    kill_parser.set_defaults(func=_command_kill)
 
-    tail_parser = subparsers.add_parser("tail", help="Tail log files for a queued job")
-    tail_parser.add_argument("job_id")
-    tail_parser.add_argument("--kind", choices=("observer", "task"), default="observer")
-    tail_parser.add_argument("--lines", type=int, default=100)
-    tail_parser.add_argument("--follow", action="store_true")
-    tail_parser.set_defaults(func=_command_tail)
-
-    tensorboard_parser = subparsers.add_parser("tensorboard", help="Open TensorBoard for one or more queued jobs")
-    tensorboard_parser.add_argument("job_ids", nargs="*", help="Job ids. Omit to use running + queued jobs.")
-    tensorboard_parser.add_argument("--all", action="store_true", help="Use all jobs with TensorBoard logs")
-    tensorboard_parser.add_argument("--port", type=int, default=DEFAULT_TENSORBOARD_PORT)
-    tensorboard_parser.add_argument("--bind-all", action="store_true")
-    tensorboard_parser.set_defaults(func=_command_tensorboard)
-
-    metrics_parser = subparsers.add_parser("metrics", help="Extract scalar metrics from a queued job")
-    metrics_parser.add_argument("job_id")
-    metrics_parser.add_argument("--tag", default=None, help="Filter to one metric tag")
-    metrics_parser.add_argument("--last", type=int, default=None, help="Keep only the last N points per tag")
-    metrics_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
-    metrics_parser.set_defaults(func=_command_metrics)
-
-    cleanup_parser = subparsers.add_parser("cleanup", help="Kill stale process trees and repair queue state")
-    cleanup_parser.set_defaults(func=_command_cleanup)
-
-    systemd_parser = subparsers.add_parser("systemd", help="Print or install a user systemd service unit")
-    systemd_parser.add_argument("--name", default="xax-queue-observer")
-    systemd_parser.add_argument("--install", action="store_true")
-    systemd_parser.add_argument("--force", action="store_true")
-    systemd_parser.add_argument("--enable", action="store_true")
-    systemd_parser.add_argument("--start", action="store_true")
-    systemd_parser.set_defaults(func=_command_systemd)
-
-    run_parser = subparsers.add_parser("_run-job", help=argparse.SUPPRESS)
-    run_parser.add_argument("--job-id", required=True)
-    run_parser.set_defaults(func=lambda parsed_args: _run_queued_job(parsed_args.job_id))
-
-    return parser
+def _queue_help_text() -> str:
+    lines = [
+        "Usage: xax queue <command> [args]",
+        "",
+        "Manage xax queued jobs and the user systemd queue service.",
+        "",
+        "Commands:",
+    ]
+    lines.extend([f"  {command}" for command in VISIBLE_COMMANDS])
+    lines.append("")
+    lines.append("Run `xax queue <command> --help` for command usage.")
+    return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = _build_parser()
-    args = parser.parse_args(argv)
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    if not argv_list or argv_list[0] in ("-h", "--help"):
+        sys.stdout.write(_queue_help_text() + "\n")
+        raise SystemExit(0)
 
-    command_fn_raw = getattr(args, "func", None)
-    if command_fn_raw is None or not callable(command_fn_raw):
-        parser.error("No command selected")
-    command_fn = cast(Callable[[argparse.Namespace], int], command_fn_raw)
+    command, sub_argv = argv_list[0], argv_list[1:]
+    if command not in COMMAND_HELP:
+        sys.stderr.write(f"Unknown queue command: {command}\n")
+        sys.stderr.write(_queue_help_text() + "\n")
+        raise SystemExit(2)
+
+    if sub_argv and sub_argv[0] in ("-h", "--help"):
+        sys.stdout.write(COMMAND_HELP[command] + "\n")
+        raise SystemExit(0)
 
     try:
-        return_code = int(command_fn(args))
+        match command:
+            case "_observer":
+                return_code = int(_command_observer(parse_args_as(ObserverArgs, sub_argv)))
+            case "start":
+                return_code = int(_command_service_action("start", parse_args_as(ServiceActionArgs, sub_argv)))
+            case "stop":
+                return_code = int(_command_service_action("stop", parse_args_as(ServiceActionArgs, sub_argv)))
+            case "restart":
+                return_code = int(_command_service_action("restart", parse_args_as(ServiceActionArgs, sub_argv)))
+            case "status" | "list":
+                return_code = int(_command_status(parse_args_as(QueueStatusArgs, sub_argv)))
+            case "move":
+                return_code = int(_command_move(parse_args_as(MoveJobArgs, sub_argv)))
+            case "cancel":
+                return_code = int(_command_cancel(parse_args_as(CancelJobArgs, sub_argv)))
+            case "kill":
+                return_code = int(_command_kill(parse_args_as(KillJobArgs, sub_argv)))
+            case "tail":
+                return_code = int(_command_tail(parse_args_as(TailJobArgs, sub_argv)))
+            case "tensorboard":
+                return_code = int(_command_tensorboard(parse_args_as(TensorboardArgs, sub_argv)))
+            case "metrics":
+                return_code = int(_command_metrics(parse_args_as(MetricsArgs, sub_argv)))
+            case "cleanup":
+                return_code = int(_command_cleanup())
+            case "install-service":
+                return_code = int(_command_install_service(parse_args_as(ServiceInstallArgs, sub_argv)))
+            case "systemd":
+                systemd_args = parse_args_as(SystemdArgs, sub_argv)
+                if systemd_args.install:
+                    return_code = int(
+                        _command_install_service(
+                            ServiceInstallArgs(
+                                name=systemd_args.name,
+                                force=systemd_args.force,
+                                enable=systemd_args.enable,
+                                start=systemd_args.start,
+                            )
+                        )
+                    )
+                else:
+                    return_code = int(_command_print_service(ServiceActionArgs(name=systemd_args.name)))
+            case "_run-job":
+                run_args = parse_args_as(RunJobArgs, sub_argv)
+                return_code = int(_run_queued_job(run_args.job_id))
+            case _:
+                sys.stderr.write(f"Unsupported command: {command}\n")
+                return_code = 2
     except KeyboardInterrupt:
         return_code = 130
     except Exception as error:

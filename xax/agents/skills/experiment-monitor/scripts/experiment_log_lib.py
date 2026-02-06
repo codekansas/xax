@@ -5,16 +5,18 @@ import datetime as dt
 import os
 import shutil
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
+
+_get_experiments_dir_from_conf: Callable[[], Path | None] | None = None
+_get_user_global_dir_from_conf: Callable[[], Path] | None = None
 
 try:
-    from xax.core.conf import (
-        get_experiments_dir as _get_experiments_dir_from_conf,
-        get_user_global_dir as _get_user_global_dir_from_conf,
-    )
+    from xax.core.conf import get_experiments_dir, get_user_global_dir
 except Exception:  # pragma: no cover
-    _get_experiments_dir_from_conf = None
-    _get_user_global_dir_from_conf = None
+    pass
+else:
+    _get_experiments_dir_from_conf = get_experiments_dir
+    _get_user_global_dir_from_conf = get_user_global_dir
 
 FIELDNAMES: list[str] = [
     "experiment_id",

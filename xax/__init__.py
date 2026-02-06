@@ -88,6 +88,7 @@ __all__ = [
     "get_run_dir",
     "get_runs_dir",
     "load_user_config",
+    "MISSING",
     "State",
     "StepKind",
     "cast_step_kind",
@@ -201,6 +202,8 @@ __all__ = [
     "CollateMode",
     "collate",
     "collate_non_null",
+    "parse_args_as",
+    "parse_known_args_as",
     "breakpoint_if_nonfinite",
     "get_named_leaves",
     "log_if_nonfinite",
@@ -278,6 +281,13 @@ __all__ = [
     "Precision",
     "PrecisionConfig",
     "as_shape_dtype",
+    "dataclass_from_mapping",
+    "deep_merge",
+    "load_yaml",
+    "merge_config_sources",
+    "render_dataclass_help",
+    "save_yaml",
+    "to_yaml_text",
 ]
 
 import os
@@ -378,6 +388,7 @@ NAME_MAP: dict[str, str] = {
     "get_run_dir": "core.conf",
     "get_runs_dir": "core.conf",
     "load_user_config": "core.conf",
+    "MISSING": "core.conf",
     "State": "core.state",
     "StepKind": "core.state",
     "cast_step_kind": "core.state",
@@ -491,6 +502,8 @@ NAME_MAP: dict[str, str] = {
     "CollateMode": "utils.data.collate",
     "collate": "utils.data.collate",
     "collate_non_null": "utils.data.collate",
+    "parse_args_as": "utils.cli_args",
+    "parse_known_args_as": "utils.cli_args",
     "breakpoint_if_nonfinite": "utils.debugging",
     "get_named_leaves": "utils.debugging",
     "log_if_nonfinite": "utils.debugging",
@@ -568,6 +581,13 @@ NAME_MAP: dict[str, str] = {
     "Precision": "utils.types.training",
     "PrecisionConfig": "utils.types.training",
     "as_shape_dtype": "utils.types.training",
+    "dataclass_from_mapping": "utils.structured_config",
+    "deep_merge": "utils.structured_config",
+    "load_yaml": "utils.structured_config",
+    "merge_config_sources": "utils.structured_config",
+    "render_dataclass_help": "utils.structured_config",
+    "save_yaml": "utils.structured_config",
+    "to_yaml_text": "utils.structured_config",
 }
 
 
@@ -651,6 +671,7 @@ if IMPORT_ALL or TYPE_CHECKING:
     from xax.arch.ssm import SSM, BaseSSMBlock, DiagSSMBlock, SSMBlock
     from xax.arch.unet import UNet
     from xax.core.conf import (
+        MISSING,
         UserConfig,
         field,
         get_data_dir,
@@ -759,6 +780,7 @@ if IMPORT_ALL or TYPE_CHECKING:
     from xax.task.mixins.train import InitParams, Optimizer
     from xax.task.script import Script, ScriptConfig
     from xax.task.task import Config, SupervisedConfig, SupervisedTask, Task
+    from xax.utils.cli_args import parse_args_as, parse_known_args_as
     from xax.utils.data.collate import CollateMode, collate, collate_non_null
     from xax.utils.debugging import (
         breakpoint_if_nonfinite,
@@ -814,6 +836,15 @@ if IMPORT_ALL or TYPE_CHECKING:
         slice_pytree,
         tuple_insert,
         update_pytree,
+    )
+    from xax.utils.structured_config import (
+        dataclass_from_mapping,
+        deep_merge,
+        load_yaml,
+        merge_config_sources,
+        render_dataclass_help,
+        save_yaml,
+        to_yaml_text,
     )
     from xax.utils.text import (
         TextBlock,

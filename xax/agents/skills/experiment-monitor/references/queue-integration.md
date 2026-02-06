@@ -23,6 +23,10 @@ Each job should include, when available:
 ## Current `xax` Command
 
 - `xax queue status --json > queue_status.json`
+- Ensure the user service is installed/running:
+  - `xax queue install-service --enable --start`
+- Queue GPU jobs with one-at-a-time observer scheduling:
+  - `python examples/ljspeech.py --launcher queued --queued-launcher single ...`
 
 Then import:
 

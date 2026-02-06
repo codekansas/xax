@@ -1,13 +1,24 @@
 """Starts or resumes an experiment-monitor session under the experiments directory."""
 
-import argparse
 import datetime as dt
 import logging
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from experiment_log_lib import ensure_experiment_templates, get_experiments_root_dir, resolve_experiment_dir
 
+from xax.utils.cli_args import parse_args_as
+
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class StartExperimentArgs:
+    name: str | None = field(default=None, metadata={"help": "Experiment session name"})
+    experiments_dir: Path | None = field(default=None, metadata={"help": "Override experiments root directory"})
+    new: bool = field(default=False, metadata={"help": "Require creating a new session"})
+    resume: bool = field(default=False, metadata={"help": "Require resuming an existing session"})
 
 
 def _default_experiment_name() -> str:
@@ -15,21 +26,9 @@ def _default_experiment_name() -> str:
     return f"experiment-{timestamp}"
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Start a new experiment session or resume an existing one.",
-    )
-    parser.add_argument("--name", default=None, help="Experiment session name")
-    parser.add_argument("--experiments-dir", type=Path, default=None, help="Override experiments root directory")
-    parser.add_argument("--new", action="store_true", help="Require creating a new session")
-    parser.add_argument("--resume", action="store_true", help="Require resuming an existing session")
-    return parser
-
-
 def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    parser = _build_parser()
-    args = parser.parse_args(argv)
+    args = parse_args_as(StartExperimentArgs, list(sys.argv[1:] if argv is None else argv))
 
     if args.new and args.resume:
         raise ValueError("Pass at most one of --new and --resume")
