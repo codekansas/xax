@@ -1498,6 +1498,8 @@ def llm_generate_jit(
     temperature: float,
     top_p: float,
     key: PRNGKeyArray,
+    allowed_token_range: tuple[int, int] | None = None,
+    min_new_tokens_before_eos: int = 0,
 ) -> tuple[Array, Array]:
     """JIT-compiled autoregressive generation with optional context.
 
@@ -1511,10 +1513,24 @@ def llm_generate_jit(
         temperature: Sampling temperature.
         top_p: Top-p (nucleus) sampling probability.
         key: PRNG key for sampling.
+        allowed_token_range: Optional inclusive/exclusive range for allowed
+            sampled token IDs, represented as `(min_id, max_id)`.
+        min_new_tokens_before_eos: Minimum number of generated tokens required
+            before EOS can be sampled.
 
     Returns:
         Tuple of (generated tokens, final sequence length).
     """
+    if allowed_token_range is None:
+        allowed_token_min_id: int | None = None
+        allowed_token_max_id: int | None = None
+    else:
+        allowed_token_min_id, allowed_token_max_id = allowed_token_range
+        if allowed_token_max_id <= allowed_token_min_id:
+            raise ValueError("allowed_token_range must satisfy max_id > min_id.")
+    if min_new_tokens_before_eos < 0:
+        raise ValueError("min_new_tokens_before_eos must be >= 0.")
+
     initial_len = tokens_t.shape[-1]
     max_len = initial_len + max_new_tokens
 
@@ -1528,10 +1544,36 @@ def llm_generate_jit(
     dtype = model.embed.weight.dtype
     caches = model.init_cache(max_len, dtype)
 
+    if allowed_token_min_id is None:
+
+        def apply_sampling_mask(logits_1v: Array, generated_count: Array) -> Array:
+            token_ids_v = jnp.arange(logits_1v.shape[-1], dtype=jnp.int32)
+            allowed_mask_v = jnp.ones_like(token_ids_v, dtype=jnp.bool_)
+            if eos_id >= 0:
+                allow_eos = generated_count >= min_new_tokens_before_eos
+                eos_mask_v = token_ids_v == eos_id
+                allowed_mask_v = jnp.where(allow_eos, allowed_mask_v, allowed_mask_v & ~eos_mask_v)
+            min_logit = jnp.asarray(jnp.finfo(logits_1v.dtype).min, dtype=logits_1v.dtype)
+            return jnp.where(allowed_mask_v[None, :], logits_1v, min_logit)
+
+    else:
+        assert allowed_token_max_id is not None
+
+        def apply_sampling_mask(logits_1v: Array, generated_count: Array) -> Array:
+            token_ids_v = jnp.arange(logits_1v.shape[-1], dtype=jnp.int32)
+            allowed_mask_v = (token_ids_v >= allowed_token_min_id) & (token_ids_v < allowed_token_max_id)
+            if eos_id >= 0:
+                allow_eos = generated_count >= min_new_tokens_before_eos
+                eos_mask_v = token_ids_v == eos_id
+                allowed_mask_v = jnp.where(allow_eos, allowed_mask_v | eos_mask_v, allowed_mask_v)
+            min_logit = jnp.asarray(jnp.finfo(logits_1v.dtype).min, dtype=logits_1v.dtype)
+            return jnp.where(allowed_mask_v[None, :], logits_1v, min_logit)
+
     # Prime the KV cache with the prompt so subsequent iterations can decode one token at a time.
     prompt_context_tn = None if context_tn is None else context_tn[:initial_len]
     prompt_logits_tv, caches = model.forward(tokens_t, context_tn=prompt_context_tn, caches=caches)
     prompt_logits_1v = prompt_logits_tv[-1:, :]
+    prompt_logits_1v = apply_sampling_mask(prompt_logits_1v, jnp.int32(0))
 
     # Samples first generated token from the prompt's last position.
     key, sample_key = jax.random.split(key)
@@ -1558,6 +1600,8 @@ def llm_generate_jit(
         )
 
         logits_1v, caches = model.forward(prev_token_1, context_tn=step_context_1n, caches=caches)
+        generated_count = cur_pos - initial_len
+        logits_1v = apply_sampling_mask(logits_1v, generated_count)
 
         key, sample_key = jax.random.split(key)
         next_token = _sample_next_token(logits_1v, temperature, top_p, sample_key, num_samples=1)[0, 0]

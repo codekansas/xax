@@ -77,7 +77,11 @@ class SemanticTTSModel(eqx.Module):
         prompt_tokens_s: Array,
         max_audio_tokens: int,
         audio_end_id: int,
+        temperature: float,
+        top_p: float,
         key: PRNGKeyArray,
+        allowed_token_range: tuple[int, int] | None = None,
+        min_new_tokens_before_eos: int = 0,
     ) -> tuple[Array, Array]:
         """Generate audio BPE tokens given text prefix using sampling.
 
@@ -85,7 +89,13 @@ class SemanticTTSModel(eqx.Module):
             prompt_tokens_s: Prompt token IDs, with shape (text_len + 2,)
             max_audio_tokens: Maximum number of audio tokens to generate
             audio_end_id: Audio EOS token ID
+            temperature: Sampling temperature
+            top_p: Nucleus sampling probability
             key: PRNG key for sampling
+            allowed_token_range: Optional inclusive/exclusive range for sampled
+                token IDs, represented as `(min_id, max_id)`.
+            min_new_tokens_before_eos: Minimum number of generated tokens
+                before EOS can be sampled.
 
         Returns:
             Tuple of (generated audio BPE token IDs, final sequence length)
@@ -96,9 +106,11 @@ class SemanticTTSModel(eqx.Module):
             eos_id=audio_end_id,
             max_new_tokens=max_audio_tokens,
             context_tn=None,
-            temperature=0.8,
-            top_p=0.9,
+            temperature=temperature,
+            top_p=top_p,
             key=key,
+            allowed_token_range=allowed_token_range,
+            min_new_tokens_before_eos=min_new_tokens_before_eos,
         )
 
 
@@ -242,6 +254,8 @@ class ResidualModel(eqx.Module):
         stretched_hidden_td: Array,
         num_frames: Array,
         max_frames: int,
+        temperature: float,
+        top_p: float,
         key: PRNGKeyArray,
     ) -> Array:
         # Both stretched_hidden_td and q0_codes_t are frame-indexed:
@@ -252,6 +266,7 @@ class ResidualModel(eqx.Module):
 
         # Shared semantic context vectors.
         base_context_td = jax.vmap(self.hidden_proj)(stretched_hidden_td)
+        frame_mask_t = jnp.arange(max_frames) < num_frames
 
         for layer_idx in range(1, NUM_QUANTIZERS):
             # Adds the previous layer's token embeddings.
@@ -263,14 +278,17 @@ class ResidualModel(eqx.Module):
             pred_tokens_t, _ = xax.llm_generate_jit(
                 self.shared_layer_llm,
                 start_t,
-                eos_id=AUDIO_EOS_TOKEN_ID,
+                eos_id=-1,
                 max_new_tokens=max_frames,
                 context_tn=layer_context_td,
-                temperature=0.8,
-                top_p=0.9,
+                temperature=temperature,
+                top_p=top_p,
                 key=layer_key,
             )
-            all_codes.append(pred_tokens_t[1:])
+            pred_codes_t = pred_tokens_t[1:]
+            pred_codes_t = jnp.where(frame_mask_t, pred_codes_t, 0)
+            pred_codes_t = jnp.clip(pred_codes_t, 0, xax.MIMI_CODEBOOK_SIZE - 1)
+            all_codes.append(pred_codes_t)
 
         return jnp.stack(all_codes, axis=0)
 
@@ -435,6 +453,10 @@ class Config(xax.SupervisedConfig):
     residual_mlp_dim: int = xax.field(RESIDUAL_MLP_DIM, help="Residual model MLP dimension")
     semantic_loss_weight: float = xax.field(1.0, help="Weight for stage-1 semantic loss in total loss")
     acoustic_loss_weight: float = xax.field(1.0, help="Weight for stage-2 acoustic loss in total loss")
+    text_loss_weight: float = xax.field(
+        0.1,
+        help="Weight for text-segment LM preservation loss in total loss",
+    )
 
     # LoRA settings.
     lora_rank: int = xax.field(16, help="Rank of LoRA decomposition")
@@ -450,6 +472,14 @@ class Config(xax.SupervisedConfig):
 
     # Eval settings.
     eval_prompt: str = xax.field("Hello, world! I'm a TTS model.", help="Prompt to use for evaluation")
+    semantic_gen_temperature: float = xax.field(0.8, help="Sampling temperature for semantic generation")
+    semantic_gen_top_p: float = xax.field(0.9, help="Top-p for semantic generation")
+    semantic_gen_min_new_tokens: int = xax.field(
+        48,
+        help="Minimum semantic BPE tokens to generate before allowing EOS",
+    )
+    residual_gen_temperature: float = xax.field(0.8, help="Sampling temperature for residual generation")
+    residual_gen_top_p: float = xax.field(0.9, help="Top-p for residual generation")
 
 
 class LJSpeechTTS(xax.SupervisedTask[Config]):
@@ -674,15 +704,60 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
         # Stage 1: Semantic BPE prediction loss
         tokens_bs, targets_bs = codes_bs[:, :-1], codes_bs[:, 1:]
-        mask_bs = targets_bs > self.text_end_id
+        semantic_mask_bs = targets_bs > self.text_end_id
 
-        # Forward pass for semantic model (Stage 1)
-        stage1_loss, stage1_acc, hidden_bsd = jax.vmap(
-            model.semantic.llm.get_loss_and_accuracy,
-            in_axes=(0, 0, None, 0, None),
-        )(tokens_bs, targets_bs, None, mask_bs, 32)
-        stage1_loss = stage1_loss.mean()
-        stage1_acc = stage1_acc.mean()
+        # Preserve text conditioning by also supervising the text segment.
+        text_end_mask_bs = codes_bs == self.text_end_id
+        has_text_end_b = jnp.any(text_end_mask_bs, axis=1)
+        text_end_idx_b = jnp.argmax(text_end_mask_bs, axis=1)
+        target_pos_bs = jnp.broadcast_to(jnp.arange(targets_bs.shape[1])[None, :], targets_bs.shape)
+        text_mask_bs = (target_pos_bs < text_end_idx_b[:, None]) & has_text_end_b[:, None]
+
+        def compute_stage1_terms(
+            sample_tokens_s: Array,
+            sample_targets_s: Array,
+            sample_semantic_mask_s: Array,
+            sample_text_mask_s: Array,
+        ) -> tuple[Array, Array, Array, Array, Array]:
+            hidden_sd = model.semantic.llm.forward_hidden(sample_tokens_s)
+            semantic_loss = xax.chunked_cross_entropy_loss(
+                hidden_td=hidden_sd,
+                targets_t=sample_targets_s,
+                lm_head=model.semantic.llm.get_logits,
+                mask_t=sample_semantic_mask_s,
+                chunk_size=32,
+            )
+            semantic_acc = xax.chunked_cross_entropy_acc(
+                hidden_td=hidden_sd,
+                targets_t=sample_targets_s,
+                lm_head=model.semantic.llm.get_logits,
+                mask_t=sample_semantic_mask_s,
+                chunk_size=32,
+            )
+            text_loss = xax.chunked_cross_entropy_loss(
+                hidden_td=hidden_sd,
+                targets_t=sample_targets_s,
+                lm_head=model.semantic.llm.get_logits,
+                mask_t=sample_text_mask_s,
+                chunk_size=32,
+            )
+            text_acc = xax.chunked_cross_entropy_acc(
+                hidden_td=hidden_sd,
+                targets_t=sample_targets_s,
+                lm_head=model.semantic.llm.get_logits,
+                mask_t=sample_text_mask_s,
+                chunk_size=32,
+            )
+            return semantic_loss, semantic_acc, text_loss, text_acc, hidden_sd
+
+        stage1_loss_b, stage1_acc_b, text_loss_b, text_acc_b, hidden_bsd = jax.vmap(
+            compute_stage1_terms,
+            in_axes=(0, 0, 0, 0),
+        )(tokens_bs, targets_bs, semantic_mask_bs, text_mask_bs)
+        stage1_loss = stage1_loss_b.mean()
+        stage1_acc = stage1_acc_b.mean()
+        text_loss = text_loss_b.mean()
+        text_acc = text_acc_b.mean()
 
         # Compute Stage 2 loss for each sample
         stage2_loss, stage2_acc = self._compute_stage2_loss_batch(
@@ -696,23 +771,36 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
         # Weighted total loss allows balancing semantic/acoustic priorities.
         weighted_stage1_loss = self.config.semantic_loss_weight * stage1_loss
+        weighted_text_loss = self.config.text_loss_weight * text_loss
         weighted_stage2_loss = self.config.acoustic_loss_weight * stage2_loss
-        total_loss = weighted_stage1_loss + weighted_stage2_loss
+        total_loss = weighted_stage1_loss + weighted_text_loss + weighted_stage2_loss
         metrics: dict[str, xax.Metric] = {
             "loss": xax.Scalar(total_loss),
             "stage1_loss": xax.Scalar(stage1_loss),
             "stage2_loss": xax.Scalar(stage2_loss),
+            "text_loss": xax.Scalar(text_loss),
             "weighted_stage1_loss": xax.Scalar(weighted_stage1_loss),
             "weighted_stage2_loss": xax.Scalar(weighted_stage2_loss),
-            "unweighted_total_loss": xax.Scalar(stage1_loss + stage2_loss),
+            "weighted_text_loss": xax.Scalar(weighted_text_loss),
+            "unweighted_total_loss": xax.Scalar(stage1_loss + text_loss + stage2_loss),
             "stage1_accuracy": xax.Scalar(stage1_acc),
             "stage2_accuracy": xax.Scalar(stage2_acc),
+            "text_accuracy": xax.Scalar(text_acc),
         }
 
         if heavy:
-            audio_t, gt_audio_t, gt_text_t = self._generate_audio(model, batch, key)
+            audio_t, gt_audio_t, gt_text_t, generated_bpe_length, generated_num_frames, invalid_audio_bpe_count = (
+                self._generate_audio(model, batch, key)
+            )
             metrics["generated_audio"] = xax.Audio(audio_t, sample_rate=xax.MIMI_SAMPLE_RATE)
             metrics["real_audio"] = xax.Audio(gt_audio_t, sample_rate=xax.MIMI_SAMPLE_RATE)
+            metrics["eval_prompt"] = xax.Tokens(self.eval_prompt_tokens, tokenizer="llm")
+            metrics["generated_bpe_length"] = xax.Scalar(generated_bpe_length.astype(jnp.float32))
+            metrics["generated_num_frames"] = xax.Scalar(generated_num_frames.astype(jnp.float32))
+            metrics["generated_audio_seconds"] = xax.Scalar(
+                generated_num_frames.astype(jnp.float32) * (320.0 / float(xax.MIMI_SAMPLE_RATE))
+            )
+            metrics["invalid_audio_bpe_count"] = xax.Scalar(invalid_audio_bpe_count.astype(jnp.float32))
 
             # Transcribe generated audio with Whisper
             transcript_tokens, _, _ = model.whisper_transcriber.transcribe(audio_t, max_tokens=64)
@@ -798,7 +886,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         model: FullTTSModel,
         batch: Batch,
         key: PRNGKeyArray,
-    ) -> tuple[Array, Array, Array]:
+    ) -> tuple[Array, Array, Array, Array, Array, Array]:
         """Generate audio using two-stage pipeline.
 
         Stage 1: Generate Q0 BPE tokens and get hidden states
@@ -816,21 +904,35 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             prompt_tokens_s=self.eval_prompt_tokens,
             max_audio_tokens=max_audio_bpe,
             audio_end_id=self.audio_end_id,
+            temperature=self.config.semantic_gen_temperature,
+            top_p=self.config.semantic_gen_top_p,
             key=k1,
+            allowed_token_range=(self.first_audio_bpe_id, self.first_audio_bpe_id + self.config.audio_bpe_vocab_size),
+            min_new_tokens_before_eos=self.config.semantic_gen_min_new_tokens,
         )
 
         # Strip prompt prefix and EOS from generated tokens
         prompt_len = len(self.eval_prompt_tokens)
         gen_tokens = audio_bpe_tokens[prompt_len:]
-        gen_length = audio_bpe_length - prompt_len
+        gen_length = jnp.maximum(audio_bpe_length - prompt_len, 0)
 
         # Exclude EOS token if generated
         last_idx = jnp.clip(gen_length - 1, 0)
-        has_eos = gen_tokens[last_idx] == self.audio_end_id
-        gen_length = gen_length - has_eos.astype(jnp.int32)
+        has_eos = (gen_length > 0) & (gen_tokens[last_idx] == self.audio_end_id)
+        gen_length = jnp.where(has_eos, gen_length - 1, gen_length)
+
+        # Keep decoding robust even if generation emits non-audio tokens.
+        audio_bpe_min_id = self.first_audio_bpe_id
+        audio_bpe_max_id = self.first_audio_bpe_id + self.config.audio_bpe_vocab_size
+        valid_audio_bpe_mask = (gen_tokens >= audio_bpe_min_id) & (gen_tokens < audio_bpe_max_id)
+        valid_prefix_mask = jnp.arange(gen_tokens.shape[0]) < gen_length
+        invalid_prefix_mask = valid_prefix_mask & ~valid_audio_bpe_mask
+        invalid_audio_bpe_count = jnp.sum(invalid_prefix_mask.astype(jnp.int32))
+        first_invalid_idx = jnp.argmax(invalid_prefix_mask.astype(jnp.int32))
+        gen_length = jnp.where(invalid_prefix_mask.any(), first_invalid_idx, gen_length)
 
         # Decode BPE to Q0 codes
-        bpe_tokens_for_decode = gen_tokens - self.first_audio_bpe_id
+        bpe_tokens_for_decode = jnp.where(valid_audio_bpe_mask, gen_tokens - self.first_audio_bpe_id, 0)
         q0_codes_t, num_frames = decode_bpe_to_q0(
             bpe_tokens_b=bpe_tokens_for_decode,
             bpe_length=gen_length,
@@ -838,6 +940,9 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             span_table_v=self.audio_bpe_span_table,
             max_frames=max_frames,
         )
+        frame_mask_t = jnp.arange(max_frames) < num_frames
+        q0_codes_t = jnp.where(frame_mask_t, q0_codes_t, 0)
+        q0_codes_t = jnp.clip(q0_codes_t, 0, xax.MIMI_CODEBOOK_SIZE - 1)
 
         # Get hidden states from semantic model for the full generated sequence
         # Use static slicing with max length to avoid dynamic shape issues in JIT
@@ -860,24 +965,27 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             stretched_hidden_td=stretched_hidden_td,
             num_frames=num_frames,
             max_frames=max_frames,
+            temperature=self.config.residual_gen_temperature,
+            top_p=self.config.residual_gen_top_p,
             key=k2,
         )
 
         # Decode with Mimi
-        all_codes_ft = all_codes_ft.clip(max=xax.MIMI_CODEBOOK_SIZE - 1)
+        all_codes_ft = jnp.where(frame_mask_t[None, :], all_codes_ft, 0)
+        all_codes_ft = jnp.clip(all_codes_ft, 0, xax.MIMI_CODEBOOK_SIZE - 1)
         audio_gen = model.mimi.decode(all_codes_ft)
 
         # Get ground truth audio from batch.
         gt_codes_tf = batch["audio_codes"][0]  # (T, 8)
         gt_codes_ft = gt_codes_tf[1:max_frames, :].T
-        gt_codes_ft = gt_codes_ft.clip(max=xax.MIMI_CODEBOOK_SIZE - 1)
+        gt_codes_ft = jnp.where((gt_codes_ft >= 0) & (gt_codes_ft < xax.MIMI_CODEBOOK_SIZE), gt_codes_ft, 0)
         audio_gt = model.mimi.decode(gt_codes_ft)
 
         # Parse ground truth text
         gt_ids = batch["codes"][0]
         gt_text_ids = jax.lax.dynamic_slice(gt_ids, (1,), (gt_ids.shape[0] - 1,))
 
-        return audio_gen[0], audio_gt[0], gt_text_ids
+        return audio_gen[0], audio_gt[0], gt_text_ids, gen_length, num_frames, invalid_audio_bpe_count
 
     @override
     def decode_tokens(self, tokens: np.ndarray, token_type: str) -> str:
