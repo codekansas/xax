@@ -1,16 +1,23 @@
 """Typed configuration helpers for dataclass-based config + CLI overrides."""
 
+import copy
 import dataclasses
 import enum
 import os
 import re
+import shutil
+import sys
 from pathlib import Path
 from types import UnionType
-from typing import Any, Literal, TypeGuard, TypeVar, Union, cast, get_args, get_origin
+from typing import Any, Callable, Literal, Mapping, TypeGuard, TypeVar, Union, cast, get_args, get_origin, overload
 
 import yaml
 
+from xax.utils.text import TextBlock, colored, render_text_blocks
+
 ConfigT = TypeVar("ConfigT")
+FieldT = TypeVar("FieldT")
+_HELP_DEFAULT_METADATA_KEY = "_xax_help_default_value"
 
 
 class _MissingValue:
@@ -21,8 +28,97 @@ class _MissingValue:
 MISSING = _MissingValue()
 
 
+class _UnsetValue:
+    pass
+
+
+_UNSET = _UnsetValue()
+
+
 def is_missing_value(value: object) -> bool:
     return value is MISSING
+
+
+@overload
+def field(  # noqa: A001
+    value: FieldT,
+    *,
+    help: str | None = None,
+    metadata: Mapping[str, object] | None = None,
+    **metadata_items: object,
+) -> FieldT: ...
+
+
+@overload
+def field(  # noqa: A001
+    value: _UnsetValue = _UNSET,
+    *,
+    default_factory: Callable[[], FieldT],
+    help: str | None = None,
+    metadata: Mapping[str, object] | None = None,
+    **metadata_items: object,
+) -> FieldT: ...
+
+
+@overload
+def field(  # noqa: A001
+    value: _UnsetValue = _UNSET,
+    *,
+    default_factory: _UnsetValue = _UNSET,
+    help: str | None = None,
+    metadata: Mapping[str, object] | None = None,
+    **metadata_items: object,
+) -> Any: ...  # noqa: ANN401
+
+
+def field(  # noqa: A001
+    value: FieldT | _UnsetValue = _UNSET,
+    *,
+    default_factory: Callable[[], FieldT] | _UnsetValue = _UNSET,
+    help: str | None = None,
+    metadata: Mapping[str, object] | None = None,
+    **metadata_items: object,
+) -> FieldT | Any:
+    """Creates a dataclass field with optional structured metadata.
+
+    Args:
+        value: Optional default value. If omitted, the field is required.
+        default_factory: Optional default factory. Mutually exclusive with ``value``.
+        help: Optional help string stored in field metadata.
+        metadata: Optional metadata mapping.
+        metadata_items: Additional metadata key-value pairs.
+
+    Returns:
+        A dataclass field descriptor.
+    """
+    if value is not _UNSET and default_factory is not _UNSET:
+        raise ValueError("Cannot specify both `value` and `default_factory`")
+    merged_metadata = dict(metadata or {})
+    merged_metadata.update(metadata_items)
+    if help is not None:
+        merged_metadata["help"] = help
+
+    if default_factory is not _UNSET:
+        factory = cast(Callable[[], FieldT], default_factory)
+        return dataclasses.field(default_factory=factory, metadata=merged_metadata)
+
+    if value is _UNSET:
+        return dataclasses.field(metadata=merged_metadata)
+
+    if callable(value):
+        callable_value = cast(Callable[[], FieldT], value)
+        return dataclasses.field(default_factory=callable_value, metadata=merged_metadata)
+
+    default_value_for_help = copy.deepcopy(value) if value.__class__.__hash__ is None else value
+    merged_metadata.setdefault(_HELP_DEFAULT_METADATA_KEY, default_value_for_help)
+
+    if value.__class__.__hash__ is None:
+        default_value = cast(FieldT, value)
+        return dataclasses.field(
+            default_factory=lambda default_value=default_value: copy.deepcopy(default_value),
+            metadata=merged_metadata,
+        )
+    return dataclasses.field(default=value, metadata=merged_metadata)
 
 
 def to_primitive(value: object, *, preserve_missing: bool = False) -> object:
@@ -409,34 +505,98 @@ def _annotation_to_name(annotation: object) -> str:
     return str(annotation)
 
 
-def render_dataclass_help(config_type: type[object], *, prog: str) -> str:
+def _format_help_default(value: object) -> str:
+    if isinstance(value, enum.Enum):
+        return repr(value.value)
+    if isinstance(value, Path):
+        return str(value)
+    return repr(value)
+
+
+def _can_render_help_default(value: object) -> bool:
+    if dataclasses.is_dataclass(value):
+        return False
+    if callable(value):
+        return False
+    return True
+
+
+def _column_widths_for_help(total_width: int) -> tuple[int, int, int, int]:
+    usable_width = max(total_width, 96)
+    field_width = max(20, min(42, int(usable_width * 0.30)))
+    type_width = max(18, min(34, int(usable_width * 0.24)))
+    default_width = max(12, min(28, int(usable_width * 0.16)))
+    # 13 accounts for table separators and framing from render_text_blocks.
+    description_width = max(24, usable_width - field_width - type_width - default_width - 13)
+    return field_width, type_width, default_width, description_width
+
+
+def render_dataclass_help(config_type: type[object], *, prog: str, use_color: bool | None = None) -> str:
     """Renders dotted-field help text from dataclass metadata."""
     if not dataclasses.is_dataclass(config_type):
         raise TypeError(f"Expected dataclass type, got {config_type!r}")
 
-    lines = [
-        f"Usage: {prog} [config.yaml ...] [key=value ...]",
-        "",
-        "Config fields:",
-    ]
+    use_color = sys.stdout.isatty() if use_color is None else use_color
+    header_color = "light-cyan" if use_color else None
+    field_color = "light-blue" if use_color else None
+    type_color = "grey" if use_color else None
+
+    rows: list[tuple[str, str, str, str]] = []
 
     def visit(type_obj: type[object], prefix: str = "") -> None:
         for field in dataclasses.fields(type_obj):
             field_path = field.name if not prefix else f"{prefix}.{field.name}"
             help_text = str(field.metadata.get("help", ""))
-            default_display = ""
+            default_display = "-"
             if field.default is not dataclasses.MISSING:
-                default_display = f" (default: {field.default!r})"
-            annotation_name = _annotation_to_name(field.type)
+                default_display = _format_help_default(field.default)
+            elif _HELP_DEFAULT_METADATA_KEY in field.metadata:
+                metadata_default = field.metadata[_HELP_DEFAULT_METADATA_KEY]
+                if _can_render_help_default(metadata_default):
+                    default_display = _format_help_default(metadata_default)
+            elif field.default_factory is not dataclasses.MISSING:
+                # Show simple built-in container defaults; hide other factories.
+                if field.default_factory in (list, dict, set, tuple, frozenset):
+                    default_display = _format_help_default(field.default_factory())
+            annotation_name = _annotation_to_name(field.type).replace("NoneType", "None")
+            description = help_text if help_text else "-"
+            rows.append((field_path, annotation_name, default_display, description))
+
             if _is_dataclass_type(field.type):
-                lines.append(f"- `{field_path}`: {annotation_name}{default_display}")
-                if help_text:
-                    lines.append(f"  {help_text}")
                 visit(field.type, field_path)
-            else:
-                lines.append(f"- `{field_path}`: {annotation_name}{default_display}")
-                if help_text:
-                    lines.append(f"  {help_text}")
 
     visit(config_type)
-    return "\n".join(lines)
+    rows.sort(key=lambda row: row[0])
+
+    terminal_width = shutil.get_terminal_size(fallback=(120, 20)).columns
+    field_width, type_width, default_width, description_width = _column_widths_for_help(terminal_width)
+
+    table_rows: list[list[TextBlock]] = [
+        [
+            TextBlock("field", color=header_color, bold=True, width=field_width),
+            TextBlock("type", color=header_color, bold=True, width=type_width),
+            TextBlock("default", color=header_color, bold=True, width=default_width),
+            TextBlock("description", color=header_color, bold=True, width=description_width),
+        ]
+    ]
+    for field_path, annotation_name, default_display, description in rows:
+        table_rows.append(
+            [
+                TextBlock(field_path, color=field_color, width=field_width),
+                TextBlock(annotation_name, color=type_color, width=type_width),
+                TextBlock(default_display, width=default_width),
+                TextBlock(description, width=description_width),
+            ]
+        )
+
+    usage_label = colored("Usage", "light-cyan", bold=True) if use_color else "Usage"
+    config_label = colored("Config Fields", "light-cyan", bold=True) if use_color else "Config fields"
+    table_rendered = render_text_blocks(table_rows, align_all_blocks=True)
+    return "\n".join(
+        [
+            f"{usage_label}: {prog} [config.yaml ...] [key=value ...]",
+            "",
+            f"{config_label}:",
+            table_rendered,
+        ]
+    )

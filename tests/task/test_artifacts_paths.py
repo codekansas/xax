@@ -29,7 +29,6 @@ def test_artifacts_uses_runs_dir_hierarchy(monkeypatch: pytest.MonkeyPatch, tmp_
     _configure_user_dir(monkeypatch, tmp_path)
     runs_root = tmp_path / "runs_root"
     monkeypatch.setenv("RUNS_DIR", str(runs_root))
-    monkeypatch.delenv("RUN_DIR", raising=False)
     _load_user_config_cached.cache_clear()
 
     first_task = DummyArtifactsTask(DummyArtifactsConfig())
@@ -42,7 +41,6 @@ def test_artifacts_uses_runs_dir_hierarchy(monkeypatch: pytest.MonkeyPatch, tmp_
     assert second_run_dir == runs_root / "dummy_artifacts_task" / "run_001"
     assert first_run_dir.exists()
     assert second_run_dir.exists()
-    assert first_task.exp_dir == first_run_dir
 
 
 def test_artifacts_respects_fixed_run_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -52,16 +50,4 @@ def test_artifacts_respects_fixed_run_dir(monkeypatch: pytest.MonkeyPatch, tmp_p
     task = DummyArtifactsTask(DummyArtifactsConfig(run_dir=str(fixed_run_dir)))
 
     assert task.run_dir == fixed_run_dir.resolve()
-    assert task.exp_dir == fixed_run_dir.resolve()
     assert fixed_run_dir.exists()
-
-
-def test_artifacts_exp_dir_alias(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    _configure_user_dir(monkeypatch, tmp_path)
-
-    legacy_exp_dir = tmp_path / "legacy_exp"
-    task = DummyArtifactsTask(DummyArtifactsConfig(exp_dir=str(legacy_exp_dir)))
-
-    assert task.run_dir == legacy_exp_dir.resolve()
-    assert task.exp_dir == legacy_exp_dir.resolve()
-    assert legacy_exp_dir.exists()

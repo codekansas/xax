@@ -1,1 +1,1 @@
-experiment_id,parent_experiment_id,queue_job_id,status,task_key,command,config_path,exp_dir,objective_metric,objective_mode,objective_value,metrics_json,hypothesis,change_summary,result_summary,next_action,started_at,ended_at,created_at,updated_at,owner,notes
+experiment_id,parent_experiment_id,queue_job_id,status,task_key,command,config_path,run_dir,objective_metric,objective_mode,objective_value,metrics_json,hypothesis,change_summary,result_summary,next_action,started_at,ended_at,created_at,updated_at,owner,notes

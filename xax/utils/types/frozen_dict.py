@@ -6,7 +6,7 @@ a dependency in downstream projects.
 
 import collections
 from types import MappingProxyType
-from typing import Any, Iterator, Mapping, Self, TypeVar
+from typing import Any, Iterator, Mapping, Self, TypeVar, cast
 
 import jax
 
@@ -47,7 +47,7 @@ class FrozenDict(Mapping[K, V]):
     __slots__ = ("_dict", "_hash")
 
     def __init__(self, *args: Any, __unsafe_skip_copy__: bool = False, **kwargs: Any) -> None:  # noqa: ANN401
-        xs: dict[K, V] = dict(*args, **kwargs)
+        xs = cast(dict[K, V], dict(*args, **kwargs))
         if __unsafe_skip_copy__:
             self._dict = xs
         else:

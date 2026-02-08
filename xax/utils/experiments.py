@@ -194,8 +194,8 @@ class NaNError(Exception):
 
 
 def diff_configs(
-    first: Mapping | Sequence,
-    second: Mapping | Sequence,
+    first: object,
+    second: object,
     prefix: str | None = None,
 ) -> tuple[list[str], list[str]]:
     """Returns the difference between two configs.
@@ -223,7 +223,9 @@ def diff_configs(
     any_config = (list, dict)
 
     if isinstance(first, Mapping) and isinstance(second, Mapping):
-        first_keys, second_keys = cast(set[str], set(first.keys())), cast(set[str], set(second.keys()))
+        first_mapping = cast(Mapping[str, object], first)
+        second_mapping = cast(Mapping[str, object], second)
+        first_keys, second_keys = set(first_mapping.keys()), set(second_mapping.keys())
 
         # Gets the new keys in each config.
         new_first += [f"{prefix}.{key}" for key in first_keys.difference(second_keys)]
@@ -232,31 +234,39 @@ def diff_configs(
         # Gets the new sub-keys in each config.
         for key in first_keys.intersection(second_keys):
             sub_prefix = key if prefix is None else f"{prefix}.{key}"
-            if first[key] is MISSING or second[key] is MISSING:
-                if first[key] is not MISSING:
-                    new_first += [get_diff_string(sub_prefix, first[key])]
-                if second[key] is not MISSING:
-                    new_second += [get_diff_string(sub_prefix, second[key])]
-            elif isinstance(first[key], any_config) and isinstance(second[key], any_config):
-                sub_new_first, sub_new_second = diff_configs(first[key], second[key], prefix=sub_prefix)
+            first_val = first_mapping[key]
+            second_val = second_mapping[key]
+            if first_val is MISSING or second_val is MISSING:
+                if first_val is not MISSING:
+                    new_first += [get_diff_string(sub_prefix, first_val)]
+                if second_val is not MISSING:
+                    new_second += [get_diff_string(sub_prefix, second_val)]
+            elif isinstance(first_val, any_config) and isinstance(second_val, any_config):
+                sub_new_first, sub_new_second = diff_configs(first_val, second_val, prefix=sub_prefix)
                 new_first, new_second = new_first + sub_new_first, new_second + sub_new_second
-            elif cast_enums(first[key]) != cast_enums(second[key]):
-                first_val, second_val = first[key], second[key]
+            elif cast_enums(first_val) != cast_enums(second_val):
                 new_first += [get_diff_string(sub_prefix, first_val)]
                 new_second += [get_diff_string(sub_prefix, second_val)]
 
-    elif isinstance(first, Sequence) and isinstance(second, Sequence):
-        if len(first) > len(second):
-            for i in range(len(second), len(first)):
-                new_first += [get_diff_string(prefix, first[i])]
-        elif len(second) > len(first):
-            for i in range(len(first), len(second)):
-                new_second += [get_diff_string(prefix, second[i])]
+    elif (
+        isinstance(first, Sequence)
+        and isinstance(second, Sequence)
+        and not isinstance(first, str | bytes | bytearray)
+        and not isinstance(second, str | bytes | bytearray)
+    ):
+        first_seq = cast(Sequence[object], first)
+        second_seq = cast(Sequence[object], second)
+        if len(first_seq) > len(second_seq):
+            for idx in range(len(second_seq), len(first_seq)):
+                new_first += [get_diff_string(prefix, first_seq[idx])]
+        elif len(second_seq) > len(first_seq):
+            for idx in range(len(first_seq), len(second_seq)):
+                new_second += [get_diff_string(prefix, second_seq[idx])]
 
-        for i in range(min(len(first), len(second))):
-            sub_prefix = str(i) if prefix is None else f"{prefix}.{i}"
-            if isinstance(first[i], any_config) and isinstance(second[i], any_config):
-                sub_new_first, sub_new_second = diff_configs(first[i], second[i], prefix=sub_prefix)
+        for idx in range(min(len(first_seq), len(second_seq))):
+            sub_prefix = str(idx) if prefix is None else f"{prefix}.{idx}"
+            if isinstance(first_seq[idx], any_config) and isinstance(second_seq[idx], any_config):
+                sub_new_first, sub_new_second = diff_configs(first_seq[idx], second_seq[idx], prefix=sub_prefix)
                 new_first, new_second = new_first + sub_new_first, new_second + sub_new_second
     else:
         new_first += [get_diff_string(prefix, first)]

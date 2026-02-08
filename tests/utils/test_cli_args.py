@@ -6,7 +6,7 @@ from typing import Literal
 
 import pytest
 
-from xax.utils.cli_args import ARGPARSE_DEST_METADATA_KEY, parse_args_as, parse_known_args_as
+from xax.utils.cli_args import ARGPARSE_DEST_METADATA_KEY, parse_args_as, parse_known_args_as, render_help_text
 
 
 @dataclass(frozen=True)
@@ -36,3 +36,11 @@ def test_parse_known_args_as_returns_remaining_args() -> None:
 def test_parse_args_as_rejects_wrong_type() -> None:
     with pytest.raises(TypeError, match="Value 'dataset'"):
         parse_args_as(_LauncherArgs, ["--launcher", "dataset"])
+
+
+def test_render_help_text_includes_usage_and_required_marker() -> None:
+    help_text = render_help_text(_LauncherArgs, prog="xax launch")
+
+    assert "Usage: xax launch --launcher <launcher>" in help_text
+    assert "--launcher <launcher>" in help_text
+    assert "(required)" in help_text

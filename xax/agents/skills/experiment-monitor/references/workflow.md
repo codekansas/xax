@@ -19,6 +19,7 @@ where `experiments_dir` comes from `xax.core.conf.get_experiments_dir()` (or its
    - config delta,
    - expected impact,
    - objective metric and direction.
+   - On multi-GPU hosts, reserve 1-2 GPUs for local development and let queue jobs use the remaining GPUs via queue service GPU allocation flags.
 4. Monitor status transitions and failures.
 5. When complete, log observed metrics and write a one-line conclusion.
 6. Decide next action: iterate, branch, or stop.

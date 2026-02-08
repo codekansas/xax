@@ -25,7 +25,7 @@ class QueuedJob(TypedDict):
     task_key: str
     launcher: str
     status: JobStatus
-    exp_dir: str
+    run_dir: str
     stage_dir: str
     config_path: str
     observer_log_path: str
@@ -91,7 +91,7 @@ def _normalize_job(job_id: str, job_raw: dict) -> QueuedJob:
         "task_key": str(job_raw["task_key"]),
         "launcher": str(job_raw["launcher"]),
         "status": cast(JobStatus, str(job_raw["status"])),
-        "exp_dir": str(job_raw["exp_dir"]),
+        "run_dir": str(job_raw["run_dir"]),
         "stage_dir": str(job_raw["stage_dir"]),
         "config_path": str(job_raw["config_path"]),
         "observer_log_path": str(job_raw["observer_log_path"]),
@@ -195,7 +195,7 @@ def enqueue_job(
     *,
     task_key: str,
     launcher: str,
-    exp_dir: Path,
+    run_dir: Path,
     stage_dir: Path,
     config_path: Path,
     observer_log_path: Path,
@@ -213,7 +213,7 @@ def enqueue_job(
             "task_key": task_key,
             "launcher": launcher_name,
             "status": "queued",
-            "exp_dir": str(exp_dir),
+            "run_dir": str(run_dir),
             "stage_dir": str(stage_dir),
             "config_path": str(config_path),
             "observer_log_path": str(observer_log_path),

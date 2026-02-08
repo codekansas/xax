@@ -26,19 +26,19 @@ logger = logging.getLogger(__name__)
 CheckpointPart = Literal["model", "opt_state", "state", "config", "model_state_config", "all"]
 
 
-def get_ckpt_path(exp_dir: Path, state: State | None = None) -> Path:
+def get_ckpt_path(run_dir: Path, state: State | None = None) -> Path:
     """Defines the path to the checkpoint for a given state.
 
     Args:
-        exp_dir: The experiment directory
+        run_dir: The run directory
         state: The current trainer state
 
     Returns:
         The path to the checkpoint directory.
     """
     if state is None:
-        return exp_dir / "checkpoints" / "latest"
-    return exp_dir / "checkpoints" / f"step_{int(state.num_steps.item())}"
+        return run_dir / "checkpoints" / "latest"
+    return run_dir / "checkpoints" / f"step_{int(state.num_steps.item())}"
 
 
 @jax.tree_util.register_dataclass
@@ -176,16 +176,16 @@ class CheckpointingMixin(ArtifactsMixin[Config], Generic[Config]):
         self.__last_ckpt_time = 0.0
 
     def get_ckpt_path(self, state: State | None = None) -> Path:
-        return get_ckpt_path(self.exp_dir, state)
+        return get_ckpt_path(self.run_dir, state)
 
     def get_init_ckpt_path(self) -> Path | None:
-        if self._exp_dir is not None:
+        if self._run_dir is not None:
             ckpt_path = self.get_ckpt_path()
             # Check if latest checkpoint exists
             if ckpt_path.exists() and ckpt_path.is_dir():
                 return ckpt_path
             # Also check for step-based checkpoints
-            checkpoints_dir = self.exp_dir / "checkpoints"
+            checkpoints_dir = self.run_dir / "checkpoints"
             if checkpoints_dir.exists():
                 step_dirs = sorted(
                     [d for d in checkpoints_dir.iterdir() if d.is_dir() and d.name.startswith("step_")],

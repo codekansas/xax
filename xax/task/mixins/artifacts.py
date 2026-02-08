@@ -24,7 +24,6 @@ logger = logging.getLogger(__name__)
 class ArtifactsConfig(BaseConfig):
     runs_dir: str | None = field(None, help="Directory containing all runs for this task")
     run_dir: str | None = field(None, help="The fixed run directory")
-    exp_dir: str | None = field(None, help="Deprecated alias for `run_dir`")
     log_to_file: bool = field(True, help="If set, add a file handler to the logger to write all logs to the run dir")
 
 
@@ -33,14 +32,12 @@ Config = TypeVar("Config", bound=ArtifactsConfig)
 
 class ArtifactsMixin(BaseTask[Config]):
     _run_dir: Path | None
-    _exp_dir: Path | None
     _stage_dir: Path | None
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
 
         self._run_dir = None
-        self._exp_dir = None
         self._stage_dir = None
 
     def add_logger_handlers(self, logger: logging.Logger) -> None:
@@ -77,22 +74,17 @@ class ArtifactsMixin(BaseTask[Config]):
 
     def set_run_dir(self, run_dir: str | Path) -> Self:
         self._run_dir = Path(run_dir).expanduser().resolve()
-        self._exp_dir = self._run_dir
         return self
 
     def get_run_dir(self) -> Path:
         if self._run_dir is not None:
             return self._run_dir
-        if self._exp_dir is not None:
-            self._run_dir = self._exp_dir
-            return self._run_dir
 
-        fixed_run_dir = self.config.run_dir if self.config.run_dir is not None else self.config.exp_dir
+        fixed_run_dir = self.config.run_dir
         if fixed_run_dir is not None:
             run_dir = Path(fixed_run_dir).expanduser().resolve()
             run_dir.mkdir(parents=True, exist_ok=True)
             self._run_dir = run_dir
-            self._exp_dir = run_dir
             logger.log(LOG_STATUS, self._run_dir)
             return self._run_dir
 
@@ -104,22 +96,8 @@ class ArtifactsMixin(BaseTask[Config]):
             run_id += 1
         run_dir.mkdir(exist_ok=True, parents=True)
         self._run_dir = run_dir.expanduser().resolve()
-        self._exp_dir = self._run_dir
         logger.log(LOG_STATUS, self._run_dir)
         return self._run_dir
-
-    @property
-    def exp_dir(self) -> Path:
-        """Deprecated alias for `run_dir`."""
-        return self.get_run_dir()
-
-    def set_exp_dir(self, exp_dir: str | Path) -> Self:
-        """Deprecated alias for `set_run_dir`."""
-        return self.set_run_dir(exp_dir)
-
-    def get_exp_dir(self) -> Path:
-        """Deprecated alias for `get_run_dir`."""
-        return self.get_run_dir()
 
     def stage_environment(self) -> Path | None:
         if self._stage_dir is None:

@@ -15,17 +15,24 @@ Use this skill when the user wants an iterative experimentation loop:
 
 ## Quick Start
 
-1. Start or resume a session under the configured experiments directory (`xax.core.conf.get_experiments_dir()`):
-   - New session:
-     - `python scripts/start_experiment_session.py --new --name <experiment_name>`
-   - Resume session:
-     - `python scripts/start_experiment_session.py --resume --name <experiment_name>`
-2. If queue JSON is available, ingest it:
-   - `python scripts/sync_queue_status.py --experiment-name <experiment_name> --status-json queue_status.json`
-3. Add hypothesis/config/result fields:
-   - `python scripts/upsert_experiment_log.py --experiment-name <experiment_name> --experiment-id <id> ...`
-4. Render a readable report:
-   - `python scripts/render_experiment_report.py --experiment-name <experiment_name>`
+1. Ensure the queue observer service is installed and running:
+   - `xax queue start`
+   - If the machine has multiple GPUs and you want to reserve some for local dev:
+     - Explicit devices: `xax queue start --queue-gpus 0,1,2`
+     - First N devices: `xax queue start --queue-num-gpus 3`
+2. Submit jobs through normal training commands, using queued launch mode when needed:
+   - `python examples/ljspeech.py --launcher queued ...`
+3. Monitor queue state and job progress directly from the queue CLI:
+   - `xax queue status`
+   - `xax queue status --json`
+   - `xax queue metrics <job_id> --json`
+   - `xax queue tail <job_id> --kind observer --follow`
+4. Manage experiment-monitor session artifacts via CLI:
+   - `xax experiment session --new --name <experiment_name>`
+   - `xax experiment sync-queue-status --status-json queue_status.json --experiment-name <experiment_name>`
+   - `xax experiment upsert --experiment-id <id> --status planned ...`
+   - `xax experiment report --experiment-name <experiment_name>`
+5. Iterate on hypotheses based on queue + metrics output and keep a canonical experiment log.
 
 ## Required Operating Rules
 
@@ -57,27 +64,23 @@ Use this skill when the user wants an iterative experimentation loop:
 
 ## Queue CLI Integration
 
-- Prefer the project’s queue-management CLI.
-- If it can emit a JSON payload with a `jobs` list, use `scripts/sync_queue_status.py`.
+- Prefer the project’s queue-management CLI for all queue operations.
+- Before running local test/debug jobs on GPU, first check which GPUs are reserved for queued training via the user service env:
+  - `systemctl --user show xax-queue-observer.service --property=Environment | rg 'XAX_QUEUE_GPUS|XAX_QUEUE_NUM_GPUS'`
+  - Then set `CUDA_VISIBLE_DEVICES` to a non-overlapping GPU set for local commands.
+  - Goal: never run local tests on GPUs currently allocated to the queue observer.
 - For GPU training jobs, queue with:
-  - `--launcher queued --queued-launcher single`
-  This runs one queued job at a time while using a single-device launcher for the job itself.
-- Current `xax` fallback:
-  - `xax queue install-service --enable --start`
-  - `xax queue status --json`
-  - `xax queue metrics <job_id> --json`
-- If the queue CLI schema changes, map it to the log schema in `references/table-schema.md`.
-
-## Scripts
-
-- `scripts/upsert_experiment_log.py`
-  - Upsert one experiment row with hypothesis/metrics/outcome fields.
-- `scripts/sync_queue_status.py`
-  - Ingest queue status JSON and upsert queue/run/result fields.
-- `scripts/render_experiment_report.py`
-  - Generate a concise markdown report from the CSV log.
-- `scripts/start_experiment_session.py`
-  - Create or resume `<experiments_dir>/<experiment_name>` and initialize templates.
+  - `--launcher queued`
+  Queue execution always uses `MultiDeviceLauncher` for the running job.
+- On multi-GPU machines, prefer reserving 1-2 GPUs for active development/debugging and assigning the remaining GPUs to queued jobs via:
+  - `xax queue start --queue-gpus ...`
+  - or `xax queue start --queue-num-gpus ...`
+- Queue commands to prefer:
+  - `xax queue start|stop|restart`
+  - `xax queue status`
+  - `xax queue move|cancel|kill`
+  - `xax queue tail|metrics|tensorboard`
+- Do not rely on standalone helper scripts for this skill. Use `xax queue` and `xax experiment` commands.
 
 ## References
 

@@ -85,7 +85,6 @@ __all__ = [
     "get_data_dir",
     "get_experiments_dir",
     "get_pretrained_models_dir",
-    "get_run_dir",
     "get_runs_dir",
     "load_user_config",
     "MISSING",
@@ -290,6 +289,7 @@ __all__ = [
     "to_yaml_text",
 ]
 
+import importlib
 import os
 import shutil
 from typing import TYPE_CHECKING
@@ -385,7 +385,6 @@ NAME_MAP: dict[str, str] = {
     "get_data_dir": "core.conf",
     "get_experiments_dir": "core.conf",
     "get_pretrained_models_dir": "core.conf",
-    "get_run_dir": "core.conf",
     "get_runs_dir": "core.conf",
     "load_user_config": "core.conf",
     "MISSING": "core.conf",
@@ -677,7 +676,6 @@ if IMPORT_ALL or TYPE_CHECKING:
         get_data_dir,
         get_experiments_dir,
         get_pretrained_models_dir,
-        get_run_dir,
         get_runs_dir,
         load_user_config,
     )

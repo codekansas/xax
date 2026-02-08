@@ -1,8 +1,7 @@
 """Defines a launcher that can be toggled from typed CLI flags."""
 
 import sys
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, get_args
+from typing import TYPE_CHECKING
 
 from xax.task.base import RawConfigType
 from xax.task.launchers.base import BaseLauncher
@@ -11,31 +10,10 @@ from xax.task.launchers.multi_cpu import MultiCpuLauncher
 from xax.task.launchers.multi_device import MultiDeviceLauncher
 from xax.task.launchers.queued import QueuedLauncher
 from xax.task.launchers.single_device import SingleDeviceLauncher
-from xax.utils.cli_args import ARGPARSE_DEST_METADATA_KEY, CLI_SHORT_METADATA_KEY, parse_known_args_as
+from xax.utils.launcher.cli import parse_launcher_args
 
 if TYPE_CHECKING:
     from xax.task.mixins.runnable import Config, RunnableMixin
-
-
-LauncherChoice = Literal["single", "s", "multi", "m", "multi_cpu", "mc", "dataset", "d", "queued", "q"]
-
-
-@dataclass(frozen=True)
-class LauncherCliArgs:
-    launcher: LauncherChoice = field(
-        default="multi",
-        metadata={
-            ARGPARSE_DEST_METADATA_KEY: "launcher",
-            CLI_SHORT_METADATA_KEY: "l",
-        },
-    )
-
-
-def _parse_launcher_args(cli_args: list[str]) -> tuple[LauncherCliArgs, list[str]]:
-    parsed_args, rest = parse_known_args_as(LauncherCliArgs, cli_args)
-    if parsed_args.launcher not in get_args(LauncherChoice):
-        raise ValueError(f"Invalid launcher choice: {parsed_args.launcher}")
-    return parsed_args, rest
 
 
 class CliLauncher(BaseLauncher):
@@ -46,7 +24,7 @@ class CliLauncher(BaseLauncher):
         use_cli: bool | list[str] = True,
     ) -> None:
         args = use_cli if isinstance(use_cli, list) else sys.argv[1:]
-        parsed_args, cli_args_rest = _parse_launcher_args(args)
+        parsed_args, cli_args_rest = parse_launcher_args(args)
         launcher_choice = parsed_args.launcher
         use_cli_next: bool | list[str] = False if not use_cli else cli_args_rest
 

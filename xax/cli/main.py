@@ -1,36 +1,61 @@
 """Top-level `xax` CLI entrypoint with delegated subcommands."""
 
+import importlib
 import sys
 from dataclasses import dataclass
-from typing import Callable
+from typing import Protocol, cast
 
-from xax.cli import edit_config, install_skills, queue
+from xax.utils.cli_output import CliOutput, get_cli_output
 
 
 @dataclass(frozen=True)
 class _Subcommand:
     name: str
     help: str
-    delegate: Callable[[list[str] | None], None]
+    module_name: str
+
+
+class _SubcommandModule(Protocol):
+    def main(self, argv: list[str] | None = None) -> None:
+        ...
+
+
+def _load_subcommand_module(module_name: str) -> _SubcommandModule:
+    module = importlib.import_module(module_name)
+    main_fn = getattr(module, "main", None)
+    if main_fn is None or not callable(main_fn):
+        raise RuntimeError(f"Subcommand module {module_name} does not define callable main(argv)")
+    return cast(_SubcommandModule, module)
 
 
 SUBCOMMANDS: tuple[_Subcommand, ...] = (
-    _Subcommand(name="queue", help="Manage queued jobs and the user systemd observer service", delegate=queue.main),
-    _Subcommand(name="install-skills", help="Install bundled Codex skills into .agents", delegate=install_skills.main),
-    _Subcommand(name="edit-config", help="Edit checkpoint configs in-place", delegate=edit_config.main),
+    _Subcommand(
+        name="queue",
+        help="Manage queued jobs and the user systemd observer service",
+        module_name="xax.cli.queue",
+    ),
+    _Subcommand(
+        name="install-skills",
+        help="Install bundled Codex skills into .agents",
+        module_name="xax.cli.install_skills",
+    ),
+    _Subcommand(
+        name="edit-config",
+        help="Edit checkpoint configs in-place",
+        module_name="xax.cli.edit_config",
+    ),
 )
 
 
-def _build_parser() -> str:
-    lines = [
-        "Usage: xax <command> [args]",
-        "",
-        "Top-level CLI for xax utilities.",
-        "",
-        "Commands:",
-    ]
-    lines.extend([f"  {subcommand.name:14s} {subcommand.help}" for subcommand in SUBCOMMANDS])
-    return "\n".join(lines)
+def _show_help(out: CliOutput) -> None:
+    out.plain("Usage: xax <command> [args]")
+    out.plain("")
+    out.table(
+        title="Commands",
+        headers=["command", "description"],
+        rows=[[subcommand.name, subcommand.help] for subcommand in SUBCOMMANDS],
+    )
+    out.plain("Run `xax <command> --help` for command usage.")
 
 
 def _exit_code_from_system_exit(code: object) -> int:
@@ -42,27 +67,23 @@ def _exit_code_from_system_exit(code: object) -> int:
 
 
 def main(argv: list[str] | None = None) -> None:
-    help_text = _build_parser()
+    out = get_cli_output()
     argv_list = list(sys.argv[1:] if argv is None else argv)
     if not argv_list or argv_list[0] in ("-h", "--help"):
-        sys.stdout.write(help_text + "\n")
+        _show_help(out)
         raise SystemExit(0)
 
     command = argv_list[0]
     subcommand_argv = argv_list[1:]
-    delegate: Callable[[list[str] | None], None] | None = None
-    for subcommand in SUBCOMMANDS:
-        if subcommand.name == command:
-            delegate = subcommand.delegate
-            break
-    if delegate is None:
-        sys.stderr.write(
-            f"Invalid subcommand {command!r}. Choose one of: {[subcommand.name for subcommand in SUBCOMMANDS]}\n"
-        )
+    subcommand = next((item for item in SUBCOMMANDS if item.name == command), None)
+    if subcommand is None:
+        out.error("Invalid subcommand %r.", command)
+        out.plain("Choose one of: %s", ", ".join(item.name for item in SUBCOMMANDS))
         raise SystemExit(2)
 
     try:
-        delegate(subcommand_argv)
+        module = _load_subcommand_module(subcommand.module_name)
+        module.main(subcommand_argv)
         return_code = 0
     except SystemExit as system_exit:
         return_code = _exit_code_from_system_exit(system_exit.code)

@@ -25,6 +25,12 @@ def test_xax_cli_edit_config_help() -> None:
     assert system_exit.value.code == 0
 
 
+def test_xax_cli_experiment_help() -> None:
+    with pytest.raises(SystemExit) as system_exit:
+        main(["experiment", "--help"])
+    assert system_exit.value.code == 0
+
+
 def test_xax_cli_install_skills(tmp_path: Path) -> None:
     destination_agents_dir = tmp_path / ".agents"
     with pytest.raises(SystemExit) as system_exit:

@@ -210,7 +210,35 @@ def parse_args_as(args_type: type[_ArgsT], argv: list[str] | None = None) -> _Ar
 def render_help_text(args_type: type[_ArgsT], *, prog: str, description: str | None = None) -> str:
     fields = _build_fields(args_type)
     field_map = {field.name: field for field in dataclasses.fields(args_type)}
-    lines: list[str] = [f"Usage: {prog} [options]"]
+    positional_fields = [field for field in fields if field.positional]
+    has_optional_options = any(not field.positional and not field.required for field in fields)
+    required_option_fields = [field for field in fields if not field.positional and field.required]
+
+    usage_parts: list[str] = [prog]
+    if has_optional_options:
+        usage_parts.append("[options]")
+
+    def option_usage_fragment(field: _CliField) -> str:
+        option_name = _long_option_name(field)
+        if field.is_bool:
+            return option_name
+        value_label = f"<{field.cli_name}>"
+        if field.is_list:
+            return f"{option_name} {value_label} ..."
+        return f"{option_name} {value_label}"
+
+    for field in required_option_fields:
+        usage_parts.append(option_usage_fragment(field))
+
+    for field in positional_fields:
+        position_label = f"<{field.cli_name}>"
+        if field.is_list:
+            position_label += " ..."
+        if not field.required:
+            position_label = f"[{position_label}]"
+        usage_parts.append(position_label)
+
+    lines: list[str] = [f"Usage: {' '.join(usage_parts)}"]
     if description is not None:
         lines.extend(["", description])
     lines.extend(["", "Options:"])
@@ -220,13 +248,24 @@ def render_help_text(args_type: type[_ArgsT], *, prog: str, description: str | N
         help_text = str(field_meta.metadata.get(CLI_HELP_METADATA_KEY, ""))
         if field.positional:
             cli_label = f"<{field.cli_name}>"
+            if field.is_list:
+                cli_label += " ..."
         else:
             cli_label = _long_option_name(field)
             if field.short_name is not None:
                 cli_label = f"-{field.short_name}, {cli_label}"
-        default_suffix = ""
-        if not field.required and field.default not in (None, [], False):
-            default_suffix = f" (default: {field.default!r})"
-        lines.append(f"  {cli_label:24s} {help_text}{default_suffix}".rstrip())
+            if not field.is_bool:
+                cli_label = f"{cli_label} <{field.cli_name}>"
+
+        details: list[str] = []
+        if field.required:
+            details.append("required")
+        elif field.default not in (None, [], False):
+            details.append(f"default: {field.default!r}")
+        if field.is_bool and field.default is True:
+            details.append(f"disable with --no-{field.cli_name.replace('_', '-')}")
+
+        detail_suffix = f" ({'; '.join(details)})" if details else ""
+        lines.append(f"  {cli_label:30s} {help_text}{detail_suffix}".rstrip())
 
     return "\n".join(lines)

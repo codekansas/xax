@@ -12,8 +12,8 @@ from pathlib import Path
 
 from xax.task.mixins.checkpointing import load_ckpt
 from xax.utils.cli_args import CLI_POSITIONAL_METADATA_KEY, parse_args_as, render_help_text
+from xax.utils.cli_output import get_cli_output
 from xax.utils.structured_config import load_yaml, to_yaml_text
-from xax.utils.text import colored, show_info
 
 
 @dataclass(frozen=True)
@@ -22,6 +22,7 @@ class EditConfigArgs:
 
 
 def _run_edit_config(args: EditConfigArgs) -> None:
+    out = get_cli_output(prefix="edit-config")
     ckpt_path = args.ckpt_path
 
     # Loads the config from the checkpoint.
@@ -42,18 +43,22 @@ def _run_edit_config(args: EditConfigArgs) -> None:
         os.remove(f.name)
 
     if edited_config_str == config_str:
-        show_info("No changes were made to the config.")
+        out.status("No changes were made to the config.")
         return
 
     # Diffs the original and edited configs.
     diff = difflib.ndiff(config_str.splitlines(), edited_config_str.splitlines())
+    diff_rows: list[list[str]] = []
     for line in diff:
         if line.startswith("+ "):
-            print(colored(line, "light-green"), flush=True)
+            diff_rows.append(["+", line[2:]])
         elif line.startswith("- "):
-            print(colored(line, "light-red"), flush=True)
+            diff_rows.append(["-", line[2:]])
         elif line.startswith("? "):
-            print(colored(line, "light-cyan"), flush=True)
+            diff_rows.append(["?", line[2:]])
+
+    if diff_rows:
+        out.table(title="Config Diff", headers=["kind", "line"], rows=diff_rows)
 
     # Saves the edited config to the checkpoint.
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -75,21 +80,31 @@ def _run_edit_config(args: EditConfigArgs) -> None:
             info.size = len(config_bytes)
             tar.addfile(info, io.BytesIO(config_bytes))
 
+    out.status("Updated checkpoint config: %s", ckpt_path)
+
 
 def main(argv: list[str] | None = None) -> None:
+    out = get_cli_output(prefix="edit-config")
     argv_list = list(sys.argv[1:] if argv is None else argv)
     if any(token in ("-h", "--help") for token in argv_list):
-        sys.stdout.write(
+        out.plain(
             render_help_text(
                 EditConfigArgs,
                 prog="xax edit-config",
                 description="Edit checkpoint configs in-place.",
             )
-            + "\n"
         )
         raise SystemExit(0)
     parsed_args = parse_args_as(EditConfigArgs, argv_list)
-    _run_edit_config(parsed_args)
+    try:
+        _run_edit_config(parsed_args)
+        return_code = 0
+    except KeyboardInterrupt:
+        return_code = 130
+    except Exception as error:
+        out.error("Failed to edit checkpoint config: %s", error)
+        return_code = 1
+    raise SystemExit(return_code)
 
 
 if __name__ == "__main__":

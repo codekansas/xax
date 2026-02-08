@@ -143,7 +143,7 @@ class TrainMixin(
         # The kind of step that was specified in the config.
         self._step_kind = cast_step_kind(self.config.step_kind)
 
-        jax.config.update("jax_default_matmul_precision", self.config.precision.compute_dtype.value)
+        jax.config.update("jax_default_matmul_precision", self.config.precision.compute_dtype)
 
     @property
     def precision_config(self) -> PrecisionConfig:
@@ -537,7 +537,7 @@ class TrainMixin(
 
     def log_state(self) -> None:
         logger.log(LOG_STATUS, self.task_path)
-        logger.log(LOG_STATUS, self.exp_dir)
+        logger.log(LOG_STATUS, self.run_dir)
         logger.log(LOG_STATUS, "JAX devices: %s", jax.local_devices())
         self.logger.log_file("state.txt", get_state_file_string(self))
         self.logger.log_file("training_code.py", get_training_code(self))

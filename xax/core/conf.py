@@ -1,5 +1,6 @@
 """Defines base configuration functions and utilities."""
 
+import copy
 import functools
 import os
 from dataclasses import dataclass, field as field_base
@@ -37,8 +38,11 @@ def field(
 
     if callable(value):
         return field_base(default_factory=value, metadata=metadata)
+
+    metadata.setdefault("_xax_help_default_value", copy.deepcopy(value) if value.__class__.__hash__ is None else value)
+
     if value.__class__.__hash__ is None:
-        return field_base(default_factory=lambda: value, metadata=metadata)
+        return field_base(default_factory=lambda value=value: copy.deepcopy(value), metadata=metadata)
     return field_base(default=value, metadata=metadata)
 
 
@@ -80,7 +84,6 @@ class Experiment:
 @dataclass(kw_only=True)
 class Directories:
     runs: str | None = field(None, help="Directory containing all training runs")
-    run: str | None = field(None, help="Deprecated alias for `directories.runs`")
     experiments: str | None = field(None, help="Directory containing experiment-monitor sessions")
     data: str | None = field(None, help="The data directory")
     pretrained_models: str | None = field(None, help="The models directory")
@@ -162,37 +165,6 @@ def _load_user_config_cached() -> UserConfig:
     if local_cfg_path.exists():
         merged_payload = merge_payloads(merged_payload, load_yaml(local_cfg_path))
 
-    # Applies environment variable overrides to preserve current behavior.
-    directories_raw = merged_payload.get("directories")
-    if directories_raw is None:
-        directories_payload: dict[str, object] = {}
-    elif isinstance(directories_raw, dict):
-        directories_payload = {str(key): value for key, value in directories_raw.items()}
-    else:
-        raise TypeError("`directories` config section must be a mapping/object")
-    merged_payload["directories"] = directories_payload
-    env_directory_keys = {
-        "RUNS_DIR": "runs",
-        "RUN_DIR": "run",
-        "EXPERIMENTS_DIR": "experiments",
-        "DATA_DIR": "data",
-        "MODEL_DIR": "pretrained_models",
-    }
-    for env_key, config_key in env_directory_keys.items():
-        if env_value := os.environ.get(env_key):
-            directories_payload[config_key] = env_value
-
-    logging_raw = merged_payload.get("logging")
-    if logging_raw is None:
-        logging_payload: dict[str, object] = {}
-    elif isinstance(logging_raw, dict):
-        logging_payload = {str(key): value for key, value in logging_raw.items()}
-    else:
-        raise TypeError("`logging` config section must be a mapping/object")
-    merged_payload["logging"] = logging_payload
-    if log_level := os.environ.get("XAX_LOG_LEVEL"):
-        logging_payload["log_level"] = log_level
-
     return merge_config_sources(UserConfig, [merged_payload])
 
 
@@ -207,24 +179,13 @@ def load_user_config() -> UserConfig:
 
 def get_runs_dir() -> Path | None:
     config = load_user_config().directories
-    if not is_missing(config, "runs"):
-        runs_value = config.runs
-        if runs_value is None:
-            raise RuntimeError("Expected non-empty `directories.runs` value")
-        (runs_dir := Path(runs_value)).mkdir(parents=True, exist_ok=True)
-        return runs_dir
-    if is_missing(config, "run"):
+    if is_missing(config, "runs"):
         return None
-    run_value = config.run
-    if run_value is None:
-        raise RuntimeError("Expected non-empty `directories.run` value")
-    (run_dir := Path(run_value)).mkdir(parents=True, exist_ok=True)
-    return run_dir
-
-
-def get_run_dir() -> Path | None:
-    """Deprecated alias for `get_runs_dir`."""
-    return get_runs_dir()
+    runs_value = config.runs
+    if runs_value is None:
+        raise RuntimeError("Expected non-empty `directories.runs` value")
+    (runs_dir := Path(runs_value)).mkdir(parents=True, exist_ok=True)
+    return runs_dir
 
 
 def get_experiments_dir() -> Path | None:
@@ -243,7 +204,7 @@ def get_data_dir() -> Path:
     if is_missing(config, "data"):
         raise RuntimeError(
             "The data directory has not been set! You should set it in your config file "
-            f"in {user_config_path()} or set the DATA_DIR environment variable."
+            f"in {user_config_path()}."
         )
     data_value = config.data
     if data_value is None:
@@ -255,8 +216,8 @@ def get_pretrained_models_dir() -> Path:
     config = load_user_config().directories
     if is_missing(config, "pretrained_models"):
         raise RuntimeError(
-            "The data directory has not been set! You should set it in your config file "
-            f"in {user_config_path()} or set the MODEL_DIR environment variable."
+            "The models directory has not been set! You should set it in your config file "
+            f"in {user_config_path()}."
         )
     models_value = config.pretrained_models
     if models_value is None:

@@ -36,6 +36,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax._src.core import ClosedJaxpr
 from jaxtyping import Array
+from numpy.typing import NDArray
 from PIL import Image as PILImage, ImageDraw, ImageFont
 from PIL.Image import Image as PILImageType
 
@@ -466,17 +467,19 @@ def get_image(image: np.ndarray | Array | PILImageType, target_resolution: tuple
         else:
             raise ValueError(f"Unsupported image dtype: {image.dtype}")
 
+        image_u8 = cast(NDArray[np.uint8], image)
+
         # Converts to a PIL image.
-        if image.shape[-1] == 1:
-            image = PILImage.fromarray(image[..., 0])
-        elif image.shape[-1] == 3:
-            image = PILImage.fromarray(image)
-        elif image.shape[0] == 1:
-            image = PILImage.fromarray(image[0])
-        elif image.shape[0] == 3:
-            image = PILImage.fromarray(image.transpose(1, 2, 0))
+        if image_u8.shape[-1] == 1:
+            image = PILImage.fromarray(np.squeeze(image_u8, axis=-1))
+        elif image_u8.shape[-1] == 3:
+            image = PILImage.fromarray(image_u8)
+        elif image_u8.shape[0] == 1:
+            image = PILImage.fromarray(np.squeeze(image_u8, axis=0))
+        elif image_u8.shape[0] == 3:
+            image = PILImage.fromarray(np.transpose(image_u8, (1, 2, 0)))
         else:
-            raise ValueError(f"Unsupported image shape: {image.shape}")
+            raise ValueError(f"Unsupported image shape: {image_u8.shape}")
 
     if target_resolution is not None:
         image = make_human_viewable_resolution(image, trg_res=target_resolution)

@@ -15,7 +15,7 @@ def test_install_bundled_skills_copies_agents_tree(tmp_path: Path) -> None:
     assert copied_entry_count >= 1
     skill_root = destination_agents_dir / "skills" / "experiment-monitor"
     assert (skill_root / "SKILL.md").exists()
-    assert (skill_root / "scripts" / "upsert_experiment_log.py").exists()
+    assert not (skill_root / "scripts").exists()
     assert (skill_root / "references" / "workflow.md").exists()
     assert (skill_root / "templates" / "experiment_log.csv").exists()
     assert (skill_root / ".gitignore").read_text(encoding="utf-8") == "*\n"

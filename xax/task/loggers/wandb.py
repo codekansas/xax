@@ -3,9 +3,8 @@
 import logging
 import os
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 import jax
 import numpy as np
@@ -37,27 +36,10 @@ def sanitize_metric_name(name: str) -> str:
     return "".join(char for char in name if ord(char) <= 0xFFFF)
 
 
-class WandbConfigResumeOption(str, Enum):
-    ALLOW = "allow"
-    NEVER = "never"
-    MUST = "must"
-    AUTO = "auto"
-
-
-class WandbConfigModeOption(str, Enum):
-    ONLINE = "online"
-    OFFLINE = "offline"
-    DISABLED = "disabled"
-    SHARED = "shared"
-
-
-class WandbConfigReinitOption(str, Enum):
-    RETURN_PREVIOUS = "return_previous"
-    FINISH_PREVIOUS = "finish_previous"
-
-
-WandbConfigResume = WandbConfigResumeOption | bool
-WandbConfigMode = WandbConfigModeOption | None
+WandbConfigResumePolicy = Literal["allow", "never", "must", "auto"]
+WandbConfigResume = WandbConfigResumePolicy | bool
+WandbConfigMode = Literal["online", "offline", "disabled", "shared"] | None
+WandbConfigReinit = Literal["return_previous", "finish_previous"]
 
 
 @jax.tree_util.register_dataclass
@@ -70,8 +52,8 @@ class WandbConfig:
     tags: list[str] | None = field(None, help="List of tags for this run.")
     notes: str | None = field(None, help="Notes about this run.")
     log_interval_seconds: float = field(10.0, help="The interval between successive log lines.")
-    reinit: WandbConfigReinitOption = field(
-        WandbConfigReinitOption.RETURN_PREVIOUS,
+    reinit: WandbConfigReinit = field(
+        "return_previous",
         help="Whether to allow multiple wandb.init() calls in the same process.",
     )
     resume: WandbConfigResume = field(False, help="Whether to resume a previous run. Can be a run ID string.")
@@ -136,9 +118,9 @@ class WandbLogger(LoggerImpl):
             config=self.config,
             tags=self.tags,
             notes=self.notes,
-            reinit=self.reinit.value,
-            resume=self.resume.value if isinstance(self.resume, WandbConfigResumeOption) else self.resume,
-            mode=self.mode.value if isinstance(self.mode, WandbConfigModeOption) else self.mode,
+            reinit=self.reinit,
+            resume=self.resume,
+            mode=self.mode,
         )
 
         self._started = True

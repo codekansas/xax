@@ -2,10 +2,9 @@
 
 import os
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from types import TracebackType
-from typing import Generic, Self, TypeVar
+from typing import Generic, Literal, Self, TypeVar
 
 import jax
 import numpy as np
@@ -20,12 +19,7 @@ from xax.task.loggers.tensorboard import TensorboardLogger
 from xax.task.loggers.wandb import WandbConfig, WandbLogger
 from xax.task.mixins.artifacts import ArtifactsConfig, ArtifactsMixin
 
-
-class LoggerBackend(str, Enum):
-    STDOUT = "stdout"
-    JSON = "json"
-    TENSORBOARD = "tensorboard"
-    WANDB = "wandb"
+LoggerBackend = Literal["stdout", "json", "tensorboard", "wandb"]
 
 
 @jax.tree_util.register_dataclass
@@ -36,7 +30,7 @@ class LoggerConfig(ArtifactsConfig):
         help="The interval between successive log lines.",
     )
     logger_backend: list[LoggerBackend] = field(
-        value=[LoggerBackend.STDOUT, LoggerBackend.JSON, LoggerBackend.TENSORBOARD],
+        value=["stdout", "json", "tensorboard"],
         help="The logger backend to use",
     )
     tensorboard_log_interval_seconds: float = field(
@@ -82,36 +76,36 @@ class LoggerMixin(ArtifactsMixin[Config], Generic[Config]):
         # If this is also an ArtifactsMixin, we should default add some
         # additional loggers which log data to the artifacts directory.
         if isinstance(self, ArtifactsMixin):
-            self.add_logger(StateLogger(run_directory=self.exp_dir))
+            self.add_logger(StateLogger(run_directory=self.run_dir))
 
     def _create_logger_backend(self, backend: LoggerBackend) -> LoggerImpl:
         match backend:
-            case LoggerBackend.STDOUT:
+            case "stdout":
                 return StdoutLogger(
                     log_interval_seconds=self.config.log_interval_seconds,
                 )
 
-            case LoggerBackend.JSON:
+            case "json":
                 return JsonLogger(
-                    run_directory=self.exp_dir,
+                    run_directory=self.run_dir,
                     log_interval_seconds=self.config.log_interval_seconds,
                 )
 
-            case LoggerBackend.TENSORBOARD:
+            case "tensorboard":
                 return TensorboardLogger(
-                    run_directory=self.exp_dir,
+                    run_directory=self.run_dir,
                     log_interval_seconds=self.config.tensorboard_log_interval_seconds,
                 )
 
-            case LoggerBackend.WANDB:
+            case "wandb":
                 return WandbLogger(
-                    run_directory=self.exp_dir,
+                    run_directory=self.run_dir,
                     config=self.config.wandb,
                 )
 
             case _:
                 # This shouldn't happen, as validation should take care of this
-                raise Exception(f"Invalid logger_backend '{self.config.logger_backend}'")
+                raise ValueError(f"Invalid logger_backend '{self.config.logger_backend}'")
 
     def decode_tokens(self, tokens: np.ndarray, token_type: str) -> str:
         raise NotImplementedError(

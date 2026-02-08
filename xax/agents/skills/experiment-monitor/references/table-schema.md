@@ -9,7 +9,7 @@
 - `task_key`: task/class identifier.
 - `command`: launch command or short CLI invocation.
 - `config_path`: config snapshot path.
-- `exp_dir`: run output directory (legacy field name in queue payloads).
+- `run_dir`: run output directory.
 - `objective_metric`: name of metric to optimize.
 - `objective_mode`: `max` or `min`.
 - `objective_value`: observed value for completed runs.

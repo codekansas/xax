@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from xax.core.conf import _load_user_config_cached
-from xax.task.launchers.queue_state import (
+from xax.utils.launcher.queue_state import (
     claim_next_job,
     clear_job_process_tracking,
     enqueue_job,
@@ -27,28 +27,28 @@ def _configure_user_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
 
 
 def _enqueue_dummy_job(tmp_path: Path) -> str:
-    exp_dir = tmp_path / "exp"
-    stage_dir = exp_dir / "code"
-    config_path = exp_dir / "queued_config.yaml"
-    observer_log_path = exp_dir / "queue_observer.log"
-    exp_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "code"
+    config_path = run_dir / "queued_config.yaml"
+    observer_log_path = run_dir / "queue_observer.log"
+    run_dir.mkdir(parents=True, exist_ok=True)
     config_path.write_text("test: true\n", encoding="utf-8")
     stage_dir.mkdir(parents=True, exist_ok=True)
     return enqueue_job(
         task_key="tests.task.test_queue_state.DummyTask",
         launcher="multi",
-        exp_dir=exp_dir,
+        run_dir=run_dir,
         stage_dir=stage_dir,
         config_path=config_path,
         observer_log_path=observer_log_path,
     )
 
 
-def test_queue_state_normalizes_legacy_jobs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_queue_state_normalizes_missing_process_fields(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _configure_user_dir(monkeypatch, tmp_path)
     paths = get_queue_paths()
     paths.state_path.parent.mkdir(parents=True, exist_ok=True)
-    legacy_payload = {
+    state_payload = {
         "version": 1,
         "next_job_idx": 2,
         "queue": ["job-0000001"],
@@ -59,10 +59,10 @@ def test_queue_state_normalizes_legacy_jobs(monkeypatch: pytest.MonkeyPatch, tmp
                 "task_key": "tests.task.test_queue_state.DummyTask",
                 "launcher": "multi",
                 "status": "queued",
-                "exp_dir": str(tmp_path / "exp"),
-                "stage_dir": str(tmp_path / "exp" / "code"),
-                "config_path": str(tmp_path / "exp" / "queued_config.yaml"),
-                "observer_log_path": str(tmp_path / "exp" / "queue_observer.log"),
+                "run_dir": str(tmp_path / "run"),
+                "stage_dir": str(tmp_path / "run" / "code"),
+                "config_path": str(tmp_path / "run" / "queued_config.yaml"),
+                "observer_log_path": str(tmp_path / "run" / "queue_observer.log"),
                 "enqueued_at": 1.0,
                 "started_at": None,
                 "ended_at": None,
@@ -72,7 +72,7 @@ def test_queue_state_normalizes_legacy_jobs(monkeypatch: pytest.MonkeyPatch, tmp
             }
         },
     }
-    paths.state_path.write_text(json.dumps(legacy_payload), encoding="utf-8")
+    paths.state_path.write_text(json.dumps(state_payload), encoding="utf-8")
 
     state = read_queue_state()
     job = state["jobs"]["job-0000001"]

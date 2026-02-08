@@ -7,7 +7,7 @@ from importlib import resources
 from pathlib import Path
 
 from xax.utils.cli_args import ARGPARSE_DEST_METADATA_KEY, parse_args_as, render_help_text
-from xax.utils.logging import LOG_STATUS, configure_logging
+from xax.utils.cli_output import get_cli_output
 
 
 def _write_new_skill_gitignores(destination_agents_dir: Path, existing_skill_names: set[str]) -> int:
@@ -78,15 +78,14 @@ class InstallSkillsArgs:
 
 
 def _command_install(args: InstallSkillsArgs) -> int:
-    logger = configure_logging(prefix="skills")
+    out = get_cli_output(prefix="skills")
 
     destination_agents_dir = args.destination_agents_dir.expanduser()
     if not destination_agents_dir.is_absolute():
         destination_agents_dir = (Path.cwd() / destination_agents_dir).resolve()
 
     copied_entry_count = install_bundled_skills(destination_agents_dir, commit_to_git=args.commit_to_git)
-    logger.log(
-        LOG_STATUS,
+    out.status(
         "Installed %d top-level entries into %s (commit_to_git=%s)",
         copied_entry_count,
         destination_agents_dir,
@@ -96,15 +95,15 @@ def _command_install(args: InstallSkillsArgs) -> int:
 
 
 def main(argv: list[str] | None = None) -> None:
+    out = get_cli_output(prefix="skills")
     argv_list = list(sys.argv[1:] if argv is None else argv)
     if any(token in ("-h", "--help") for token in argv_list):
-        sys.stdout.write(
+        out.plain(
             render_help_text(
                 InstallSkillsArgs,
                 prog="xax install-skills",
                 description="Install bundled xax Codex skills into a local .agents directory.",
             )
-            + "\n"
         )
         raise SystemExit(0)
     parsed_args = parse_args_as(InstallSkillsArgs, argv_list)
@@ -114,8 +113,7 @@ def main(argv: list[str] | None = None) -> None:
     except KeyboardInterrupt:
         return_code = 130
     except Exception as error:
-        logger = configure_logging(prefix="skills")
-        logger.error("Failed to install skills: %s", error)
+        out.error("Failed to install skills: %s", error)
         return_code = 1
     raise SystemExit(return_code)
 

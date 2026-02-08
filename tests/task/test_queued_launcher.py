@@ -8,10 +8,10 @@ import pytest
 
 from xax.core.conf import _load_user_config_cached
 from xax.task.base import BaseConfig, BaseTask
-from xax.task.launchers.queue_state import clear_observer, read_queue_state, register_observer
 from xax.task.launchers.queued import QueuedLauncher
 from xax.task.mixins.artifacts import ArtifactsConfig, ArtifactsMixin
 from xax.task.mixins.runnable import RunnableConfig, RunnableMixin
+from xax.utils.launcher.queue_state import clear_observer, read_queue_state, register_observer
 
 
 @dataclass
@@ -40,7 +40,7 @@ def test_queued_launcher_requires_active_observer(monkeypatch: pytest.MonkeyPatc
     with pytest.raises(RuntimeError, match="observer"):
         launcher.launch(
             DummyQueuedTask,
-            DummyQueuedConfig(exp_dir=str(tmp_path / "run_a")),
+            DummyQueuedConfig(run_dir=str(tmp_path / "run_a")),
             use_cli=False,
         )
 
@@ -51,10 +51,10 @@ def test_queued_launcher_enqueues_job(monkeypatch: pytest.MonkeyPatch, tmp_path:
     register_observer(observer_pid, status="idle")
     try:
         launcher = QueuedLauncher()
-        exp_dir = tmp_path / "run_b"
+        run_dir = tmp_path / "run_b"
         launcher.launch(
             DummyQueuedTask,
-            DummyQueuedConfig(exp_dir=str(exp_dir)),
+            DummyQueuedConfig(run_dir=str(run_dir)),
             use_cli=False,
         )
 
@@ -65,6 +65,7 @@ def test_queued_launcher_enqueues_job(monkeypatch: pytest.MonkeyPatch, tmp_path:
 
         assert queued_job["status"] == "queued"
         assert queued_job["task_key"].endswith(".DummyQueuedTask")
+        assert queued_job["launcher"] == "multi"
         assert Path(queued_job["config_path"]).exists()
         assert Path(queued_job["stage_dir"]).exists()
     finally:
@@ -79,20 +80,20 @@ def test_queued_launcher_allows_queue_reordering(monkeypatch: pytest.MonkeyPatch
         launcher = QueuedLauncher()
         launcher.launch(
             DummyQueuedTask,
-            DummyQueuedConfig(exp_dir=str(tmp_path / "run_1")),
+            DummyQueuedConfig(run_dir=str(tmp_path / "run_1")),
             use_cli=False,
         )
         launcher.launch(
             DummyQueuedTask,
-            DummyQueuedConfig(exp_dir=str(tmp_path / "run_2")),
+            DummyQueuedConfig(run_dir=str(tmp_path / "run_2")),
             use_cli=["--queue-position", "1"],
         )
         state = read_queue_state()
         assert len(state["queue"]) == 2
         first_job = state["jobs"][state["queue"][0]]
         second_job = state["jobs"][state["queue"][1]]
-        assert first_job["exp_dir"].endswith("run_2")
-        assert second_job["exp_dir"].endswith("run_1")
+        assert first_job["run_dir"].endswith("run_2")
+        assert second_job["run_dir"].endswith("run_1")
     finally:
         clear_observer(observer_pid)
 
@@ -103,10 +104,29 @@ def test_cli_launcher_supports_queued_choice(monkeypatch: pytest.MonkeyPatch, tm
     register_observer(observer_pid, status="idle")
     try:
         DummyQueuedTask.launch(
-            DummyQueuedConfig(exp_dir=str(tmp_path / "run_cli")),
+            DummyQueuedConfig(run_dir=str(tmp_path / "run_cli")),
             use_cli=["--launcher", "queued"],
         )
         state = read_queue_state()
         assert len(state["queue"]) == 1
+    finally:
+        clear_observer(observer_pid)
+
+
+def test_queued_launcher_rejects_removed_queued_launcher_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _configure_user_dir(monkeypatch, tmp_path)
+    observer_pid = os.getpid()
+    register_observer(observer_pid, status="idle")
+    try:
+        launcher = QueuedLauncher()
+        with pytest.raises(ValueError, match="no longer supported"):
+            launcher.launch(
+                DummyQueuedTask,
+                DummyQueuedConfig(run_dir=str(tmp_path / "run_deprecated_flag")),
+                use_cli=["--queued-launcher", "single"],
+            )
     finally:
         clear_observer(observer_pid)
