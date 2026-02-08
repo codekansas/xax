@@ -29,7 +29,7 @@ def _configure_user_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
 def _enqueue_dummy_job(tmp_path: Path) -> str:
     run_dir = tmp_path / "run"
     stage_dir = run_dir / "code"
-    config_path = run_dir / "queued_config.yaml"
+    config_path = run_dir / "config.yaml"
     observer_log_path = run_dir / "queue_observer.log"
     run_dir.mkdir(parents=True, exist_ok=True)
     config_path.write_text("test: true\n", encoding="utf-8")
@@ -61,7 +61,7 @@ def test_queue_state_normalizes_missing_process_fields(monkeypatch: pytest.Monke
                 "status": "queued",
                 "run_dir": str(tmp_path / "run"),
                 "stage_dir": str(tmp_path / "run" / "code"),
-                "config_path": str(tmp_path / "run" / "queued_config.yaml"),
+                "config_path": str(tmp_path / "run" / "config.yaml"),
                 "observer_log_path": str(tmp_path / "run" / "queue_observer.log"),
                 "enqueued_at": 1.0,
                 "started_at": None,

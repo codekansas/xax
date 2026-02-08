@@ -12,7 +12,12 @@ Use `xax queue` commands as the primary integration surface:
 - `xax queue metrics <job_id> --json`
 - `xax queue tail <job_id> --kind observer --follow`
 
-Use `xax experiment` commands for experiment-log operations; avoid standalone helper scripts.
+Use skill scripts for experiment-log operations:
+
+- `start_experiment_session.py`
+- `sync_queue_status.py`
+- `upsert_experiment_log.py`
+- `render_experiment_report.py`
 
 ## Queue JSON Shape
 

@@ -328,7 +328,7 @@ def test_status_formats_recent_jobs_as_table_and_shows_observer_gpus(
         "status": "completed",
         "run_dir": "/tmp/run_001",
         "stage_dir": "/tmp/run_001/code",
-        "config_path": "/tmp/run_001/queued_config.yaml",
+        "config_path": "/tmp/run_001/config.yaml",
         "observer_log_path": "/tmp/run_001/queue_observer.log",
         "enqueued_at": 1.0,
         "started_at": 2.0,
@@ -390,7 +390,7 @@ def test_tail_defaults_to_running_job_when_job_id_is_omitted(
         "status": "running",
         "run_dir": "/tmp/run_002",
         "stage_dir": "/tmp/run_002/code",
-        "config_path": "/tmp/run_002/queued_config.yaml",
+        "config_path": "/tmp/run_002/config.yaml",
         "observer_log_path": "/tmp/run_002/queue_observer.log",
         "enqueued_at": 1.0,
         "started_at": 2.0,
@@ -445,7 +445,7 @@ def test_run_queued_job_always_uses_multi_device_launcher(
 ) -> None:
     stage_dir = tmp_path / "stage"
     stage_dir.mkdir(parents=True, exist_ok=True)
-    config_path = tmp_path / "queued_config.yaml"
+    config_path = tmp_path / "config.yaml"
     config_path.write_text("{}", encoding="utf-8")
 
     job_id = "job-0000001"

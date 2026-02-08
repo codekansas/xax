@@ -38,7 +38,7 @@ class QueuedLauncher(BaseLauncher):
         run_dir = get_task_run_dir(task_obj)
         run_dir.mkdir(parents=True, exist_ok=True)
 
-        config_path = run_dir / "queued_config.yaml"
+        config_path = run_dir / "config.yaml"
         staged_code_dir = run_dir / "code"
         observer_log_path = run_dir / "queue_observer.log"
 

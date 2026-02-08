@@ -25,10 +25,12 @@ def test_xax_cli_edit_config_help() -> None:
     assert system_exit.value.code == 0
 
 
-def test_xax_cli_experiment_help() -> None:
+def test_xax_cli_rejects_removed_experiment_subcommand(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as system_exit:
-        main(["experiment", "--help"])
-    assert system_exit.value.code == 0
+        main(["experiment"])
+
+    assert system_exit.value.code == 2
+    assert "Invalid subcommand" in capsys.readouterr().err
 
 
 def test_xax_cli_install_skills(tmp_path: Path) -> None:

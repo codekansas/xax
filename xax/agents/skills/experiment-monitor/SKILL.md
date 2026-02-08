@@ -27,11 +27,11 @@ Use this skill when the user wants an iterative experimentation loop:
    - `xax queue status --json`
    - `xax queue metrics <job_id> --json`
    - `xax queue tail <job_id> --kind observer --follow`
-4. Manage experiment-monitor session artifacts via CLI:
-   - `xax experiment session --new --name <experiment_name>`
-   - `xax experiment sync-queue-status --status-json queue_status.json --experiment-name <experiment_name>`
-   - `xax experiment upsert --experiment-id <id> --status planned ...`
-   - `xax experiment report --experiment-name <experiment_name>`
+4. Manage experiment-monitor session artifacts via skill scripts:
+   - `python xax/agents/skills/experiment-monitor/scripts/start_experiment_session.py --new --name <experiment_name>`
+   - `python xax/agents/skills/experiment-monitor/scripts/sync_queue_status.py --status-json queue_status.json --experiment-name <experiment_name>`
+   - `python xax/agents/skills/experiment-monitor/scripts/upsert_experiment_log.py --experiment-id <id> --status planned ...`
+   - `python xax/agents/skills/experiment-monitor/scripts/render_experiment_report.py --experiment-name <experiment_name>`
 5. Iterate on hypotheses based on queue + metrics output and keep a canonical experiment log.
 
 ## Required Operating Rules
@@ -80,7 +80,7 @@ Use this skill when the user wants an iterative experimentation loop:
   - `xax queue status`
   - `xax queue move|cancel|kill`
   - `xax queue tail|metrics|tensorboard`
-- Do not rely on standalone helper scripts for this skill. Use `xax queue` and `xax experiment` commands.
+- Use `xax queue` for queue operations and the skill-local scripts under `xax/agents/skills/experiment-monitor/scripts/` for experiment-log operations.
 
 ## References
 
