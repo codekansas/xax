@@ -8,10 +8,9 @@ import os
 import signal
 import socket
 import time
-from collections.abc import Mapping
 from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
-from typing import Iterator, Literal, TypeAlias
+from typing import Iterator, Literal, Mapping, TypeAlias
 
 import cattrs
 
@@ -488,9 +487,7 @@ def register_observer(
             and prev_info is not None
             and prev_info.pid != pid
         ):
-            raise RuntimeError(
-                f"Queue observer is already running (pid={prev_info.pid}, host={prev_info.hostname})"
-            )
+            raise RuntimeError(f"Queue observer is already running (pid={prev_info.pid}, host={prev_info.hostname})")
         now = time.time()
         info = ObserverInfo(
             pid=pid,

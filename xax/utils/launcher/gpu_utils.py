@@ -3,8 +3,8 @@
 import os
 import shutil
 import subprocess
-from collections.abc import Mapping
 from pathlib import Path
+from typing import Mapping
 
 QUEUE_GPUS_ENV_VAR = "XAX_QUEUE_GPUS"
 QUEUE_NUM_GPUS_ENV_VAR = "XAX_QUEUE_NUM_GPUS"

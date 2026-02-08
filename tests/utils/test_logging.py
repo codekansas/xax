@@ -2,8 +2,8 @@
 
 import io
 import logging
-from collections.abc import Iterator
 from types import SimpleNamespace
+from typing import Iterator
 
 import pytest
 
