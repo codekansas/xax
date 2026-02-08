@@ -124,6 +124,7 @@ def test_queue_top_level_help_lists_command_descriptions(capsys: pytest.CaptureF
     assert system_exit.value.code == 0
     output = capsys.readouterr().out
     assert "status" in output
+    assert "wait" in output
     assert "Show observer status" in output
     assert "install-service" not in output
     assert "uninstall-service" not in output
@@ -461,3 +462,77 @@ def test_tail_without_job_id_errors_when_queue_is_empty(
     assert system_exit.value.code == 1
     assert "No queued jobs to tail" in capsys.readouterr().err
 
+
+def test_wait_returns_immediately_when_no_running_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("xax.cli.queue.xax.get_running_job", lambda: None)
+
+    def fail_sleep(_seconds: float) -> None:
+        raise AssertionError("wait should not sleep when there is no running job")
+
+    monkeypatch.setattr("xax.cli.queue.time.sleep", fail_sleep)
+
+    with pytest.raises(SystemExit) as system_exit:
+        main(["wait"])
+
+    assert system_exit.value.code == 0
+
+
+def test_wait_polls_until_original_running_job_finishes(monkeypatch: pytest.MonkeyPatch) -> None:
+    running_job = QueuedJob(
+        job_id="job-0000010",
+        task_key="tests.task.DummyTask",
+        launcher="single",
+        python_executable=sys.executable,
+        status="running",
+        run_dir="/tmp/run_010",
+        stage_dir="/tmp/run_010/code",
+        config_path="/tmp/run_010/config.yaml",
+        observer_log_path="/tmp/run_010/queue_observer.log",
+        enqueued_at=1.0,
+        started_at=2.0,
+        ended_at=None,
+        pid=1010,
+        process_group_id=1010,
+        child_pids=[],
+        oom_detected=False,
+        return_code=None,
+        error=None,
+    )
+    finished_job = QueuedJob(
+        job_id="job-0000010",
+        task_key="tests.task.DummyTask",
+        launcher="single",
+        python_executable=sys.executable,
+        status="completed",
+        run_dir="/tmp/run_010",
+        stage_dir="/tmp/run_010/code",
+        config_path="/tmp/run_010/config.yaml",
+        observer_log_path="/tmp/run_010/queue_observer.log",
+        enqueued_at=1.0,
+        started_at=2.0,
+        ended_at=3.0,
+        pid=None,
+        process_group_id=None,
+        child_pids=[],
+        oom_detected=False,
+        return_code=0,
+        error=None,
+    )
+    polled_states = iter(
+        [
+            QueueState(version=1, next_job_idx=2, queue=[], running_job_id="job-0000010", jobs={}),
+            QueueState(version=1, next_job_idx=3, queue=[], running_job_id="job-0000099", jobs={}),
+        ]
+    )
+    sleep_calls: list[float] = []
+
+    monkeypatch.setattr("xax.cli.queue.xax.get_running_job", lambda: running_job)
+    monkeypatch.setattr("xax.cli.queue.xax.read_queue_state", lambda: next(polled_states))
+    monkeypatch.setattr("xax.cli.queue.xax.get_job", lambda job_id: finished_job if job_id == "job-0000010" else None)
+    monkeypatch.setattr("xax.cli.queue.time.sleep", lambda seconds: sleep_calls.append(seconds))
+
+    with pytest.raises(SystemExit) as system_exit:
+        main(["wait", "--poll-seconds", "0.5"])
+
+    assert system_exit.value.code == 0
+    assert sleep_calls == [0.5]

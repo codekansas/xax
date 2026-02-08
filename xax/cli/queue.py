@@ -75,6 +75,11 @@ class QueueStatusArgs:
 
 
 @dataclass(frozen=True)
+class QueueWaitArgs:
+    poll_seconds: float = xax.field(DEFAULT_POLL_SECONDS, help="Polling interval while waiting for completion.")
+
+
+@dataclass(frozen=True)
 class MoveJobArgs:
     job_id: str = xax.field(help="Queued job id to move.", metadata={xax.CLI_POSITIONAL_METADATA_KEY: True})
     position: int = xax.field(help="1-based queue position.", metadata={xax.CLI_POSITIONAL_METADATA_KEY: True})
@@ -793,6 +798,38 @@ def _command_status(args: QueueStatusArgs) -> int:
     return 0
 
 
+def _command_wait(args: QueueWaitArgs) -> int:
+    if args.poll_seconds <= 0:
+        raise ValueError("poll_seconds must be > 0")
+
+    out = xax.get_cli_output(prefix="queue")
+    running_job = xax.get_running_job()
+    if running_job is None:
+        return 0
+
+    waiting_job_id = running_job.job_id
+    out.status("Waiting for running job %s to finish", waiting_job_id)
+
+    while True:
+        state = xax.read_queue_state()
+        if state.running_job_id != waiting_job_id:
+            break
+        time.sleep(args.poll_seconds)
+
+    finished_job = xax.get_job(waiting_job_id)
+    if finished_job is None:
+        out.status("Job %s finished", waiting_job_id)
+        return 0
+
+    out.status(
+        "Job %s finished: status=%s return=%s",
+        waiting_job_id,
+        finished_job.status,
+        "-" if finished_job.return_code is None else str(finished_job.return_code),
+    )
+    return 0
+
+
 def _command_move(args: MoveJobArgs) -> int:
     position_idx = args.position - 1
     if position_idx < 0:
@@ -1340,6 +1377,10 @@ COMMAND_SPECS: dict[str, _CommandSpec] = {
         description="Show observer status, running job, queued jobs, and recent completions.",
         args_type=QueueStatusArgs,
     ),
+    "wait": _CommandSpec(
+        description="Wait for the currently running queued job to finish.",
+        args_type=QueueWaitArgs,
+    ),
     "move": _CommandSpec(
         description="Move a queued job to a new position.",
         args_type=MoveJobArgs,
@@ -1440,6 +1481,8 @@ def main(argv: list[str] | None = None) -> None:
                 return_code = int(_command_service_lifecycle("restart", sub_argv))
             case "status":
                 return_code = int(_command_status(xax.parse_args_as(QueueStatusArgs, sub_argv)))
+            case "wait":
+                return_code = int(_command_wait(xax.parse_args_as(QueueWaitArgs, sub_argv)))
             case "move":
                 return_code = int(_command_move(xax.parse_args_as(MoveJobArgs, sub_argv)))
             case "cancel":
