@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from xax.cli.queue import (
+    MetricPoint,
     _resolve_existing_run_dir,
     _resolve_queue_gpu_devices,
     _service_unit_text,
@@ -461,6 +462,130 @@ def test_tail_without_job_id_errors_when_queue_is_empty(
 
     assert system_exit.value.code == 1
     assert "No queued jobs to tail" in capsys.readouterr().err
+
+
+def test_metrics_defaults_to_running_job_and_returns_latest_per_tag(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    running_job = QueuedJob(
+        job_id="job-0000020",
+        task_key="tests.task.DummyTask",
+        launcher="single",
+        python_executable=sys.executable,
+        status="running",
+        run_dir="/tmp/run_020",
+        stage_dir="/tmp/run_020/code",
+        config_path="/tmp/run_020/config.yaml",
+        observer_log_path="/tmp/run_020/queue_observer.log",
+        enqueued_at=1.0,
+        started_at=2.0,
+        ended_at=None,
+        pid=20,
+        process_group_id=20,
+        child_pids=[],
+        oom_detected=False,
+        return_code=None,
+        error=None,
+    )
+    resolved_run_dir = tmp_path / "resolved_run"
+    (resolved_run_dir / "tensorboard").mkdir(parents=True, exist_ok=True)
+    points = [
+        MetricPoint(tag="train/loss", step=1, wall_time=1.0, value=2.0, source="light"),
+        MetricPoint(tag="train/loss", step=2, wall_time=2.0, value=1.5, source="heavy"),
+        MetricPoint(tag="val/loss", step=1, wall_time=1.2, value=3.0, source="light"),
+        MetricPoint(tag="val/loss", step=3, wall_time=3.2, value=2.4, source="light"),
+    ]
+
+    monkeypatch.setattr("xax.cli.queue.xax.get_running_job", lambda: running_job)
+    monkeypatch.setattr("xax.cli.queue.xax.list_jobs", lambda: [])
+    monkeypatch.setattr("xax.cli.queue._resolve_existing_run_dir", lambda _run_dir: resolved_run_dir)
+    monkeypatch.setattr("xax.cli.queue._collect_metric_points", lambda _tb_root: points)
+
+    with pytest.raises(SystemExit) as system_exit:
+        main(["metrics", "--json"])
+
+    assert system_exit.value.code == 0
+    payload = capsys.readouterr().out
+    assert payload.count('"tag": "train/loss"') == 1
+    assert payload.count('"tag": "val/loss"') == 1
+    assert '"step": 2' in payload
+    assert '"value": 1.5' in payload
+    assert '"step": 3' in payload
+    assert '"value": 2.4' in payload
+    assert '"value": 2.0' not in payload
+    assert '"value": 3.0' not in payload
+
+
+def test_metrics_without_job_id_uses_most_recent_job(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    older_job = QueuedJob(
+        job_id="job-0000030",
+        task_key="tests.task.DummyTask",
+        launcher="single",
+        python_executable=sys.executable,
+        status="completed",
+        run_dir="/tmp/run_030",
+        stage_dir="/tmp/run_030/code",
+        config_path="/tmp/run_030/config.yaml",
+        observer_log_path="/tmp/run_030/queue_observer.log",
+        enqueued_at=1.0,
+        started_at=2.0,
+        ended_at=3.0,
+        pid=None,
+        process_group_id=None,
+        child_pids=[],
+        oom_detected=False,
+        return_code=0,
+        error=None,
+    )
+    newest_job = QueuedJob(
+        job_id="job-0000031",
+        task_key="tests.task.DummyTask",
+        launcher="single",
+        python_executable=sys.executable,
+        status="queued",
+        run_dir="/tmp/run_031",
+        stage_dir="/tmp/run_031/code",
+        config_path="/tmp/run_031/config.yaml",
+        observer_log_path="/tmp/run_031/queue_observer.log",
+        enqueued_at=4.0,
+        started_at=None,
+        ended_at=None,
+        pid=None,
+        process_group_id=None,
+        child_pids=[],
+        oom_detected=False,
+        return_code=None,
+        error=None,
+    )
+    selected_run_dir: str | None = None
+    resolved_run_dir = tmp_path / "resolved_run"
+    (resolved_run_dir / "tensorboard").mkdir(parents=True, exist_ok=True)
+
+    def _fake_resolve_existing_run_dir(run_dir_raw: str) -> Path:
+        nonlocal selected_run_dir
+        selected_run_dir = run_dir_raw
+        return resolved_run_dir
+
+    monkeypatch.setattr("xax.cli.queue.xax.get_running_job", lambda: None)
+    monkeypatch.setattr("xax.cli.queue.xax.list_jobs", lambda: [older_job, newest_job])
+    monkeypatch.setattr("xax.cli.queue._resolve_existing_run_dir", _fake_resolve_existing_run_dir)
+    monkeypatch.setattr(
+        "xax.cli.queue._collect_metric_points",
+        lambda _tb_root: [MetricPoint(tag="loss", step=5, wall_time=5.0, value=1.0, source="light")],
+    )
+
+    with pytest.raises(SystemExit) as system_exit:
+        main(["metrics"])
+
+    assert system_exit.value.code == 0
+    assert selected_run_dir == newest_job.run_dir
+    assert newest_job.job_id in capsys.readouterr().out
 
 
 def test_wait_returns_immediately_when_no_running_job(monkeypatch: pytest.MonkeyPatch) -> None:

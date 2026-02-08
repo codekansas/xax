@@ -95,7 +95,6 @@ class SupervisedMixin(
 
     @xax_jit(
         static_argnames=["self", "static_parts", "optimizer", "heavy"],
-        donate_argnames=["trainable_arr", "opt_state", "state", "key"],
         jit_level=3,
     )
     def train_step(

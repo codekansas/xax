@@ -1518,13 +1518,28 @@ def llm_generate_jit(
     initial_len = tokens_t.shape[-1]
     max_len = initial_len + max_new_tokens
 
-    # Initialize output token buffer
+    if max_new_tokens <= 0:
+        return tokens_t, jnp.asarray(initial_len, dtype=jnp.int32)
+
+    # Initializes output token buffer.
     padded_tokens = jnp.zeros(max_len, dtype=jnp.int32)
     padded_tokens = padded_tokens.at[:initial_len].set(tokens_t)
 
     dtype = model.embed.weight.dtype
-    init_caches = model.init_cache(max_len, dtype)
-    init_state = (padded_tokens, jnp.int32(initial_len), key, jnp.bool_(False), init_caches)
+    caches = model.init_cache(max_len, dtype)
+
+    # Prime the KV cache with the prompt so subsequent iterations can decode one token at a time.
+    prompt_context_tn = None if context_tn is None else context_tn[:initial_len]
+    prompt_logits_tv, caches = model.forward(tokens_t, context_tn=prompt_context_tn, caches=caches)
+    prompt_logits_1v = prompt_logits_tv[-1:, :]
+
+    # Samples first generated token from the prompt's last position.
+    key, sample_key = jax.random.split(key)
+    next_token = _sample_next_token(prompt_logits_1v, temperature, top_p, sample_key, num_samples=1)[0, 0]
+    padded_tokens = padded_tokens.at[initial_len].set(next_token)
+    done = jnp.bool_((eos_id >= 0) & (next_token == eos_id))
+
+    init_state = (padded_tokens, jnp.int32(initial_len + 1), key, done, caches)
 
     def cond_fn(state: tuple[Array, Array, Array, Array, list[TransformerBlockCache]]) -> Array:
         _, cur_pos, _, done, _ = state
@@ -1535,17 +1550,21 @@ def llm_generate_jit(
     ) -> tuple[Array, Array, Array, Array, list[TransformerBlockCache]]:
         tokens_t, cur_pos, key, _, caches = state
 
-        # Forward pass on full buffer, passing caches around.
-        key, subkey = jax.random.split(key)
-        logits_tv, caches = model.forward(tokens_t[:-1], context_tn=context_tn, caches=caches)
-        logits = logits_tv[..., cur_pos - 1, :]
+        prev_token_1 = jax.lax.dynamic_slice(tokens_t, (cur_pos - 1,), (1,))
+        step_context_1n = (
+            None
+            if context_tn is None
+            else jax.lax.dynamic_slice_in_dim(context_tn, start_index=cur_pos - 1, slice_size=1, axis=0)
+        )
 
-        key, subkey = jax.random.split(key)
-        next_token = _sample_next_token(logits, temperature, top_p, subkey, num_samples=1)[..., 0]
-        new_tokens = tokens_t.at[cur_pos].set(next_token)
+        logits_1v, caches = model.forward(prev_token_1, context_tn=step_context_1n, caches=caches)
+
+        key, sample_key = jax.random.split(key)
+        next_token = _sample_next_token(logits_1v, temperature, top_p, sample_key, num_samples=1)[0, 0]
+        tokens_t = tokens_t.at[cur_pos].set(next_token)
         done = jnp.bool_((eos_id >= 0) & (next_token == eos_id))
 
-        return (new_tokens, cur_pos + 1, key, done, caches)
+        return tokens_t, cur_pos + 1, key, done, caches
 
     final_tokens, final_pos, _, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_state)
     return final_tokens, final_pos

@@ -130,9 +130,12 @@ class TensorboardArgs:
 
 @dataclass(frozen=True)
 class MetricsArgs:
-    job_id: str = xax.field(help="Job id to read metrics from.", metadata={xax.CLI_POSITIONAL_METADATA_KEY: True})
+    job_id: str | None = xax.field(
+        None,
+        help="Job id to read metrics from. Defaults to the running job, otherwise the most recent job.",
+        metadata={xax.CLI_POSITIONAL_METADATA_KEY: True},
+    )
     tag: str | None = xax.field(None, help="Optional metric tag filter.")
-    last: int | None = xax.field(None, help="Keep only the last N points per tag.")
     as_json: bool = xax.field(
         False,
         help="Emit metric points as JSON.",
@@ -955,21 +958,27 @@ def _tail_file(path: Path, lines: int, follow: bool) -> int:
                 time.sleep(0.5)
 
 
+def _running_or_latest_job() -> "xax.QueuedJob | None":
+    if (running_job := xax.get_running_job()) is not None:
+        return running_job
+    jobs = xax.list_jobs()
+    if not jobs:
+        return None
+    return max(
+        jobs,
+        key=lambda job: max(
+            job.enqueued_at,
+            job.started_at or job.enqueued_at,
+            job.ended_at or job.enqueued_at,
+        ),
+    )
+
+
 def _command_tail(args: TailJobArgs) -> int:
     if args.job_id is None:
-        job = xax.get_running_job()
+        job = _running_or_latest_job()
         if job is None:
-            jobs = xax.list_jobs()
-            if not jobs:
-                raise ValueError("No queued jobs to tail. Pass a job id explicitly.")
-            job = max(
-                jobs,
-                key=lambda queued_job: max(
-                    queued_job.enqueued_at,
-                    queued_job.started_at or queued_job.enqueued_at,
-                    queued_job.ended_at or queued_job.enqueued_at,
-                ),
-            )
+            raise ValueError("No queued jobs to tail. Pass a job id explicitly.")
     else:
         job = xax.get_job(args.job_id)
         if job is None:
@@ -1090,28 +1099,38 @@ def _collect_metric_points(tensorboard_root: Path) -> list[MetricPoint]:
     return points
 
 
+def _latest_metric_points_by_tag(points: list[MetricPoint]) -> list[MetricPoint]:
+    latest_by_tag: dict[str, MetricPoint] = {}
+    for point in points:
+        previous = latest_by_tag.get(point.tag)
+        if previous is None or (point.step, point.wall_time, point.source) > (
+            previous.step,
+            previous.wall_time,
+            previous.source,
+        ):
+            latest_by_tag[point.tag] = point
+    return [latest_by_tag[tag] for tag in sorted(latest_by_tag)]
+
+
 def _command_metrics(args: MetricsArgs) -> int:
-    job = xax.get_job(args.job_id)
-    if job is None:
-        raise ValueError(f"Unknown job id: {args.job_id}")
+    if args.job_id is None:
+        job = _running_or_latest_job()
+        if job is None:
+            raise ValueError("No queued jobs to read metrics from. Pass a job id explicitly.")
+    else:
+        job = xax.get_job(args.job_id)
+        if job is None:
+            raise ValueError(f"Unknown job id: {args.job_id}")
+    job_id = job.job_id
 
     tensorboard_root = _resolve_existing_run_dir(job.run_dir) / "tensorboard"
     if not tensorboard_root.exists():
-        raise FileNotFoundError(f"TensorBoard directory does not exist for {args.job_id}: {tensorboard_root}")
+        raise FileNotFoundError(f"TensorBoard directory does not exist for {job_id}: {tensorboard_root}")
 
     points = _collect_metric_points(tensorboard_root)
     if args.tag is not None:
         points = [point for point in points if point.tag == args.tag]
-    points.sort(key=lambda point: (point.tag, point.step, point.wall_time))
-
-    if args.last is not None:
-        grouped_points: dict[str, list[MetricPoint]] = {}
-        for point in points:
-            grouped_points.setdefault(point.tag, []).append(point)
-        points = []
-        for grouped_values in grouped_points.values():
-            points.extend(grouped_values[-args.last :])
-        points.sort(key=lambda point: (point.tag, point.step, point.wall_time))
+    points = _latest_metric_points_by_tag(points)
 
     if args.as_json:
         payload = [asdict(point) for point in points]
@@ -1120,10 +1139,10 @@ def _command_metrics(args: MetricsArgs) -> int:
 
     out = xax.get_cli_output(prefix="queue")
     if not points:
-        out.warning("No scalar metrics found for job %s", args.job_id)
+        out.warning("No scalar metrics found for job %s", job_id)
         return 0
     out.table(
-        title=f"Metrics ({args.job_id})",
+        title=f"Metrics ({job_id})",
         headers=["tag", "step", "value", "source", "wall_time"],
         rows=[
             [
