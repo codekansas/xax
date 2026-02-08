@@ -1,5 +1,6 @@
 """CLI argument utilities for launcher selection."""
 
+import sys
 from dataclasses import dataclass, field
 from typing import Literal, get_args
 
@@ -25,3 +26,10 @@ def parse_launcher_args(cli_args: list[str]) -> tuple[LauncherCliArgs, list[str]
     if parsed_args.launcher not in get_args(LauncherChoice):
         raise ValueError(f"Invalid launcher choice: {parsed_args.launcher}")
     return parsed_args, rest
+
+
+def help_requested(use_cli: bool | list[str]) -> bool:
+    if not use_cli:
+        return False
+    args = use_cli if isinstance(use_cli, list) else sys.argv[1:]
+    return any(arg in ("-h", "--help") for arg in args)

@@ -9,8 +9,8 @@ import optax
 import orbax.checkpoint as ocp
 from jaxtyping import Array, PyTree
 
-from xax.core.conf import field
 from xax.core.state import State
+from xax.utils.structured_config import field
 
 S = TypeVar("S")
 

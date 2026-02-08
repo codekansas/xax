@@ -41,8 +41,31 @@ def is_missing_value(value: object) -> bool:
 
 @overload
 def field(  # noqa: A001
+    value: _MissingValue,
+    *,
+    static: bool = True,
+    help: str | None = None,
+    metadata: Mapping[str, object] | None = None,
+    **metadata_items: object,
+) -> Any: ...  # noqa: ANN401
+
+
+@overload
+def field(  # noqa: A001
+    value: Callable[[], FieldT],
+    *,
+    static: bool = True,
+    help: str | None = None,
+    metadata: Mapping[str, object] | None = None,
+    **metadata_items: object,
+) -> FieldT: ...
+
+
+@overload
+def field(  # noqa: A001
     value: FieldT,
     *,
+    static: bool = True,
     help: str | None = None,
     metadata: Mapping[str, object] | None = None,
     **metadata_items: object,
@@ -54,6 +77,7 @@ def field(  # noqa: A001
     value: _UnsetValue = _UNSET,
     *,
     default_factory: Callable[[], FieldT],
+    static: bool = True,
     help: str | None = None,
     metadata: Mapping[str, object] | None = None,
     **metadata_items: object,
@@ -65,6 +89,7 @@ def field(  # noqa: A001
     value: _UnsetValue = _UNSET,
     *,
     default_factory: _UnsetValue = _UNSET,
+    static: bool = True,
     help: str | None = None,
     metadata: Mapping[str, object] | None = None,
     **metadata_items: object,
@@ -75,6 +100,7 @@ def field(  # noqa: A001
     value: FieldT | _UnsetValue = _UNSET,
     *,
     default_factory: Callable[[], FieldT] | _UnsetValue = _UNSET,
+    static: bool = True,
     help: str | None = None,
     metadata: Mapping[str, object] | None = None,
     **metadata_items: object,
@@ -84,6 +110,7 @@ def field(  # noqa: A001
     Args:
         value: Optional default value. If omitted, the field is required.
         default_factory: Optional default factory. Mutually exclusive with ``value``.
+        static: Whether to mark this dataclass field as static metadata.
         help: Optional help string stored in field metadata.
         metadata: Optional metadata mapping.
         metadata_items: Additional metadata key-value pairs.
@@ -95,6 +122,7 @@ def field(  # noqa: A001
         raise ValueError("Cannot specify both `value` and `default_factory`")
     merged_metadata = dict(metadata or {})
     merged_metadata.update(metadata_items)
+    merged_metadata["static"] = static
     if help is not None:
         merged_metadata["help"] = help
 

@@ -6,6 +6,7 @@ import json
 import shutil
 from collections import Counter
 from pathlib import Path
+from typing import Literal
 
 from xax.core.conf import get_experiments_dir, get_user_global_dir
 
@@ -34,7 +35,7 @@ FIELDNAMES: list[str] = [
     "notes",
 ]
 
-STATUS_CHOICES: tuple[str, ...] = (
+ExperimentStatus = Literal[
     "planned",
     "queued",
     "running",
@@ -42,7 +43,7 @@ STATUS_CHOICES: tuple[str, ...] = (
     "failed",
     "cancelled",
     "superseded",
-)
+]
 
 
 def utc_now_iso() -> str:

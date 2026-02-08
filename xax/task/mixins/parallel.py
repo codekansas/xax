@@ -12,8 +12,8 @@ import jax
 import numpy as np
 from jax.sharding import PartitionSpec as P
 
-from xax.core.conf import field
 from xax.task.base import BaseConfig, BaseTask
+from xax.utils.structured_config import field
 
 logger = logging.getLogger(__name__)
 

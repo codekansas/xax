@@ -2,10 +2,10 @@
 
 import importlib
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol, cast
 
-from xax.utils.cli_output import CliOutput, get_cli_output
+import xax
 
 
 @dataclass(frozen=True)
@@ -15,17 +15,12 @@ class _Subcommand:
     module_name: str
 
 
-class _SubcommandModule(Protocol):
-    def main(self, argv: list[str] | None = None) -> None:
-        ...
-
-
-def _load_subcommand_module(module_name: str) -> _SubcommandModule:
+def _load_subcommand_main(module_name: str) -> Callable[[list[str] | None], None]:
     module = importlib.import_module(module_name)
     main_fn = getattr(module, "main", None)
     if main_fn is None or not callable(main_fn):
         raise RuntimeError(f"Subcommand module {module_name} does not define callable main(argv)")
-    return cast(_SubcommandModule, module)
+    return main_fn
 
 
 SUBCOMMANDS: tuple[_Subcommand, ...] = (
@@ -47,7 +42,7 @@ SUBCOMMANDS: tuple[_Subcommand, ...] = (
 )
 
 
-def _show_help(out: CliOutput) -> None:
+def _show_help(out: xax.CliOutput) -> None:
     out.plain("Usage: xax <command> [args]")
     out.plain("")
     out.table(
@@ -58,7 +53,7 @@ def _show_help(out: CliOutput) -> None:
     out.plain("Run `xax <command> --help` for command usage.")
 
 
-def _exit_code_from_system_exit(code: object) -> int:
+def _exit_code_from_system_exit(code: int | str | None) -> int:
     if code is None:
         return 0
     if isinstance(code, int):
@@ -67,7 +62,7 @@ def _exit_code_from_system_exit(code: object) -> int:
 
 
 def main(argv: list[str] | None = None) -> None:
-    out = get_cli_output()
+    out = xax.get_cli_output()
     argv_list = list(sys.argv[1:] if argv is None else argv)
     if not argv_list or argv_list[0] in ("-h", "--help"):
         _show_help(out)
@@ -82,8 +77,8 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(2)
 
     try:
-        module = _load_subcommand_module(subcommand.module_name)
-        module.main(subcommand_argv)
+        subcommand_main = _load_subcommand_main(subcommand.module_name)
+        subcommand_main(subcommand_argv)
         return_code = 0
     except SystemExit as system_exit:
         return_code = _exit_code_from_system_exit(system_exit.code)

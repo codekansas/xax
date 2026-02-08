@@ -18,10 +18,10 @@ from typing import Generic, TypeVar
 import jax
 import psutil
 
-from xax.core.conf import field
 from xax.task.base import BaseConfig
 from xax.task.mixins.logger import LoggerConfig, LoggerMixin
 from xax.task.mixins.process import ProcessConfig, ProcessMixin
+from xax.utils.structured_config import field
 
 logger: logging.Logger = logging.getLogger(__name__)
 

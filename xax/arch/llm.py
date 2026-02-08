@@ -28,8 +28,8 @@ from xax.arch.attention import (
     TransformerBlockCache,
     apply_linear,
 )
-from xax.core.conf import MISSING, field
 from xax.utils.jax import filter_jit as xax_filter_jit
+from xax.utils.structured_config import MISSING, field
 
 try:
     from huggingface_hub import snapshot_download

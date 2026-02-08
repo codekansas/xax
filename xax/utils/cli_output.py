@@ -5,7 +5,7 @@ import traceback
 from dataclasses import dataclass
 from typing import Sequence, TextIO
 
-from xax.utils.text import Color, TextBlock, colored, outlined, render_text_blocks
+from xax.utils.text import Color, TextBlock, colored, outlined, render_text_blocks, uncolored
 
 _LEVEL_COLORS: dict[str, Color] = {
     "status": "light-green",
@@ -13,6 +13,7 @@ _LEVEL_COLORS: dict[str, Color] = {
     "warning": "light-yellow",
     "error": "light-red",
 }
+_TABLE_TITLE_COLOR: Color = "light-magenta"
 
 
 @dataclass(frozen=True)
@@ -90,8 +91,8 @@ class CliOutput:
         headers: Sequence[str],
         rows: Sequence[Sequence[str]],
         header_color: Color = "light-cyan",
+        title_color: Color = _TABLE_TITLE_COLOR,
     ) -> None:
-        self.section(title)
         header_blocks = [
             TextBlock(header, color=header_color if self.use_color else None, bold=True)
             for header in headers
@@ -99,8 +100,45 @@ class CliOutput:
         body_blocks = [[TextBlock(cell) for cell in row] for row in rows]
         block_rows = [header_blocks, *body_blocks]
         rendered = render_text_blocks(block_rows, align_all_blocks=True)
+        rendered_lines = rendered.splitlines()
+        if rendered_lines:
+            rendered_lines[0] = self._render_titled_table_top(
+                rendered_lines[0],
+                title=title,
+                title_color=title_color,
+            )
+            rendered = "\n".join(rendered_lines)
         self.plain(rendered)
         self.plain("")
+
+    def _render_titled_table_top(self, top_border: str, *, title: str, title_color: Color) -> str:
+        plain_top_border = uncolored(top_border)
+        if not plain_top_border.startswith("┌") or not plain_top_border.endswith("┐"):
+            return top_border
+        if len(plain_top_border) <= 3:
+            return top_border
+
+        inner_width = len(plain_top_border) - 2
+        title_text = f" {title.strip()} "
+        if len(title_text) > inner_width:
+            max_title_width = inner_width - 2
+            if max_title_width <= 0:
+                return top_border
+            raw_title = title.strip()
+            if len(raw_title) > max_title_width:
+                if max_title_width >= 3:
+                    raw_title = raw_title[: max_title_width - 3] + "..."
+                else:
+                    raw_title = raw_title[:max_title_width]
+            title_text = f" {raw_title} "
+
+        if len(title_text) > inner_width:
+            return top_border
+
+        left_width = (inner_width - len(title_text)) // 2
+        right_width = inner_width - len(title_text) - left_width
+        title_rendered = colored(title_text, title_color, bold=True) if self.use_color else title_text
+        return f"┌{'─' * left_width}{title_rendered}{'─' * right_width}┐"
 
 
 def get_cli_output(prefix: str | None = None) -> CliOutput:

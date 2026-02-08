@@ -52,7 +52,7 @@ AUDIO_START_TOKEN = "<|audio_start|>"
 AUDIO_END_TOKEN = "<|audio_end|>"
 
 # LoRA targets
-DEFAULT_LORA_TARGETS = ("q_proj", "v_proj", "gate", "up")
+DEFAULT_LORA_TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate", "up")
 
 
 class Batch(TypedDict):
@@ -110,15 +110,17 @@ RESIDUAL_MLP_DIM = 256
 
 
 class ResidualModel(eqx.Module):
-    """Stage 2: 7 independent LLMs for predicting Q1-Q7.
+    """Stage 2: Shared residual transformer for predicting Q1-Q7.
 
-    Each LLM predicts all timesteps for its layer before moving to the next.
-    Uses xax.LLM with context_tn for conditioning on lower layers and semantic hidden states.
+    A single autoregressive transformer is reused across residual layers, with
+    learned per-layer embeddings. This reduces parameter count and encourages
+    shared acoustic dynamics across quantizers.
     """
 
     hidden_proj: eqx.nn.Linear
-    layer_llms: tuple[xax.LLM, ...]
-    codebook_embeddings: tuple[eqx.nn.Embedding, ...]
+    shared_layer_llm: xax.LLM
+    shared_codebook_embedding: eqx.nn.Embedding
+    layer_embedding_ld: Array
 
     @staticmethod
     def build(
@@ -160,23 +162,24 @@ class ResidualModel(eqx.Module):
             mlp_hidden_dim=mlp_dim,
         )
 
-        # Build 8 LLMs for Q0-Q7
-        layer_llms = []
-        codebook_embeddings = []
-        for _ in range(1, NUM_QUANTIZERS):
-            key, layer_key = jax.random.split(key)
-            llm = xax.LLM.build(llm_config, key=layer_key)
-            layer_llms.append(llm)
+        # Build one shared residual transformer.
+        key, llm_key = jax.random.split(key)
+        shared_layer_llm = xax.LLM.build(llm_config, key=llm_key)
 
-            key, emb_key = jax.random.split(key)
-            weight = jax.random.normal(emb_key, (AUDIO_VOCAB_SIZE, embed_dim)) * 0.02
-            emb = eqx.nn.Embedding(AUDIO_VOCAB_SIZE, embed_dim, weight=weight)
-            codebook_embeddings.append(emb)
+        # Shared embedding table for previous-layer tokens.
+        key, emb_key = jax.random.split(key)
+        emb_weight_vd = jax.random.normal(emb_key, (AUDIO_VOCAB_SIZE, embed_dim)) * 0.02
+        shared_codebook_embedding = eqx.nn.Embedding(AUDIO_VOCAB_SIZE, embed_dim, weight=emb_weight_vd)
+
+        # Per-layer embeddings (Q1..Q7) to disambiguate shared-transformer usage.
+        key, layer_emb_key = jax.random.split(key)
+        layer_embedding_ld = jax.random.normal(layer_emb_key, (NUM_QUANTIZERS - 1, embed_dim)) * 0.02
 
         return ResidualModel(
             hidden_proj=hidden_proj,
-            layer_llms=tuple(layer_llms),
-            codebook_embeddings=tuple(codebook_embeddings),
+            shared_layer_llm=shared_layer_llm,
+            shared_codebook_embedding=shared_codebook_embedding,
+            layer_embedding_ld=layer_embedding_ld,
         )
 
     def compute_loss(
@@ -199,29 +202,32 @@ class ResidualModel(eqx.Module):
         # Common mask for all layers.
         mask_t = audio_codes_ft[0, 1:] != AUDIO_PAD_TOKEN_ID
 
-        # First-layer embeddings.
+        # Shared semantic context.
         # stretched_hidden_td[f] = hidden for frame f (frame-indexed)
         # audio_codes_ft[q, p] = code at seq_pos p (seq-pos-indexed, BOS at 0)
         # Using [:-1] on stretched_hidden gives frames 0 to T-1.
         # Using [1:] on audio_codes gives seq_pos 1 to T = frames 0 to T-1.
         # Both align at frame index i.
-        x_td = jax.vmap(self.hidden_proj)(stretched_hidden_td[:-1])
+        base_context_td = jax.vmap(self.hidden_proj)(stretched_hidden_td[:-1])
 
         losses = []
         accuracies = []
 
         for layer_idx in range(1, NUM_QUANTIZERS):
-            llm = self.layer_llms[layer_idx - 1]
-
             # Adds the previous layer's token embeddings.
-            emb = self.codebook_embeddings[layer_idx - 1]
-            emb_td = jax.vmap(emb)(audio_codes_ft[layer_idx - 1, 1:])
-            x_td = x_td + emb_td
+            emb_td = jax.vmap(self.shared_codebook_embedding)(audio_codes_ft[layer_idx - 1, 1:])
 
+            # Each layer conditions on semantic context + immediate lower layer.
+            layer_context_td = base_context_td + emb_td + self.layer_embedding_ld[layer_idx - 1]
             tokens_t = audio_codes_ft[layer_idx, :-1]
             targets_t = audio_codes_ft[layer_idx, 1:]
 
-            loss, accuracy, _ = llm.get_loss_and_accuracy(tokens_t, targets_t, context_tn=x_td, mask_t=mask_t)
+            loss, accuracy, _ = self.shared_layer_llm.get_loss_and_accuracy(
+                tokens_t,
+                targets_t,
+                context_tn=layer_context_td,
+                mask_t=mask_t,
+            )
             losses.append(loss)
             accuracies.append(accuracy)
 
@@ -244,24 +250,22 @@ class ResidualModel(eqx.Module):
         all_codes = [q0_codes_t]
         start_t = jnp.array([AUDIO_BOS_TOKEN_ID])
 
-        # Project LLM context vectors.
-        x_td = jax.vmap(self.hidden_proj)(stretched_hidden_td)
+        # Shared semantic context vectors.
+        base_context_td = jax.vmap(self.hidden_proj)(stretched_hidden_td)
 
         for layer_idx in range(1, NUM_QUANTIZERS):
-            llm = self.layer_llms[layer_idx - 1]
-
             # Adds the previous layer's token embeddings.
-            emb = self.codebook_embeddings[layer_idx - 1]
-            emb_td = jax.vmap(emb)(all_codes[-1])
-            x_td = x_td + emb_td
+            emb_td = jax.vmap(self.shared_codebook_embedding)(all_codes[-1])
 
+            # Use only semantic + immediate lower-layer context at each step.
+            layer_context_td = base_context_td + emb_td + self.layer_embedding_ld[layer_idx - 1]
             key, layer_key = jax.random.split(key)
             pred_tokens_t, _ = xax.llm_generate_jit(
-                llm,
+                self.shared_layer_llm,
                 start_t,
                 eos_id=AUDIO_EOS_TOKEN_ID,
                 max_new_tokens=max_frames,
-                context_tn=x_td,
+                context_tn=layer_context_td,
                 temperature=0.8,
                 top_p=0.9,
                 key=layer_key,

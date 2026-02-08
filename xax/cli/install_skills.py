@@ -6,8 +6,7 @@ from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
 
-from xax.utils.cli_args import ARGPARSE_DEST_METADATA_KEY, parse_args_as, render_help_text
-from xax.utils.cli_output import get_cli_output
+import xax
 
 
 def _write_new_skill_gitignores(destination_agents_dir: Path, existing_skill_names: set[str]) -> int:
@@ -65,7 +64,7 @@ class InstallSkillsArgs:
     destination_agents_dir: Path = field(
         default=Path(".agents"),
         metadata={
-            ARGPARSE_DEST_METADATA_KEY: "dest",
+            xax.ARGPARSE_DEST_METADATA_KEY: "dest",
             "help": "Destination agents directory. Defaults to ./.agents in the current working directory.",
         },
     )
@@ -78,7 +77,7 @@ class InstallSkillsArgs:
 
 
 def _command_install(args: InstallSkillsArgs) -> int:
-    out = get_cli_output(prefix="skills")
+    out = xax.get_cli_output(prefix="skills")
 
     destination_agents_dir = args.destination_agents_dir.expanduser()
     if not destination_agents_dir.is_absolute():
@@ -95,18 +94,18 @@ def _command_install(args: InstallSkillsArgs) -> int:
 
 
 def main(argv: list[str] | None = None) -> None:
-    out = get_cli_output(prefix="skills")
+    out = xax.get_cli_output(prefix="skills")
     argv_list = list(sys.argv[1:] if argv is None else argv)
     if any(token in ("-h", "--help") for token in argv_list):
         out.plain(
-            render_help_text(
+            xax.render_help_text(
                 InstallSkillsArgs,
                 prog="xax install-skills",
                 description="Install bundled xax Codex skills into a local .agents directory.",
             )
         )
         raise SystemExit(0)
-    parsed_args = parse_args_as(InstallSkillsArgs, argv_list)
+    parsed_args = xax.parse_args_as(InstallSkillsArgs, argv_list)
 
     try:
         return_code = int(_command_install(parsed_args))

@@ -19,10 +19,11 @@ import numpy as np
 from datasets import Dataset, DatasetDict, IterableDataset, IterableDatasetDict, load_from_disk
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from xax.core.conf import field, get_data_dir
+from xax.core.conf import get_data_dir
 from xax.core.state import Batch
 from xax.task.base import BaseConfig, BaseTask
 from xax.task.mixins.process import ProcessConfig, ProcessMixin
+from xax.utils.structured_config import field
 
 logger = logging.getLogger(__name__)
 PRNGKeyArray = jax.Array

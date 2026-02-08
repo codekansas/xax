@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array
 
-from xax.core.conf import MISSING, field
+from xax.utils.structured_config import MISSING, field
 
 # Batch = TypeVar("Batch")
 # Output = TypeVar("Output")

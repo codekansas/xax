@@ -18,10 +18,10 @@ from typing import Generic, Iterable, TypeVar
 
 import jax
 
-from xax.core.conf import field
 from xax.task.mixins.logger import LoggerConfig, LoggerMixin
 from xax.task.mixins.process import ProcessConfig, ProcessMixin
 from xax.utils.devices import get_num_gpus
+from xax.utils.structured_config import field
 
 logger: logging.Logger = logging.getLogger(__name__)
 

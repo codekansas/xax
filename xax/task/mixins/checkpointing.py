@@ -14,11 +14,10 @@ import orbax.checkpoint as ocp
 from etils import epath
 from jaxtyping import PyTree
 
-from xax.core.conf import field
 from xax.core.state import State
 from xax.nn.parallel import is_master
 from xax.task.mixins.artifacts import ArtifactsConfig, ArtifactsMixin
-from xax.utils.structured_config import load_yaml, to_yaml_text
+from xax.utils.structured_config import field, load_yaml, to_yaml_text
 from xax.utils.types.training import Optimizer
 
 logger = logging.getLogger(__name__)

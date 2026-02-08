@@ -5,13 +5,14 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import get_args
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from experiment_log_lib import (  # noqa: E402
-    STATUS_CHOICES,
+    ExperimentStatus,
     load_metrics_json,
     parse_metric_pairs,
     read_rows,
@@ -29,7 +30,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--experiments-dir", type=Path, default=None, help="Override experiments root directory")
     parser.add_argument("--parent-experiment-id", type=str, default=None, help="Parent experiment id")
     parser.add_argument("--queue-job-id", type=str, default=None, help="Queue job id")
-    parser.add_argument("--status", type=str, default=None, choices=STATUS_CHOICES, help="Experiment status")
+    parser.add_argument(
+        "--status",
+        type=str,
+        default=None,
+        choices=get_args(ExperimentStatus),
+        help="Experiment status",
+    )
     parser.add_argument("--task-key", type=str, default=None, help="Task key")
     parser.add_argument("--command", type=str, default=None, help="Command string")
     parser.add_argument("--config-path", type=str, default=None, help="Config snapshot path")

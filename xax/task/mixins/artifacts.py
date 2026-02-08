@@ -9,11 +9,14 @@ from typing import Self, TypeVar
 
 import jax
 
-from xax.core.conf import field, get_runs_dir
+from xax.core.conf import get_runs_dir
 from xax.nn.parallel import is_master
 from xax.task.base import BaseConfig, BaseTask
+from xax.task.interfaces.queued import QueuedArtifactsConfig, QueuedArtifactsTask
 from xax.utils.experiments import stage_environment
 from xax.utils.logging import LOG_STATUS, RankFilter
+from xax.utils.run_dirs import next_available_run_dir, resolve_configured_run_dir
+from xax.utils.structured_config import field
 from xax.utils.text import show_info
 
 logger = logging.getLogger(__name__)
@@ -21,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 @jax.tree_util.register_dataclass
 @dataclass
-class ArtifactsConfig(BaseConfig):
+class ArtifactsConfig(QueuedArtifactsConfig, BaseConfig):
     runs_dir: str | None = field(None, help="Directory containing all runs for this task")
     run_dir: str | None = field(None, help="The fixed run directory")
     log_to_file: bool = field(True, help="If set, add a file handler to the logger to write all logs to the run dir")
@@ -68,6 +71,9 @@ class ArtifactsMixin(BaseTask[Config]):
                 runs_dir = Path.cwd()
         return runs_dir
 
+    def get_queue_runs_dir(self) -> Path:
+        return self._get_default_runs_dir().expanduser().resolve() / self.task_name
+
     @property
     def run_dir(self) -> Path:
         return self.get_run_dir()
@@ -80,20 +86,14 @@ class ArtifactsMixin(BaseTask[Config]):
         if self._run_dir is not None:
             return self._run_dir
 
-        fixed_run_dir = self.config.run_dir
-        if fixed_run_dir is not None:
-            run_dir = Path(fixed_run_dir).expanduser().resolve()
+        run_dir = resolve_configured_run_dir(self.config.run_dir, field_name="config.run_dir")
+        if run_dir is not None:
             run_dir.mkdir(parents=True, exist_ok=True)
             self._run_dir = run_dir
             logger.log(LOG_STATUS, self._run_dir)
             return self._run_dir
 
-        def get_next_run_dir(run_id: int) -> Path:
-            return self.runs_dir / f"run_{run_id:03d}"
-
-        run_id = 0
-        while (run_dir := get_next_run_dir(run_id)).is_dir():
-            run_id += 1
+        run_dir = next_available_run_dir(self.runs_dir)
         run_dir.mkdir(exist_ok=True, parents=True)
         self._run_dir = run_dir.expanduser().resolve()
         logger.log(LOG_STATUS, self._run_dir)
@@ -118,3 +118,6 @@ class ArtifactsMixin(BaseTask[Config]):
                 show_info("Exiting training job", important=True)
             else:
                 show_info(f"Exiting training job for {self.run_dir}", important=True)
+
+
+QueuedArtifactsTask.register(ArtifactsMixin)

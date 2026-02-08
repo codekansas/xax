@@ -9,7 +9,6 @@ from typing import Generic, Literal, Self, TypeVar
 import jax
 import numpy as np
 
-from xax.core.conf import field
 from xax.core.state import State
 from xax.task.logger import Logger, LoggerImpl
 from xax.task.loggers.json import JsonLogger
@@ -18,6 +17,7 @@ from xax.task.loggers.stdout import StdoutLogger
 from xax.task.loggers.tensorboard import TensorboardLogger
 from xax.task.loggers.wandb import WandbConfig, WandbLogger
 from xax.task.mixins.artifacts import ArtifactsConfig, ArtifactsMixin
+from xax.utils.structured_config import field
 
 LoggerBackend = Literal["stdout", "json", "tensorboard", "wandb"]
 

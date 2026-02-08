@@ -14,16 +14,17 @@ from xax.utils.launcher.gpu_visibility import (
     QUEUE_NUM_GPUS_ENV_VAR,
     apply_queue_gpu_visibility,
 )
+from xax.utils.launcher.queue_state import ObserverInfo
 
 
-def _observer_info() -> dict[str, object]:
-    return {
-        "pid": 123,
-        "hostname": "test-host",
-        "started_at": 0.0,
-        "updated_at": 0.0,
-        "status": "idle",
-    }
+def _observer_info() -> ObserverInfo:
+    return ObserverInfo(
+        pid=123,
+        hostname="test-host",
+        started_at=0.0,
+        updated_at=0.0,
+        status="idle",
+    )
 
 
 def test_apply_queue_gpu_visibility_masks_reserved_gpus(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -133,9 +134,9 @@ def test_apply_queue_gpu_visibility_queries_gpus_when_cuda_visible_devices_unset
         "xax.utils.launcher.gpu_visibility._read_process_environ",
         lambda _pid: {QUEUE_GPUS_ENV_VAR: "1"},
     )
-    monkeypatch.setattr("xax.utils.launcher.gpu_visibility.shutil.which", lambda _name: "/usr/bin/nvidia-smi")
+    monkeypatch.setattr("xax.utils.launcher.gpu_utils.shutil.which", lambda _name: "/usr/bin/nvidia-smi")
     monkeypatch.setattr(
-        "xax.utils.launcher.gpu_visibility.subprocess.run",
+        "xax.utils.launcher.gpu_utils.subprocess.run",
         lambda *_args, **_kwargs: CompletedProcess(
             args=["nvidia-smi"],
             returncode=0,

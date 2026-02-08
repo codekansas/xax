@@ -1,49 +1,21 @@
 """Defines base configuration functions and utilities."""
 
-import copy
 import functools
 import os
-from dataclasses import dataclass, field as field_base
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from xax.utils.structured_config import MISSING, deep_merge, load_yaml, merge_config_sources, save_yaml, to_primitive
+from xax.utils.structured_config import (
+    MISSING,
+    deep_merge,
+    field as _field,
+    load_yaml,
+    merge_config_sources,
+    save_yaml,
+    to_primitive,
+)
 from xax.utils.text import show_error
-
-FieldType = Any
-
-
-def field(
-    value: FieldType,
-    *,
-    help: str | None = None,
-    static: bool = True,
-    **metadata: Any,  # noqa: ANN401
-) -> FieldType:
-    """Short-hand function for getting a config field.
-
-    Args:
-        value: The current field's default value.
-        help: An optional help string for the field.
-        static: Whether or not this field is static (i.e., does not change
-            during training).
-        metadata: Additional metadata fields to supply.
-
-    Returns:
-        The dataclass field.
-    """
-    metadata["static"] = static
-    if help is not None:
-        metadata["help"] = help
-
-    if callable(value):
-        return field_base(default_factory=value, metadata=metadata)
-
-    metadata.setdefault("_xax_help_default_value", copy.deepcopy(value) if value.__class__.__hash__ is None else value)
-
-    if value.__class__.__hash__ is None:
-        return field_base(default_factory=lambda value=value: copy.deepcopy(value), metadata=metadata)
-    return field_base(default=value, metadata=metadata)
 
 
 def is_missing(cfg: Any, key: str) -> bool:  # noqa: ANN401
@@ -66,47 +38,47 @@ def is_missing(cfg: Any, key: str) -> bool:  # noqa: ANN401
 
 @dataclass(kw_only=True)
 class Logging:
-    hide_third_party_logs: bool = field(True, help="If set, hide third-party logs")
-    log_level: str = field("INFO", help="The logging level to use")
+    hide_third_party_logs: bool = _field(True, help="If set, hide third-party logs")
+    log_level: str = _field("INFO", help="The logging level to use")
 
 
 @dataclass(kw_only=True)
 class Triton:
-    use_triton_if_available: bool = field(True, help="Use Triton if available")
+    use_triton_if_available: bool = _field(True, help="Use Triton if available")
 
 
 @dataclass(kw_only=True)
 class Experiment:
-    default_random_seed: int = field(1337, help="The default random seed to use")
-    max_workers: int = field(32, help="Maximum number of workers to use")
+    default_random_seed: int = _field(1337, help="The default random seed to use")
+    max_workers: int = _field(32, help="Maximum number of workers to use")
 
 
 @dataclass(kw_only=True)
 class Directories:
-    runs: str | None = field(None, help="Directory containing all training runs")
-    experiments: str | None = field(None, help="Directory containing experiment-monitor sessions")
-    data: str | None = field(None, help="The data directory")
-    pretrained_models: str | None = field(None, help="The models directory")
+    runs: str | None = _field(None, help="Directory containing all training runs")
+    experiments: str | None = _field(None, help="Directory containing experiment-monitor sessions")
+    data: str | None = _field(None, help="The data directory")
+    pretrained_models: str | None = _field(None, help="The models directory")
 
 
 @dataclass(kw_only=True)
 class SlurmPartition:
-    partition: str = field(MISSING, help="The partition name")
-    num_nodes: int = field(1, help="The number of nodes to use")
+    partition: str = _field(MISSING, help="The partition name")
+    num_nodes: int = _field(1, help="The number of nodes to use")
 
 
 @dataclass(kw_only=True)
 class Slurm:
-    launch: dict[str, SlurmPartition] = field({}, help="The available launch configurations")
+    launch: dict[str, SlurmPartition] = _field({}, help="The available launch configurations")
 
 
 @dataclass(kw_only=True)
 class UserConfig:
-    logging: Logging = field(Logging)
-    triton: Triton = field(Triton)
-    experiment: Experiment = field(Experiment)
-    directories: Directories = field(Directories)
-    slurm: Slurm = field(Slurm)
+    logging: Logging = _field(Logging)
+    triton: Triton = _field(Triton)
+    experiment: Experiment = _field(Experiment)
+    directories: Directories = _field(Directories)
+    slurm: Slurm = _field(Slurm)
 
 
 def user_config_path() -> Path:

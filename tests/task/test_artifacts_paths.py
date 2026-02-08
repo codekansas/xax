@@ -8,6 +8,7 @@ import pytest
 from xax.core.conf import _load_user_config_cached
 from xax.task.base import BaseTask
 from xax.task.mixins.artifacts import ArtifactsConfig, ArtifactsMixin
+from xax.utils.structured_config import save_yaml
 
 
 @dataclass
@@ -28,7 +29,8 @@ def _configure_user_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
 def test_artifacts_uses_runs_dir_hierarchy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _configure_user_dir(monkeypatch, tmp_path)
     runs_root = tmp_path / "runs_root"
-    monkeypatch.setenv("RUNS_DIR", str(runs_root))
+    config_path = tmp_path / ".xax" / "config.yml"
+    save_yaml(config_path, {"directories": {"runs": str(runs_root)}})
     _load_user_config_cached.cache_clear()
 
     first_task = DummyArtifactsTask(DummyArtifactsConfig())

@@ -180,7 +180,7 @@ class TensorboardLogger(LoggerImpl):
         return self.writers.writer(heavy)
 
     def log_file(self, name: str, contents: str) -> None:
-        if not is_master():
+        if not is_master() or name in self.files:
             return
         self.files[name] = f"```\n{contents}\n```"
 

@@ -1,10 +1,10 @@
 """Defines a launcher to train a model locally, on all available devices."""
 
-import sys
 from typing import TYPE_CHECKING
 
 from xax.task.base import RawConfigType
 from xax.task.launchers.base import BaseLauncher
+from xax.utils.launcher.cli import help_requested
 from xax.utils.launcher.gpu_visibility import apply_queue_gpu_visibility
 from xax.utils.launcher.task_runner import run_runnable_task
 from xax.utils.logging import configure_logging
@@ -14,19 +14,13 @@ if TYPE_CHECKING:
 
 
 class MultiDeviceLauncher(BaseLauncher):
-    def _help_requested(self, use_cli: bool | list[str]) -> bool:
-        if not use_cli:
-            return False
-        args = use_cli if isinstance(use_cli, list) else sys.argv[1:]
-        return any(arg in ("-h", "--help") for arg in args)
-
     def launch(
         self,
         task: "type[RunnableMixin[Config]]",
         *cfgs: RawConfigType,
         use_cli: bool | list[str] = True,
     ) -> None:
-        if self._help_requested(use_cli):
+        if help_requested(use_cli):
             run_runnable_task(task, *cfgs, use_cli=use_cli, logger=None)
             return
 

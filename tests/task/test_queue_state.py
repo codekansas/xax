@@ -1,6 +1,7 @@
 """Tests for queue state persistence and process metadata."""
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,7 @@ def _enqueue_dummy_job(tmp_path: Path) -> str:
     return enqueue_job(
         task_key="tests.task.test_queue_state.DummyTask",
         launcher="multi",
+        python_executable=sys.executable,
         run_dir=run_dir,
         stage_dir=stage_dir,
         config_path=config_path,
@@ -58,6 +60,7 @@ def test_queue_state_normalizes_missing_process_fields(monkeypatch: pytest.Monke
                 "job_id": "job-0000001",
                 "task_key": "tests.task.test_queue_state.DummyTask",
                 "launcher": "multi",
+                "python_executable": sys.executable,
                 "status": "queued",
                 "run_dir": str(tmp_path / "run"),
                 "stage_dir": str(tmp_path / "run" / "code"),
@@ -75,10 +78,11 @@ def test_queue_state_normalizes_missing_process_fields(monkeypatch: pytest.Monke
     paths.state_path.write_text(json.dumps(state_payload), encoding="utf-8")
 
     state = read_queue_state()
-    job = state["jobs"]["job-0000001"]
-    assert job["process_group_id"] is None
-    assert job["child_pids"] == []
-    assert job["oom_detected"] is False
+    job = state.jobs["job-0000001"]
+    assert job.process_group_id is None
+    assert job.child_pids == []
+    assert job.oom_detected is False
+    assert job.python_executable == sys.executable
 
 
 def test_process_tracking_round_trip(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -86,23 +90,23 @@ def test_process_tracking_round_trip(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     job_id = _enqueue_dummy_job(tmp_path)
     claimed = claim_next_job()
     assert claimed is not None
-    assert claimed["job_id"] == job_id
+    assert claimed.job_id == job_id
 
     set_running_job_pid(job_id, pid=12345, process_group_id=54321)
     set_running_job_children(job_id, [12346, 12347, 12346])
 
     running_job = get_running_job()
     assert running_job is not None
-    assert running_job["pid"] == 12345
-    assert running_job["process_group_id"] == 54321
-    assert running_job["child_pids"] == [12346, 12347]
+    assert running_job.pid == 12345
+    assert running_job.process_group_id == 54321
+    assert running_job.child_pids == [12346, 12347]
 
     clear_job_process_tracking(job_id)
     updated_job = get_job(job_id)
     assert updated_job is not None
-    assert updated_job["pid"] is None
-    assert updated_job["process_group_id"] is None
-    assert updated_job["child_pids"] == []
+    assert updated_job.pid is None
+    assert updated_job.process_group_id is None
+    assert updated_job.child_pids == []
 
 
 def test_finish_running_job_marks_oom(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -118,7 +122,33 @@ def test_finish_running_job_marks_oom(monkeypatch: pytest.MonkeyPatch, tmp_path:
         error="CUDA OOM detected: out of memory",
         oom_detected=True,
     )
-    assert finished_job["status"] == "failed"
-    assert finished_job["oom_detected"] is True
-    assert finished_job["process_group_id"] is None
-    assert finished_job["child_pids"] == []
+    assert finished_job.status == "failed"
+    assert finished_job.oom_detected is True
+    assert finished_job.process_group_id is None
+    assert finished_job.child_pids == []
+
+
+def test_enqueue_job_persists_python_executable(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _configure_user_dir(monkeypatch, tmp_path)
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "code"
+    config_path = run_dir / "config.yaml"
+    observer_log_path = run_dir / "queue_observer.log"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("test: true\n", encoding="utf-8")
+
+    submitter_python = "/tmp/custom-venv/bin/python"
+    job_id = enqueue_job(
+        task_key="tests.task.test_queue_state.DummyTask",
+        launcher="multi",
+        python_executable=submitter_python,
+        run_dir=run_dir,
+        stage_dir=stage_dir,
+        config_path=config_path,
+        observer_log_path=observer_log_path,
+    )
+
+    job = get_job(job_id)
+    assert job is not None
+    assert job.python_executable == submitter_python

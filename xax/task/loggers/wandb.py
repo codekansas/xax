@@ -9,10 +9,10 @@ from typing import Any, Literal, TypeVar
 import jax
 import numpy as np
 
-from xax.core.conf import field
 from xax.nn.parallel import is_master
 from xax.task.logger import LogError, LogErrorSummary, LoggerImpl, LogLine, LogPing, LogStatus
 from xax.utils.jax import as_float
+from xax.utils.structured_config import field
 
 logger: logging.Logger = logging.getLogger(__name__)
 

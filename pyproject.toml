@@ -22,20 +22,17 @@ dependencies = [
     "jaxtyping",
     "optax",
     "orbax-checkpoint",
-
     # Data processing and serialization
     "pillow",
-
     # Configuration and project management
     "pyyaml",
     "gitpython",
-
     # Monitoring and logging
     "tensorboard",
     "psutil",
-
     # Networking
     "requests",
+    "cattrs",
 ]
 
 [project.urls]

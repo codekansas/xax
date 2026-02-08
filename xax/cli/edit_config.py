@@ -10,24 +10,21 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from xax.task.mixins.checkpointing import load_ckpt
-from xax.utils.cli_args import CLI_POSITIONAL_METADATA_KEY, parse_args_as, render_help_text
-from xax.utils.cli_output import get_cli_output
-from xax.utils.structured_config import load_yaml, to_yaml_text
+import xax
 
 
 @dataclass(frozen=True)
 class EditConfigArgs:
-    ckpt_path: Path = field(metadata={CLI_POSITIONAL_METADATA_KEY: True, "help": "Path to checkpoint tar.gz"})
+    ckpt_path: Path = field(metadata={xax.CLI_POSITIONAL_METADATA_KEY: True, "help": "Path to checkpoint tar.gz"})
 
 
 def _run_edit_config(args: EditConfigArgs) -> None:
-    out = get_cli_output(prefix="edit-config")
+    out = xax.get_cli_output(prefix="edit-config")
     ckpt_path = args.ckpt_path
 
     # Loads the config from the checkpoint.
-    config = load_ckpt(ckpt_path, part="config")
-    config_str = to_yaml_text(config, sort_keys=True)
+    config = xax.load_ckpt(ckpt_path, part="config")
+    config_str = xax.to_yaml_text(config, sort_keys=True)
 
     # Opens the user's preferred editor to edit the config.
     with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as f:
@@ -37,8 +34,8 @@ def _run_edit_config(args: EditConfigArgs) -> None:
 
     # Loads the edited config.
     try:
-        edited_config = load_yaml(f.name)
-        edited_config_str = to_yaml_text(edited_config, sort_keys=True)
+        edited_config = xax.load_yaml(f.name)
+        edited_config_str = xax.to_yaml_text(edited_config, sort_keys=True)
     finally:
         os.remove(f.name)
 
@@ -84,18 +81,18 @@ def _run_edit_config(args: EditConfigArgs) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
-    out = get_cli_output(prefix="edit-config")
+    out = xax.get_cli_output(prefix="edit-config")
     argv_list = list(sys.argv[1:] if argv is None else argv)
     if any(token in ("-h", "--help") for token in argv_list):
         out.plain(
-            render_help_text(
+            xax.render_help_text(
                 EditConfigArgs,
                 prog="xax edit-config",
                 description="Edit checkpoint configs in-place.",
             )
         )
         raise SystemExit(0)
-    parsed_args = parse_args_as(EditConfigArgs, argv_list)
+    parsed_args = xax.parse_args_as(EditConfigArgs, argv_list)
     try:
         _run_edit_config(parsed_args)
         return_code = 0

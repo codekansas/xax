@@ -40,11 +40,11 @@ from numpy.typing import NDArray
 from PIL import Image as PILImage, ImageDraw, ImageFont
 from PIL.Image import Image as PILImageType
 
-from xax.core.conf import field
 from xax.core.state import State
 from xax.utils.experiments import ContextTimer, IntervalTicker
 from xax.utils.jax import to_numpy
 from xax.utils.logging import LOG_ERROR_SUMMARY, LOG_PING, LOG_STATUS, format_number
+from xax.utils.structured_config import field
 
 logger = logging.getLogger(__name__)
 
