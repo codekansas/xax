@@ -1,10 +1,13 @@
 """Defines a Tensorboard logger backend."""
 
 import atexit
+import importlib.util
 import logging
 import os
+import random
 import re
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -63,6 +66,7 @@ class TensorboardLogger(LoggerImpl):
         self.files: dict[str, str] = {}
         self.writers = TensorboardWriters(log_directory=self.log_directory, flush_seconds=flush_seconds)
         self._started = False
+        self._thread: threading.Thread | None = None
 
         # For making log messages independent.
         self.error_step = 0
@@ -75,21 +79,34 @@ class TensorboardLogger(LoggerImpl):
             return
 
         if is_master():
-            threading.Thread(target=self.worker_thread, daemon=True).start()
+            atexit.register(self.cleanup)
+            self._thread = threading.Thread(target=self.worker_thread, daemon=True)
+            self._thread.start()
 
         self._started = True
 
     def worker_thread(self) -> None:
         if os.environ.get("DISABLE_TENSORBOARD", "0") == "1":
             return
+        if importlib.util.find_spec("tensorboard") is None:
+            logger.warning("TensorBoard is not installed; skipping TensorBoard server startup.")
+            return
 
         time.sleep(self.wait_seconds)
 
         port = int(os.environ.get("TENSORBOARD_PORT", DEFAULT_TENSORBOARD_PORT))
+        change_ports = bool(int(os.environ.get("TENSORBOARD_CHANGE_PORT", "1")))
+
+        rng = random.Random(42)
 
         while port_is_busy(port):
-            logger.warning("Port %s is busy, waiting...", port)
-            time.sleep(10)
+            if change_ports:
+                new_port = rng.randint(6000, 9000)
+                logger.warning("Port %s is busy, checking port %d...", port, new_port)
+                port = new_port
+            else:
+                logger.warning("Port %s is busy, waiting...", port)
+                time.sleep(10)
 
         def make_localhost(s: str) -> str:
             if self.use_localhost:
@@ -114,7 +131,7 @@ class TensorboardLogger(LoggerImpl):
             return tbd_str
 
         command: list[str] = [
-            "python",
+            sys.executable,
             "-m",
             "tensorboard.main",
             "serve",
@@ -149,15 +166,17 @@ class TensorboardLogger(LoggerImpl):
                 lines.append(line_str)
             else:
                 line_str = "".join(lines)
-                raise RuntimeError(f"Tensorboard failed to start:\n{line_str}")
-
-            atexit.register(self.cleanup)
+                logger.warning("TensorBoard server failed to start; continuing without it:\n%s", line_str)
+                return
 
     def cleanup(self) -> None:
         if self.proc is not None:
             self.proc.terminate()
             self.proc.wait()
             self.proc = None
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
 
     def __del__(self) -> None:
         self.cleanup()
@@ -167,7 +186,7 @@ class TensorboardLogger(LoggerImpl):
         return self.writers.writer(heavy)
 
     def log_file(self, name: str, contents: str) -> None:
-        if not is_master():
+        if not is_master() or name in self.files:
             return
         self.files[name] = f"```\n{contents}\n```"
 

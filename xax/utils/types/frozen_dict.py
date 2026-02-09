@@ -4,9 +4,8 @@ This is mostly taken from Flax - we move it here to avoid having to use Flax as
 a dependency in downstream projects.
 """
 
-import collections
 from types import MappingProxyType
-from typing import Any, Iterator, Mapping, Self, TypeVar
+from typing import Any, Iterator, KeysView, Mapping, Self, TypeVar, ValuesView, cast
 
 import jax
 
@@ -30,12 +29,12 @@ def _indent(x: str, num_spaces: int) -> str:
     return "\n".join(indent_str + line for line in lines[:-1]) + "\n"
 
 
-class FrozenKeysView(collections.abc.KeysView[K]):
+class FrozenKeysView(KeysView[K]):
     def __repr__(self) -> str:
         return f"frozen_dict_keys({list(self)})"
 
 
-class FrozenValuesView(collections.abc.ValuesView[V]):
+class FrozenValuesView(ValuesView[V]):
     def __repr__(self) -> str:
         return f"frozen_dict_values({list(self)})"
 
@@ -47,7 +46,7 @@ class FrozenDict(Mapping[K, V]):
     __slots__ = ("_dict", "_hash")
 
     def __init__(self, *args: Any, __unsafe_skip_copy__: bool = False, **kwargs: Any) -> None:  # noqa: ANN401
-        xs: dict[K, V] = dict(*args, **kwargs)
+        xs = cast(dict[K, V], dict(*args, **kwargs))
         if __unsafe_skip_copy__:
             self._dict = xs
         else:

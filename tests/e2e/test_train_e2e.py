@@ -114,7 +114,7 @@ def test_save_load_model(tmpdir: Path) -> None:
     SimpleTask.launch(
         SimpleConfig(
             max_steps=5,
-            exp_dir=str(tmpdir),
+            run_dir=str(tmpdir),
             save_every_n_steps=3,
         ),
         use_cli=False,
@@ -143,7 +143,7 @@ def test_save_load_model(tmpdir: Path) -> None:
     assert (ckpt_path / "config.yaml").exists(), "Config checkpoint should exist"
 
     # Test loading checkpoint
-    task = SimpleTask.get_task(SimpleConfig(exp_dir=str(tmpdir)), use_cli=False)
+    task = SimpleTask.get_task(SimpleConfig(run_dir=str(tmpdir)), use_cli=False)
     init_params = xax.InitParams(key=jax.random.key(42))
 
     # Load checkpoint components
@@ -157,7 +157,7 @@ def test_save_load_model(tmpdir: Path) -> None:
     SimpleTask.launch(
         SimpleConfig(
             max_steps=10,
-            exp_dir=str(tmpdir),
+            run_dir=str(tmpdir),
             save_every_n_steps=3,
         ),
         use_cli=False,
@@ -180,7 +180,7 @@ def test_checkpoint_weights_preserved(tmpdir: Path) -> None:
     launcher = xax.MultiCpuLauncher(num_cpus=8)
     config = SimpleConfig(
         max_steps=5,
-        exp_dir=str(tmpdir),
+        run_dir=str(tmpdir),
         save_every_n_steps=3,
     )
 
@@ -224,7 +224,7 @@ def test_checkpoint_weights_preserved(tmpdir: Path) -> None:
     SimpleTask.launch(
         SimpleConfig(
             max_steps=8,  # Train for 3 more steps
-            exp_dir=str(tmpdir),
+            run_dir=str(tmpdir),
             save_every_n_steps=3,
         ),
         use_cli=False,

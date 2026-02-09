@@ -2,15 +2,17 @@
 
 import logging
 import os
-from enum import Enum
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
+import jax
 import numpy as np
 
 from xax.nn.parallel import is_master
 from xax.task.logger import LogError, LogErrorSummary, LoggerImpl, LogLine, LogPing, LogStatus
 from xax.utils.jax import as_float
+from xax.utils.structured_config import field
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -34,59 +36,38 @@ def sanitize_metric_name(name: str) -> str:
     return "".join(char for char in name if ord(char) <= 0xFFFF)
 
 
-class WandbConfigResumeOption(str, Enum):
-    ALLOW = "allow"
-    NEVER = "never"
-    MUST = "must"
-    AUTO = "auto"
+WandbConfigResumePolicy = Literal["allow", "never", "must", "auto"]
+WandbConfigResume = WandbConfigResumePolicy | bool
+WandbConfigMode = Literal["online", "offline", "disabled", "shared"] | None
+WandbConfigReinit = Literal["return_previous", "finish_previous"]
 
 
-class WandbConfigModeOption(str, Enum):
-    ONLINE = "online"
-    OFFLINE = "offline"
-    DISABLED = "disabled"
-    SHARED = "shared"
-
-
-class WandbConfigReinitOption(str, Enum):
-    RETURN_PREVIOUS = "return_previous"
-    FINISH_PREVIOUS = "finish_previous"
-
-
-WandbConfigResume = WandbConfigResumeOption | bool
-WandbConfigMode = WandbConfigModeOption | None
+@jax.tree_util.register_dataclass
+@dataclass
+class WandbConfig:
+    project: str | None = field(None, help="The name of the W&B project to log to.")
+    entity: str | None = field(None, help="The W&B entity (team or user) to log to.")
+    name: str | None = field(None, help="The name of this run.")
+    config: dict[str, Any] | None = field(None, help="Configuration dictionary to log.")
+    tags: list[str] | None = field(None, help="List of tags for this run.")
+    notes: str | None = field(None, help="Notes about this run.")
+    log_interval_seconds: float = field(10.0, help="The interval between successive log lines.")
+    reinit: WandbConfigReinit = field(
+        "return_previous",
+        help="Whether to allow multiple wandb.init() calls in the same process.",
+    )
+    resume: WandbConfigResume = field(False, help="Whether to resume a previous run. Can be a run ID string.")
+    mode: WandbConfigMode = field(None, help="Mode for wandb (online, offline, or disabled).")
 
 
 class WandbLogger(LoggerImpl):
-    def __init__(
-        self,
-        project: str | None = None,
-        entity: str | None = None,
-        name: str | None = None,
-        run_directory: str | Path | None = None,
-        config: dict[str, Any] | None = None,
-        tags: list[str] | None = None,
-        notes: str | None = None,
-        log_interval_seconds: float = 10.0,
-        reinit: WandbConfigReinitOption = WandbConfigReinitOption.RETURN_PREVIOUS,
-        resume: WandbConfigResume = False,
-        mode: WandbConfigMode = None,
-    ) -> None:
+    def __init__(self, run_directory: str | Path, config: WandbConfig) -> None:
         """Defines a logger which writes to Weights & Biases.
 
         Args:
-            project: The name of the W&B project to log to.
-            entity: The W&B entity (team or user) to log to.
-            name: The name of this run.
             run_directory: The root run directory. If provided, wandb will save
                 files to a subdirectory here.
-            config: Configuration dictionary to log.
-            tags: List of tags for this run.
-            notes: Notes about this run.
-            log_interval_seconds: The interval between successive log lines.
-            reinit: Whether to allow multiple wandb.init() calls in the same process.
-            resume: Whether to resume a previous run. Can be a run ID string.
-            mode: Mode for wandb ("online", "offline", or "disabled").
+            config: Configuration for the W&B logger.
         """
         try:
             import wandb as _wandb  # noqa: F401,PLC0415
@@ -97,22 +78,21 @@ class WandbLogger(LoggerImpl):
 
         self._wandb = _wandb
 
-        super().__init__(log_interval_seconds)
+        super().__init__(config.log_interval_seconds)
 
-        self.project = project
-        self.entity = entity
-        self.name = name
-        self.config = config
-        self.tags = tags
-        self.notes = notes
-        self.reinit = reinit
-        self.resume: WandbConfigResume = resume
-        self.mode: WandbConfigMode = mode
+        self.project = config.project
+        self.entity = config.entity
+        self.name = config.name
+        self.config = config.config
+        self.tags = config.tags
+        self.notes = config.notes
+        self.reinit = config.reinit
+        self.resume: WandbConfigResume = config.resume
+        self.mode: WandbConfigMode = config.mode
 
         # Set wandb directory if run_directory is provided
-        if run_directory is not None:
-            self.wandb_dir = Path(run_directory).expanduser().resolve() / "wandb"
-            self.wandb_dir.mkdir(parents=True, exist_ok=True)
+        self.wandb_dir = Path(run_directory).expanduser().resolve() / "wandb"
+        self.wandb_dir.mkdir(parents=True, exist_ok=True)
 
         self._started = False
 
@@ -138,9 +118,9 @@ class WandbLogger(LoggerImpl):
             config=self.config,
             tags=self.tags,
             notes=self.notes,
-            reinit=self.reinit.value,
-            resume=self.resume.value if isinstance(self.resume, WandbConfigResumeOption) else self.resume,
-            mode=self.mode.value if isinstance(self.mode, WandbConfigModeOption) else self.mode,
+            reinit=self.reinit,
+            resume=self.resume,
+            mode=self.mode,
         )
 
         self._started = True

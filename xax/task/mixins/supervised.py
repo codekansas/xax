@@ -21,12 +21,10 @@ from typing import (
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
 from jax.sharding import NamedSharding, PartitionSpec
 from jaxtyping import Array, PRNGKeyArray, PyTree
 
-from xax.core.conf import field
 from xax.core.state import Batch, State
 from xax.nn.parallel import is_master
 from xax.task.logger import Metric, Scalar
@@ -36,6 +34,7 @@ from xax.utils.experiments import ContextTimer
 from xax.utils.jax import fix_unspecified_sharding, jit as xax_jit
 from xax.utils.logging import LOG_PING, LOG_STATUS
 from xax.utils.pytree import get_pytree_param_count
+from xax.utils.structured_config import field
 from xax.utils.text import show_info
 from xax.utils.types.frozen_dict import FrozenDict
 
@@ -85,16 +84,10 @@ class SupervisedMixin(
         """
         raise NotImplementedError("`compute_loss` must be implemented by the subclass")
 
-    def decode_tokens(self, tokens: Array | np.ndarray) -> str:
-        raise NotImplementedError(
-            "When using a Tokens metric you must implement the `decode_tokens` method "
-            "to convert to a string which can be logged."
-        )
-
     def log_step(self, metrics: FrozenDict[str, Metric], state: State, heavy: bool) -> None:
         for k, v in metrics.items():
             try:
-                self.logger.log_metric(k, v, decode_tokens=self.decode_tokens)
+                self.logger.log_metric(k, v)
             except Exception as e:
                 raise ValueError(f"Error logging metric {k}") from e
         self.log_state_timers(state)
@@ -102,7 +95,6 @@ class SupervisedMixin(
 
     @xax_jit(
         static_argnames=["self", "static_parts", "optimizer", "heavy"],
-        donate_argnames=["trainable_arr", "opt_state", "state", "key"],
         jit_level=3,
     )
     def train_step(

@@ -12,8 +12,8 @@ from typing import Generic, TypeVar
 
 import jax
 
-from xax.core.conf import field
 from xax.task.base import BaseConfig, BaseTask
+from xax.utils.structured_config import field
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +51,7 @@ class CompileOptions:
 
     # JAX logging options
     logging_level: str = field(
-        value="INFO",
+        value="WARNING",
         help="JAX logging verbosity level",
     )
 

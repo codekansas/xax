@@ -18,10 +18,10 @@ from typing import Generic, TypeVar
 import jax
 import psutil
 
-from xax.core.conf import field
 from xax.task.base import BaseConfig
 from xax.task.mixins.logger import LoggerConfig, LoggerMixin
 from xax.task.mixins.process import ProcessConfig, ProcessMixin
+from xax.utils.structured_config import field
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -175,9 +175,21 @@ class CPUStatsMonitor:
         self._proc: Process | None = None
 
     def get_if_set(self) -> CPUStatsInfo | None:
-        if self._monitor_event.is_set():
-            self._monitor_event.clear()
-            return CPUStatsInfo.from_stats(self._cpu_stats_smem.get())
+        # CPU stats are best-effort; the SyncManager can shut down before the
+        # training loop fully unwinds. Never fail training because a monitoring
+        # proxy died.
+        try:
+            is_set = self._monitor_event.is_set()
+        except (BrokenPipeError, EOFError, OSError):
+            return None
+
+        if is_set:
+            try:
+                self._monitor_event.clear()
+                stats = self._cpu_stats_smem.get()
+            except (BrokenPipeError, EOFError, OSError):
+                return None
+            return CPUStatsInfo.from_stats(stats)
         return None
 
     def get(self) -> CPUStatsInfo | None:

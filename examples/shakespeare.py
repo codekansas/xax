@@ -137,7 +137,7 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
         loss = jax.vmap(xax.chunked_cross_entropy_loss, in_axes=(0, 0, None, 0, None))(
             hidden_btd,
             targets_bt,
-            model.lm_head.weight,
+            model.lm_head,
             mask_bt,
             256,  # Chunk size
         )
@@ -154,7 +154,7 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
             accuracy = jax.vmap(xax.chunked_cross_entropy_acc, in_axes=(0, 0, None, 0, None))(
                 hidden_btd,
                 targets_bt,
-                model.lm_head.weight,
+                model.lm_head,
                 mask_bt,
                 256,
             )
@@ -170,6 +170,7 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
                 prompt_tokens,
                 eos_id,
                 max_new_tokens=64,
+                context_tn=None,
                 temperature=0.8,
                 top_p=0.9,
                 key=gen_key,
@@ -180,7 +181,7 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
         return loss, metrics
 
     @override
-    def decode_tokens(self, tokens: Array | np.ndarray) -> str:
+    def decode_tokens(self, tokens: np.ndarray, token_type: str) -> str:
         # Convert to list and strip trailing zeros (padding from generation)
         token_list: list[int] = tokens.tolist()
         last_zero = len(token_list)

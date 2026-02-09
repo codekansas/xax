@@ -1,28 +1,30 @@
 """Lets you edit a checkpoint config programmatically."""
 
-import argparse
 import difflib
 import io
 import os
 import subprocess
+import sys
 import tarfile
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from omegaconf import OmegaConf
-
-from xax.task.mixins.checkpointing import load_ckpt
-from xax.utils.text import colored, show_info
+import xax
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("ckpt_path", type=Path)
-    args = parser.parse_args()
+@dataclass(frozen=True)
+class EditConfigArgs:
+    ckpt_path: Path = field(metadata={xax.CLI_POSITIONAL_METADATA_KEY: True, "help": "Path to checkpoint tar.gz"})
+
+
+def _run_edit_config(args: EditConfigArgs) -> None:
+    out = xax.get_cli_output(prefix="edit-config")
+    ckpt_path = args.ckpt_path
 
     # Loads the config from the checkpoint.
-    config = load_ckpt(args.ckpt_path, part="config")
-    config_str = OmegaConf.to_yaml(config)
+    config = xax.load_ckpt(ckpt_path, part="config")
+    config_str = xax.to_yaml_text(config, sort_keys=True)
 
     # Opens the user's preferred editor to edit the config.
     with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as f:
@@ -32,33 +34,37 @@ def main() -> None:
 
     # Loads the edited config.
     try:
-        edited_config = OmegaConf.load(f.name)
-        edited_config_str = OmegaConf.to_yaml(edited_config, sort_keys=True)
+        edited_config = xax.load_yaml(f.name)
+        edited_config_str = xax.to_yaml_text(edited_config, sort_keys=True)
     finally:
         os.remove(f.name)
 
     if edited_config_str == config_str:
-        show_info("No changes were made to the config.")
+        out.status("No changes were made to the config.")
         return
 
     # Diffs the original and edited configs.
     diff = difflib.ndiff(config_str.splitlines(), edited_config_str.splitlines())
+    diff_rows: list[list[str]] = []
     for line in diff:
         if line.startswith("+ "):
-            print(colored(line, "light-green"), flush=True)
+            diff_rows.append(["+", line[2:]])
         elif line.startswith("- "):
-            print(colored(line, "light-red"), flush=True)
+            diff_rows.append(["-", line[2:]])
         elif line.startswith("? "):
-            print(colored(line, "light-cyan"), flush=True)
+            diff_rows.append(["?", line[2:]])
+
+    if diff_rows:
+        out.table(title="Config Diff", headers=["kind", "line"], rows=diff_rows)
 
     # Saves the edited config to the checkpoint.
     with tempfile.TemporaryDirectory() as tmp_dir:
-        with tarfile.open(args.ckpt_path, "r:gz") as src_tar:
+        with tarfile.open(ckpt_path, "r:gz") as src_tar:
             for member in src_tar.getmembers():
                 if member.name != "config":  # Skip the old config file
                     src_tar.extract(member, tmp_dir)
 
-        with tarfile.open(args.ckpt_path, "w:gz") as tar:
+        with tarfile.open(ckpt_path, "w:gz") as tar:
             for root, _, files in os.walk(tmp_dir):
                 for file in files:
                     file_path = os.path.join(root, file)
@@ -70,6 +76,32 @@ def main() -> None:
             config_bytes = edited_config_str.encode()
             info.size = len(config_bytes)
             tar.addfile(info, io.BytesIO(config_bytes))
+
+    out.status("Updated checkpoint config: %s", ckpt_path)
+
+
+def main(argv: list[str] | None = None) -> None:
+    out = xax.get_cli_output(prefix="edit-config")
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    if any(token in ("-h", "--help") for token in argv_list):
+        out.plain(
+            xax.render_help_text(
+                EditConfigArgs,
+                prog="xax edit-config",
+                description="Edit checkpoint configs in-place.",
+            )
+        )
+        raise SystemExit(0)
+    parsed_args = xax.parse_args_as(EditConfigArgs, argv_list)
+    try:
+        _run_edit_config(parsed_args)
+        return_code = 0
+    except KeyboardInterrupt:
+        return_code = 130
+    except Exception as error:
+        out.error("Failed to edit checkpoint config: %s", error)
+        return_code = 1
+    raise SystemExit(return_code)
 
 
 if __name__ == "__main__":

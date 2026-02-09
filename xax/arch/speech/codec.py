@@ -39,6 +39,9 @@ except ModuleNotFoundError as e:
 
 logger = logging.getLogger(__name__)
 
+MIMI_SAMPLE_RATE = 24000
+MIMI_CODEBOOK_SIZE = 2048
+
 
 @dataclass(frozen=True)
 class MimiConfig:
@@ -1627,9 +1630,9 @@ def _load_weights_into_mimi(
                 if w is not None:
                     # JAX Linear uses (out, in), HF also uses (out, in)
                     set_weight(
-                        lambda m, p=prefix, li=layer_idx, pj=proj: getattr(
-                            getattr(m, p.split("_")[0] + "_transformer").layers[li].self_attn, pj
-                        ).weight,
+                        lambda m, p=prefix, li=layer_idx, pj=proj: (
+                            getattr(getattr(m, p.split("_")[0] + "_transformer").layers[li].self_attn, pj).weight
+                        ),
                         w,
                     )
 
@@ -1642,16 +1645,16 @@ def _load_weights_into_mimi(
                 b = get_weight(f"{layer_prefix}.{hf_name}.bias")
                 if w is not None:
                     set_weight(
-                        lambda m, p=prefix, li=layer_idx, on=our_name: getattr(
-                            getattr(m, p.split("_")[0] + "_transformer").layers[li], on
-                        ).weight,
+                        lambda m, p=prefix, li=layer_idx, on=our_name: (
+                            getattr(getattr(m, p.split("_")[0] + "_transformer").layers[li], on).weight
+                        ),
                         w,
                     )
                 if b is not None:
                     set_weight(
-                        lambda m, p=prefix, li=layer_idx, on=our_name: getattr(
-                            getattr(m, p.split("_")[0] + "_transformer").layers[li], on
-                        ).bias,
+                        lambda m, p=prefix, li=layer_idx, on=our_name: (
+                            getattr(getattr(m, p.split("_")[0] + "_transformer").layers[li], on).bias
+                        ),
                         b,
                     )
 
@@ -1660,9 +1663,9 @@ def _load_weights_into_mimi(
                 w = get_weight(f"{layer_prefix}.mlp.{fc}.weight")
                 if w is not None:
                     set_weight(
-                        lambda m, p=prefix, li=layer_idx, f=fc: getattr(
-                            getattr(m, p.split("_")[0] + "_transformer").layers[li].mlp, f
-                        ).weight,
+                        lambda m, p=prefix, li=layer_idx, f=fc: (
+                            getattr(getattr(m, p.split("_")[0] + "_transformer").layers[li].mlp, f).weight
+                        ),
                         w,
                     )
 
@@ -1671,9 +1674,9 @@ def _load_weights_into_mimi(
                 s = get_weight(f"{layer_prefix}.{scale_name}.scale")
                 if s is not None:
                     set_weight(
-                        lambda m, p=prefix, li=layer_idx, sn=scale_name: getattr(
-                            getattr(m, p.split("_")[0] + "_transformer").layers[li], sn
-                        ).scale,
+                        lambda m, p=prefix, li=layer_idx, sn=scale_name: (
+                            getattr(getattr(m, p.split("_")[0] + "_transformer").layers[li], sn).scale
+                        ),
                         s,
                     )
 
@@ -1723,7 +1726,7 @@ def _load_weights_into_mimi(
             embed = embed_sum / cluster_usage[:, None]
             set_weight(lambda m, li=layer_idx: m.quantizer.acoustic_rvq.layers[li].embeddings_kd, embed)
 
-    logger.info("Loaded %d/%d weight tensors", loaded_count, total_keys)
+    logger.info("Loaded %d/%d weight tensors into Mimi model", loaded_count, total_keys)
     return model
 
 

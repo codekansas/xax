@@ -6,6 +6,7 @@ just stores the configuration and provides hooks which are overridden by
 upstream classes.
 """
 
+import dataclasses
 import functools
 import inspect
 import logging
@@ -13,13 +14,23 @@ import sys
 from dataclasses import dataclass, is_dataclass
 from pathlib import Path
 from types import TracebackType
-from typing import Generic, Self, Sequence, TypeVar, cast
+from typing import Any, Generic, Self, Sequence, TypeVar, cast
 
 import jax
-from omegaconf import DictConfig, OmegaConf
-from omegaconf.base import SCMode
 
 from xax.core.state import State
+from xax.utils.structured_config import (
+    apply_dotted_override,
+    dataclass_from_mapping,
+    deep_merge,
+    is_missing_value,
+    load_yaml,
+    parse_override_token,
+    render_dataclass_help,
+    resolve_interpolations,
+    to_primitive,
+    to_yaml_text,
+)
 from xax.utils.text import camelcase_to_snakecase
 
 logger = logging.getLogger(__name__)
@@ -33,17 +44,14 @@ class BaseConfig:
 
 Config = TypeVar("Config", bound=BaseConfig)
 
-RawConfigType = BaseConfig | dict | DictConfig | str | Path
+RawConfigType = BaseConfig | dict[str, Any] | str | Path
 
 
-def _load_as_dict(path: str | Path) -> DictConfig:
-    cfg = OmegaConf.load(path)
-    if not isinstance(cfg, DictConfig):
-        raise TypeError(f"Config file at {path} must be a dictionary, not {type(cfg)}!")
-    return cfg
+def _load_as_dict(path: str | Path) -> dict[str, object]:
+    return load_yaml(path)
 
 
-def get_config(cfg: RawConfigType, task_path: Path) -> DictConfig:
+def get_config(cfg: RawConfigType, task_path: Path) -> dict[str, object]:
     if isinstance(cfg, (str, Path)):
         cfg = Path(cfg)
         if cfg.exists():
@@ -53,10 +61,46 @@ def get_config(cfg: RawConfigType, task_path: Path) -> DictConfig:
         else:
             raise FileNotFoundError(f"Could not find config file at {cfg}!")
     elif isinstance(cfg, dict):
-        cfg = OmegaConf.create(cfg)
+        cfg = {str(key): value for key, value in cfg.items()}
     elif is_dataclass(cfg):
-        cfg = OmegaConf.structured(cfg)
-    return cast(DictConfig, cfg)
+        cfg_payload = to_primitive(cfg, preserve_missing=True)
+        if not isinstance(cfg_payload, dict):
+            raise TypeError(f"Expected dataclass config payload to be a mapping, got {type(cfg_payload)!r}")
+        cfg = {str(key): value for key, value in cfg_payload.items()}
+    return cast(dict[str, object], cfg)
+
+
+def _default_config_payload(config_class: type[Config]) -> dict[str, object]:
+    default_config = config_class()
+    payload = to_primitive(default_config, preserve_missing=True)
+    if not isinstance(payload, dict):
+        raise TypeError(f"Expected default config payload to be a mapping, got {type(payload)!r}")
+    return {str(key): value for key, value in payload.items()}
+
+
+def _missing_field_paths(value: object, prefix: str = "") -> list[str]:
+    if is_missing_value(value):
+        return [prefix]
+    if is_dataclass(value):
+        missing: list[str] = []
+        for field in dataclasses.fields(value):
+            field_prefix = field.name if not prefix else f"{prefix}.{field.name}"
+            missing.extend(_missing_field_paths(getattr(value, field.name), field_prefix))
+        return missing
+    if isinstance(value, dict):
+        missing = []
+        for key, item in value.items():
+            key_str = str(key)
+            field_prefix = key_str if not prefix else f"{prefix}.{key_str}"
+            missing.extend(_missing_field_paths(item, field_prefix))
+        return missing
+    if isinstance(value, list):
+        missing = []
+        for idx, item in enumerate(value):
+            field_prefix = f"{prefix}.{idx}" if prefix else str(idx)
+            missing.extend(_missing_field_paths(item, field_prefix))
+        return missing
+    return []
 
 
 class BaseTask(Generic[Config]):
@@ -184,12 +228,15 @@ class BaseTask(Generic[Config]):
         except OSError:
             logger.warning("Could not resolve task path for %s, returning current working directory", cls.__name__)
             task_path = Path.cwd()
-        cfg = OmegaConf.structured(cls.get_config_class())
-        cfg = OmegaConf.merge(cfg, *(get_config(other_cfg, task_path) for other_cfg in cfgs))
+        config_class = cls.get_config_class()
+        cfg_payload = _default_config_payload(config_class)
+        for other_cfg in cfgs:
+            cfg_payload = cast(dict[str, object], deep_merge(cfg_payload, get_config(other_cfg, task_path)))
         if use_cli:
             args = use_cli if isinstance(use_cli, list) else sys.argv[1:]
             if "-h" in args or "--help" in args:
-                sys.stdout.write(OmegaConf.to_yaml(cfg, sort_keys=True))
+                sys.stdout.write(render_dataclass_help(config_class, prog=cls.__name__))
+                sys.stdout.write("\n")
                 sys.stdout.flush()
                 sys.exit(0)
 
@@ -198,22 +245,22 @@ class BaseTask(Generic[Config]):
             paths = [arg for arg, is_path in zip(args, is_path, strict=True) if is_path]
             non_paths = [arg for arg, is_path in zip(args, is_path, strict=True) if not is_path]
             if paths:
-                cfg = OmegaConf.merge(cfg, *(get_config(path, task_path) for path in paths))
-            cfg = OmegaConf.merge(cfg, OmegaConf.from_cli(non_paths))
+                for path in paths:
+                    cfg_payload = cast(dict[str, object], deep_merge(cfg_payload, get_config(path, task_path)))
+            for override_token in non_paths:
+                key, value = parse_override_token(override_token)
+                apply_dotted_override(cfg_payload, key, value)
 
-        return cast(
-            Config,
-            OmegaConf.to_container(
-                cfg,
-                resolve=True,
-                throw_on_missing=True,
-                structured_config_mode=SCMode.INSTANTIATE,
-            ),
-        )
+        cfg_payload = resolve_interpolations(cfg_payload)
+        config = dataclass_from_mapping(config_class, cfg_payload)
+        if missing_paths := _missing_field_paths(config):
+            missing_list = ", ".join(missing_paths)
+            raise ValueError(f"Config has missing required value(s): {missing_list}")
+        return config
 
     @classmethod
     def config_str(cls, *cfgs: RawConfigType, use_cli: bool | list[str] = True) -> str:
-        return OmegaConf.to_yaml(cls.get_config(*cfgs, use_cli=use_cli), sort_keys=True)
+        return to_yaml_text(cls.get_config(*cfgs, use_cli=use_cli), sort_keys=True)
 
     @classmethod
     def get_task(cls, *cfgs: RawConfigType, use_cli: bool | list[str] = True) -> Self:

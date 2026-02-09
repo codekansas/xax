@@ -18,10 +18,10 @@ from typing import Generic, Iterable, TypeVar
 
 import jax
 
-from xax.core.conf import field
 from xax.task.mixins.logger import LoggerConfig, LoggerMixin
 from xax.task.mixins.process import ProcessConfig, ProcessMixin
 from xax.utils.devices import get_num_gpus
+from xax.utils.structured_config import field
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -225,12 +225,29 @@ class GPUStatsMonitor:
 
     def get_if_set(self) -> dict[int, GPUStatsInfo]:
         gpu_stats: dict[int, GPUStatsInfo] = {}
-        if self._main_event.is_set():
-            self._main_event.clear()
-            for i, event in enumerate(self._events):
-                if event.is_set():
-                    event.clear()
-                    gpu_stats[i] = GPUStatsInfo.from_stats(self._smems[i].get())
+        # The SyncManager backing these proxy objects can exit before the main
+        # training loop fully unwinds (e.g. at shutdown / after a queued-job
+        # teardown). In that case, accessing the proxies raises BrokenPipeError.
+        # GPU stats are best-effort; never fail training due to monitor issues.
+        try:
+            is_set = self._main_event.is_set()
+        except (BrokenPipeError, EOFError, OSError):
+            return gpu_stats
+
+        if is_set:
+            try:
+                self._main_event.clear()
+            except (BrokenPipeError, EOFError, OSError):
+                return gpu_stats
+
+            for idx, event in enumerate(self._events):
+                try:
+                    if event.is_set():
+                        event.clear()
+                        gpu_stats[idx] = GPUStatsInfo.from_stats(self._smems[idx].get())
+                except (BrokenPipeError, EOFError, OSError):
+                    # Manager died mid-iteration; return what we have.
+                    break
         return gpu_stats
 
     def get(self) -> dict[int, GPUStatsInfo]:

@@ -24,6 +24,7 @@ from typing import (
     Iterator,
     Literal,
     Mapping,
+    Protocol,
     Self,
     Sequence,
     TypeVar,
@@ -35,14 +36,15 @@ import jax.numpy as jnp
 import numpy as np
 from jax._src.core import ClosedJaxpr
 from jaxtyping import Array
+from numpy.typing import NDArray
 from PIL import Image as PILImage, ImageDraw, ImageFont
 from PIL.Image import Image as PILImageType
 
-from xax.core.conf import field
 from xax.core.state import State
 from xax.utils.experiments import ContextTimer, IntervalTicker
 from xax.utils.jax import to_numpy
 from xax.utils.logging import LOG_ERROR_SUMMARY, LOG_PING, LOG_STATUS, format_number
+from xax.utils.structured_config import field
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +61,10 @@ DEFAULT_VIDEO_FPS = 30
 DEFAULT_HISTOGRAM_BINS = 100
 
 NAMESPACE_STACK: list[str] = []
+
+
+class DecodeTokensProtocol(Protocol):
+    def __call__(self, tokens: np.ndarray, token_type: str) -> str: ...
 
 
 def standardize_text(text: str, max_line_length: int | None = None, remove_non_ascii: bool = False) -> list[str]:
@@ -258,6 +264,7 @@ class Histogram:
 @dataclass(frozen=True)
 class Tokens:
     value: Array
+    tokenizer: str | None = field(value=None)
     secondary: bool = field(value=False)
 
 
@@ -460,17 +467,19 @@ def get_image(image: np.ndarray | Array | PILImageType, target_resolution: tuple
         else:
             raise ValueError(f"Unsupported image dtype: {image.dtype}")
 
+        image_u8 = cast(NDArray[np.uint8], image)
+
         # Converts to a PIL image.
-        if image.shape[-1] == 1:
-            image = PILImage.fromarray(image[..., 0])
-        elif image.shape[-1] == 3:
-            image = PILImage.fromarray(image)
-        elif image.shape[0] == 1:
-            image = PILImage.fromarray(image[0])
-        elif image.shape[0] == 3:
-            image = PILImage.fromarray(image.transpose(1, 2, 0))
+        if image_u8.shape[-1] == 1:
+            image = PILImage.fromarray(np.squeeze(image_u8, axis=-1))
+        elif image_u8.shape[-1] == 3:
+            image = PILImage.fromarray(image_u8)
+        elif image_u8.shape[0] == 1:
+            image = PILImage.fromarray(np.squeeze(image_u8, axis=0))
+        elif image_u8.shape[0] == 3:
+            image = PILImage.fromarray(np.transpose(image_u8, (1, 2, 0)))
         else:
-            raise ValueError(f"Unsupported image shape: {image.shape}")
+            raise ValueError(f"Unsupported image shape: {image_u8.shape}")
 
     if target_resolution is not None:
         image = make_human_viewable_resolution(image, trg_res=target_resolution)
@@ -744,6 +753,9 @@ class Logger:
         # Flag when the logger is active.
         self.active = False
 
+        # Function to call to decode tokens.
+        self.decode_tokens: DecodeTokensProtocol | None = None
+
     def add_logger(self, *logger: LoggerImpl) -> None:
         """Add the logger, so that it gets called when `write` is called.
 
@@ -841,7 +853,6 @@ class Logger:
         value: Metric,
         *,
         namespace: str | None = None,
-        decode_tokens: Callable[[Array | np.ndarray], str] | None = None,
     ) -> None:
         if not self.active:
             raise RuntimeError("The logger is not active")
@@ -854,11 +865,13 @@ class Logger:
         elif isinstance(value, Histogram):
             self.log_histogram(key, value.value, bins=value.bins, namespace=namespace)
         elif isinstance(value, Tokens):
-            if decode_tokens is None:
-                raise ValueError("decode_tokens must be provided when logging Tokens")
-            tokens_np = to_numpy(value.value)
-            value_str = decode_tokens(tokens_np)
-            self.log_string(key, value_str, namespace=namespace, secondary=value.secondary)
+            self.log_tokens(
+                key,
+                value.value,
+                namespace=namespace,
+                secondary=value.secondary,
+                token_type="default" if value.tokenizer is None else value.tokenizer,
+            )
         elif isinstance(value, Image):
             self.log_image(key, value.image, namespace=namespace, target_resolution=value.target_resolution)
         elif isinstance(value, Images):
@@ -1022,6 +1035,44 @@ class Logger:
             return histogram_values
 
         self.histograms[namespace][key] = histogram_future
+
+    def log_tokens(
+        self,
+        key: str,
+        value: Callable[[], Array | np.ndarray] | Array | np.ndarray,
+        *,
+        namespace: str | None = None,
+        secondary: bool = False,
+        token_type: str = "default",
+    ) -> None:
+        """Logs a tokens value.
+
+        Args:
+            key: The key being logged
+            value: The tokens value being logged
+            namespace: An optional logging namespace
+            tokenizer: The tokenizer to use for decoding the tokens
+            secondary: If set, treat this as a secondary value (meaning, it is
+                less important than other values, and some downstream loggers
+                will not display it)
+            token_type: The type of tokens being logged
+        """
+        if self.decode_tokens is None:
+            raise ValueError("decode_tokens must be provided when logging Tokens")
+        decode_tokens = self.decode_tokens
+
+        if not self.active:
+            raise RuntimeError("The logger is not active")
+        namespace = self.resolve_namespace(namespace)
+
+        @functools.lru_cache(maxsize=None)
+        def value_future() -> LogString:
+            tokens = value() if callable(value) else value
+            tokens_np = to_numpy(tokens)
+            string_value = decode_tokens(tokens_np, token_type)
+            return LogString(value=string_value, secondary=secondary)
+
+        self.strings[namespace][key] = value_future
 
     def log_histogram_raw(
         self,
