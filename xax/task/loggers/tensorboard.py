@@ -1,11 +1,13 @@
 """Defines a Tensorboard logger backend."""
 
 import atexit
+import importlib.util
 import logging
 import os
 import random
 import re
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -86,6 +88,9 @@ class TensorboardLogger(LoggerImpl):
     def worker_thread(self) -> None:
         if os.environ.get("DISABLE_TENSORBOARD", "0") == "1":
             return
+        if importlib.util.find_spec("tensorboard") is None:
+            logger.warning("TensorBoard is not installed; skipping TensorBoard server startup.")
+            return
 
         time.sleep(self.wait_seconds)
 
@@ -126,7 +131,7 @@ class TensorboardLogger(LoggerImpl):
             return tbd_str
 
         command: list[str] = [
-            "python",
+            sys.executable,
             "-m",
             "tensorboard.main",
             "serve",
@@ -161,7 +166,8 @@ class TensorboardLogger(LoggerImpl):
                 lines.append(line_str)
             else:
                 line_str = "".join(lines)
-                raise RuntimeError(f"Tensorboard failed to start:\n{line_str}")
+                logger.warning("TensorBoard server failed to start; continuing without it:\n%s", line_str)
+                return
 
     def cleanup(self) -> None:
         if self.proc is not None:

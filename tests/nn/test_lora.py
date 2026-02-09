@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import jax.random as jrandom
 import pytest
 
+import xax
 from xax.nn.lora import (
     LoRALinear,
     lora_filter_spec,
@@ -27,6 +28,19 @@ def test_lora_linear_matches_manual_delta() -> None:
     expected_bo = jax.vmap(linear)(x_bi) + manual_delta_bo * lora_linear.scaling
 
     assert jnp.allclose(y_model_bo, expected_bo)
+
+
+def test_apply_linear_matches_lora_linear_call() -> None:
+    key = jrandom.key(0)
+    lin_key, lora_key, x_key = jrandom.split(key, 3)
+    linear = eqx.nn.Linear(4, 3, key=lin_key)
+    lora_linear = loraize_linear(linear, rank=2, alpha=4.0, key=lora_key)  # scaling=2.0
+    x_bt4 = jrandom.normal(x_key, (2, 5, 4))
+
+    y_apply_bt3 = xax.apply_linear(x_bt4, lora_linear)
+    y_call_bt3 = lora_linear(x_bt4, inference=True)
+
+    assert jnp.allclose(y_apply_bt3, y_call_bt3, atol=1e-5)
 
 
 def test_loraize_replaces_all_linears() -> None:

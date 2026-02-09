@@ -46,8 +46,8 @@ def apply_linear(x: Array, linear: eqx.nn.Linear | Fp8Linear | LoRALinear | eqx.
         y = jnp.einsum("...d,od->...o", x, linear.weight_oi)
         if linear.bias_o is not None:
             y = y + linear.bias_o
-        # Add LoRA contribution: (x @ A) @ B * alpha
-        delta = (x @ linear.lora_a_ir) @ linear.lora_b_ro * linear.alpha
+        # Add LoRA contribution: (x @ A) @ B * (alpha / rank).
+        delta = (x @ linear.lora_a_ir) @ linear.lora_b_ro * linear.scaling
         return y + delta
     elif isinstance(linear, Fp8Linear):
         # For Fp8Linear, call it directly (it handles FP8 internally)
@@ -1500,8 +1500,11 @@ class TransformerBlock(eqx.Module):
             x_tn = x_tn + cross_attn_output
 
         # Feed-forward block with pre-norm
-        norm_x_tn = self.mlp_norm(x_tn)
-        ff_output_tn = self.feed_forward(norm_x_tn)
+        norm_x_tn = jax.vmap(self.mlp_norm)(x_tn)
+        if isinstance(self.feed_forward, eqx.nn.MLP):
+            ff_output_tn = jax.vmap(self.feed_forward)(norm_x_tn)
+        else:
+            ff_output_tn = self.feed_forward(norm_x_tn)
         x_tn = x_tn + ff_output_tn
 
         return x_tn, updated_cache
