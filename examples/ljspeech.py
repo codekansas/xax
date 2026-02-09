@@ -532,9 +532,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         # Mimi + Whisper: frozen (or absent).
         mimi_spec = None if model.mimi is None else jax.tree.map(lambda _: False, model.mimi)
         whisper_spec = (
-            None
-            if model.whisper_transcriber is None
-            else jax.tree.map(lambda _: False, model.whisper_transcriber)
+            None if model.whisper_transcriber is None else jax.tree.map(lambda _: False, model.whisper_transcriber)
         )
 
         return FullTTSModel(
@@ -1034,9 +1032,9 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         ds = cast(Dataset, ds.map(pad_sample, desc="Padding"))
         return ds
 
-    @xax.dataset_fn("unpadded", dependencies=["tokenized_v2"])
+    @xax.dataset_fn("unpadded", dependencies=["tokenized"])
     def unpadded_dataset(self) -> Dataset:
-        ds = cast(Dataset, self.load_dataset("tokenized_v2"))
+        ds = cast(Dataset, self.load_dataset("tokenized"))
 
         def prepare_sample(example: dict) -> dict:
             text_tokens = np.asarray(example["text_tokens"], dtype=np.int32)
@@ -1058,7 +1056,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             result = result.remove_columns(cols_to_remove)
         return cast(Dataset, result)
 
-    @xax.dataset_fn("tokenized_v2", use_hash=False)
+    @xax.dataset_fn("tokenized", use_hash=False)
     def tokenized_v2_dataset(self) -> Dataset:
         columns = ["text_tokens", "audio_codes"]
 
