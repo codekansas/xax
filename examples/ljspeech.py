@@ -21,9 +21,11 @@ Sequence format (stage 1):
 """
 
 import functools
+import hashlib
 import json
 import logging
 import math
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TypedDict, cast, override
@@ -33,7 +35,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-from datasets import Dataset, load_dataset
+from datasets import Dataset, concatenate_datasets, load_dataset, load_from_disk
 from jaxtyping import Array, PRNGKeyArray
 from scipy.signal import resample_poly
 from transformers import AutoTokenizer
@@ -351,6 +353,13 @@ class Config(xax.SupervisedConfig):
     residual_mlp_dim: int = xax.field(RESIDUAL_MLP_DIM, help="Residual model feed-forward hidden dim")
     semantic_loss_weight: float = xax.field(1.0, help="Weight for stage-1 semantic loss in total loss")
     acoustic_loss_weight: float = xax.field(1.0, help="Weight for stage-2 acoustic loss in total loss")
+    semantic_eos_weight: float = xax.field(
+        1.0,
+        help=(
+            "Relative weighting for the stage-1 AUDIO_END token within the semantic loss. "
+            "Increasing this can make EOS emission more reliable during generation."
+        ),
+    )
     text_loss_weight: float = xax.field(
         0.0,
         help="Optional LM loss on text prefix (usually 0 for prefix-LM training)",
@@ -378,11 +387,44 @@ class Config(xax.SupervisedConfig):
     )
     warmup_steps: int = xax.field(100, help="Number of warmup steps")
     length_percentile: float = xax.field(0.95, help="Percentile to use for padding lengths")
+    text_source: str = xax.field(
+        "normalized",
+        help=(
+            "Which LJSpeech text field to use for conditioning. "
+            "`normalized` matches keithito/lj_speech normalized_text. "
+            "`raw` uses the original text with punctuation/casing. "
+            "`both` doubles the dataset by including both variants."
+        ),
+    )
     q0_corruption_prob: float = xax.field(
         0.0,
         help=(
             "Stage-2 training only: with this probability, replace a Q0 conditioning token with a random code. "
             "This makes the residual model more robust to stage-1 generation errors."
+        ),
+    )
+    semantic_q0_corruption_prob: float = xax.field(
+        0.0,
+        help=(
+            "Stage-1 training only: with this probability, corrupt an input Q0 token in the teacher-forced "
+            "context with a random Q0 token. This is a simple denoising objective that can reduce exposure "
+            "bias and make EOS emission more reliable under free-running generation."
+        ),
+    )
+    detach_semantic_hidden_for_stage2: bool = xax.field(
+        False,
+        help=(
+            "If true, stop gradients from the stage-2 residual loss from flowing into the semantic LLM. "
+            "This can preserve the LLM's text-conditioning behavior and sometimes improves OOD stability, "
+            "at the cost of weaker joint co-adaptation."
+        ),
+    )
+    residual_semantic_hidden_dropout_prob: float = xax.field(
+        0.0,
+        help=(
+            "Stage-2 training only: dropout probability for frame-aligned semantic hidden states. "
+            "This prevents the residual model from over-relying on semantic hidden states that may be "
+            "distribution-shifted at inference (generated Q0 stream), improving robustness."
         ),
     )
 
@@ -400,11 +442,32 @@ class Config(xax.SupervisedConfig):
         "Master these, and do not let them master you.",
         help="Secondary (in-domain) prompt to sanity-check inference",
     )
-    semantic_gen_temperature: float = xax.field(0.8, help="Sampling temperature for semantic generation")
-    semantic_gen_top_p: float = xax.field(0.9, help="Top-p for semantic generation")
+    semantic_gen_temperature: float = xax.field(
+        0.0,
+        help=(
+            "Sampling temperature for semantic generation (0=greedy). "
+            "For evaluation, greedy decoding is usually more stable than sampling."
+        ),
+    )
+    semantic_gen_top_p: float = xax.field(1.0, help="Top-p for semantic generation")
     semantic_gen_min_new_tokens: int = xax.field(
-        96,
+        0,
         help="Minimum Q0 tokens to generate before allowing EOS",
+    )
+    semantic_length_heuristic_frames_per_text_token: float | None = xax.field(
+        None,
+        help=(
+            "Optional inference-only cap: max_frames ~= frames_per_text_token * num_text_tokens. "
+            "This can reduce drift/repetition when EOS isn't reliable."
+        ),
+    )
+    semantic_length_heuristic_factor: float = xax.field(
+        1.25,
+        help="Multiplier applied to semantic_length_heuristic_frames_per_text_token before capping max_frames.",
+    )
+    semantic_length_heuristic_min_frames: int = xax.field(
+        1,
+        help="Lower bound on the heuristic max_frames cap (only used when the heuristic is enabled).",
     )
     residual_gen_temperature: float = xax.field(0.0, help="Sampling temperature for residual generation (0=argmax)")
     residual_gen_top_p: float = xax.field(0.95, help="Top-p for residual generation")
@@ -469,19 +532,111 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         self.eval_prompt_tokens = make_prompt_tokens(self.config.eval_prompt)
         self.eval_prompt_in_domain_tokens = make_prompt_tokens(self.config.eval_prompt_in_domain)
 
-    @functools.cached_property
-    def _padding_lengths(self) -> tuple[int, int]:
+    def _get_padding_lengths(self) -> tuple[int, int]:
+        if hasattr(self, "_padding_lengths_cache"):
+            return self._padding_lengths_cache
+
         path = self.dataset_cache_dir / "maximum_lengths.json"
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return int(data["max_seq_len"]), int(data["max_audio_frames"])
+        file_max_seq_len: int | None = None
+        file_max_audio_frames: int | None = None
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                file_max_seq_len = int(data["max_seq_len"])
+                file_max_audio_frames = int(data["max_audio_frames"])
+            except Exception:
+                logger.exception("Failed to read %s; will infer lengths from cached dataset", path)
+
+        if "train" not in getattr(self, "dataset_functions", {}):
+            fallback_lengths = self._infer_padding_lengths_from_tokenized_cache()
+            if fallback_lengths is not None:
+                self._padding_lengths_cache = fallback_lengths
+                return self._padding_lengths_cache
+
+        # Prefer the cached train dataset's shapes as the source of truth.
+        try:
+            train_ds = cast(Dataset, self.load_dataset("train"))
+            ex0 = train_ds[0]
+            ds_max_seq_len = int(np.asarray(ex0["codes"], dtype=np.int32).shape[0])
+            ds_max_audio_frames = int(np.asarray(ex0["audio_codes"], dtype=np.int32).shape[0])
+            if (file_max_seq_len != ds_max_seq_len) or (file_max_audio_frames != ds_max_audio_frames):
+                self.dataset_cache_dir.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    json.dumps({"max_seq_len": ds_max_seq_len, "max_audio_frames": ds_max_audio_frames}),
+                    encoding="utf-8",
+                )
+            self._padding_lengths_cache = (ds_max_seq_len, ds_max_audio_frames)
+            return self._padding_lengths_cache
+        except Exception:
+            if file_max_seq_len is None or file_max_audio_frames is None:
+                raise
+            self._padding_lengths_cache = (file_max_seq_len, file_max_audio_frames)
+            return self._padding_lengths_cache
+
+    def _infer_padding_lengths_from_tokenized_cache(self) -> tuple[int, int] | None:
+        tokenized_root = self.dataset_cache_dir / "tokenized"
+        candidate_names = ("v4", "v3", "default")
+        text_source = self.config.text_source.strip().lower()
+
+        for candidate_name in candidate_names:
+            candidate_path = tokenized_root / candidate_name
+            if not candidate_path.exists():
+                continue
+
+            logger.info("Inferring padding lengths from tokenized cache at %s", candidate_path)
+            ds = cast(Dataset, load_from_disk(str(candidate_path)))
+            audio_lengths = np.asarray([len(codes_t) for codes_t in ds["audio_codes"]], dtype=np.int32)
+            max_audio_frames = int(np.percentile(audio_lengths, self.config.length_percentile * 100))
+
+            columns = set(ds.column_names)
+            if {"text_norm", "text_raw"}.issubset(columns):
+                text_norm_lengths = np.asarray(
+                    [len(self.tokenizer.encode(text)) for text in cast(list[str], ds["text_norm"])],
+                    dtype=np.int32,
+                )
+                text_raw_lengths = np.asarray(
+                    [len(self.tokenizer.encode(text)) for text in cast(list[str], ds["text_raw"])],
+                    dtype=np.int32,
+                )
+                if text_source == "normalized":
+                    code_lengths = text_norm_lengths + audio_lengths + 4
+                elif text_source == "raw":
+                    code_lengths = text_raw_lengths + audio_lengths + 4
+                elif text_source == "both":
+                    code_lengths = np.concatenate(
+                        [
+                            text_norm_lengths + audio_lengths + 4,
+                            text_raw_lengths + audio_lengths + 4,
+                        ]
+                    )
+                else:
+                    raise ValueError(
+                        f"Invalid text_source: {self.config.text_source!r} (expected normalized, raw, or both)"
+                    )
+            elif "text_tokens" in columns:
+                text_lengths = np.asarray([len(tokens_s) for tokens_s in ds["text_tokens"]], dtype=np.int32)
+                code_lengths = text_lengths + audio_lengths + 4
+            else:
+                continue
+
+            max_seq_len = int(np.percentile(code_lengths, self.config.length_percentile * 100))
+            self.dataset_cache_dir.mkdir(parents=True, exist_ok=True)
+            path = self.dataset_cache_dir / "maximum_lengths.json"
+            path.write_text(
+                json.dumps({"max_seq_len": max_seq_len, "max_audio_frames": max_audio_frames}),
+                encoding="utf-8",
+            )
+            return max_seq_len, max_audio_frames
+
+        return None
 
     @property
     def max_seq_length(self) -> int:
-        return self._padding_lengths[0]
+        return self._get_padding_lengths()[0]
 
     @property
     def max_audio_frames(self) -> int:
-        return self._padding_lengths[1]
+        return self._get_padding_lengths()[1]
 
     @override
     def get_model(self, params: xax.InitParams) -> FullTTSModel:
@@ -517,6 +672,28 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             residual_mlp_dim=self.config.residual_mlp_dim,
             key=mimi_key,
         )
+
+    @override
+    def _get_dataset_hash(self, name: str) -> str:
+        """Extend dataset hashing with config-dependent fields.
+
+        XAX dataset caching hashes dataset functions (and their dependencies)
+        but does not include runtime config values. This task's `train` (and
+        optionally `unpadded`) datasets depend on fields like `length_percentile`
+        and `text_source`, so we incorporate a small hash of those fields into
+        the cache key to prevent stale re-use across experiments.
+        """
+        base_hash = super()._get_dataset_hash(name)
+        if name not in {"train", "unpadded"}:
+            return base_hash
+
+        payload = {
+            "length_percentile": float(self.config.length_percentile),
+            "llm_repo": str(self.config.llm_repo),
+            "text_source": str(self.config.text_source),
+        }
+        cfg_hash = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:8]
+        return f"{base_hash}_{cfg_hash}"
 
     @override
     def get_trainable_filter_spec(self, model: FullTTSModel) -> FullTTSModel:
@@ -618,6 +795,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
     ) -> tuple[Array, dict[str, xax.Metric]]:
         codes_bs = batch["codes"]
         audio_codes_btf = batch["audio_codes"]
+        bsz = int(codes_bs.shape[0])
 
         # Stage 1: semantic Q0 prediction (prefix-LM style, loss on audio segment only).
         tokens_bs, targets_bs = codes_bs[:, :-1], codes_bs[:, 1:]
@@ -626,7 +804,8 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
         q0_min_id = self.first_q0_id
         q0_max_id = self.first_q0_id + CODEBOOK_SIZE
-        semantic_mask_bs = ((targets_bs >= q0_min_id) & (targets_bs < q0_max_id)) | (targets_bs == self.audio_end_id)
+        q0_mask_bs = (targets_bs >= q0_min_id) & (targets_bs < q0_max_id)
+        eos_mask_bs = targets_bs == self.audio_end_id
 
         # Optional text prefix loss (kept off by default).
         text_end_mask_bs = codes_bs == self.text_end_id
@@ -641,27 +820,63 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         def compute_stage1_terms(
             sample_tokens_s: Array,
             sample_targets_s: Array,
-            sample_semantic_mask_s: Array,
+            sample_q0_mask_s: Array,
+            sample_eos_mask_s: Array,
             sample_text_mask_s: Array,
-        ) -> tuple[Array, Array, Array, Array, Array]:
+            sample_key: PRNGKeyArray,
+        ) -> tuple[Array, Array, Array, Array, Array, Array, Array, Array, Array]:
+            if self.config.semantic_q0_corruption_prob > 0:
+                mask_key, codes_key = jax.random.split(sample_key)
+                q0_input_mask_s = (sample_tokens_s >= q0_min_id) & (sample_tokens_s < q0_max_id)
+                corrupt_mask_s = (
+                    jax.random.uniform(mask_key, sample_tokens_s.shape) < self.config.semantic_q0_corruption_prob
+                ) & q0_input_mask_s
+                random_q0_s = jax.random.randint(codes_key, sample_tokens_s.shape, q0_min_id, q0_max_id)
+                sample_tokens_s = jnp.where(corrupt_mask_s, random_q0_s, sample_tokens_s)
             hidden_sd = llm.forward_hidden(sample_tokens_s)
 
+            sample_semantic_mask_s = sample_q0_mask_s | sample_eos_mask_s
             targets_extra_s = jnp.where(sample_semantic_mask_s, sample_targets_s - base_vocab_size, 0)
             targets_extra_s = jnp.clip(targets_extra_s, 0, self.extra_vocab_size - 1)
-            semantic_loss = chunked_cross_entropy_loss(
+            q0_loss = chunked_cross_entropy_loss(
                 hidden_sd,
                 targets_extra_s,
                 audio_lm_head,
-                mask_t=sample_semantic_mask_s,
+                mask_t=sample_q0_mask_s,
                 chunk_size=128,
             )
-            semantic_acc = chunked_cross_entropy_acc(
+            q0_acc = chunked_cross_entropy_acc(
                 hidden_sd,
                 targets_extra_s,
                 audio_lm_head,
-                mask_t=sample_semantic_mask_s,
+                mask_t=sample_q0_mask_s,
                 chunk_size=128,
             )
+
+            eos_loss = chunked_cross_entropy_loss(
+                hidden_sd,
+                targets_extra_s,
+                audio_lm_head,
+                mask_t=sample_eos_mask_s,
+                chunk_size=128,
+            )
+            eos_acc = chunked_cross_entropy_acc(
+                hidden_sd,
+                targets_extra_s,
+                audio_lm_head,
+                mask_t=sample_eos_mask_s,
+                chunk_size=128,
+            )
+
+            # Weight EOS relative to Q0 positions. This uses a weighted average
+            # on the total negative log-likelihood sum (and similarly for
+            # accuracy), treating EOS as `semantic_eos_weight` positions.
+            q0_count = jnp.maximum(sample_q0_mask_s.astype(jnp.float32).sum(), 1.0)
+            eos_count = sample_eos_mask_s.astype(jnp.float32).sum()
+            eos_weight = jnp.asarray(self.config.semantic_eos_weight, dtype=jnp.float32)
+            denom = q0_count + eos_weight * eos_count
+            semantic_loss = (q0_loss * q0_count + eos_loss * eos_weight * eos_count) / denom
+            semantic_acc = (q0_acc * q0_count + eos_acc * eos_weight * eos_count) / denom
 
             if self.config.text_loss_weight <= 0:
                 text_loss = jnp.array(0.0, dtype=jnp.float32)
@@ -688,24 +903,48 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
                     chunk_size=128,
                 )
 
-            return semantic_loss, semantic_acc, text_loss, text_acc, hidden_sd
+            return semantic_loss, semantic_acc, q0_loss, q0_acc, eos_loss, eos_acc, text_loss, text_acc, hidden_sd
 
-        stage1_loss_b, stage1_acc_b, text_loss_b, text_acc_b, hidden_bsd = jax.vmap(
+        (
+            stage1_loss_b,
+            stage1_acc_b,
+            stage1_q0_loss_b,
+            stage1_q0_acc_b,
+            stage1_eos_loss_b,
+            stage1_eos_acc_b,
+            text_loss_b,
+            text_acc_b,
+            hidden_bsd,
+        ) = jax.vmap(
             compute_stage1_terms,
-            in_axes=(0, 0, 0, 0),
-        )(tokens_bs, targets_bs, semantic_mask_bs, text_mask_bs)
+            in_axes=(0, 0, 0, 0, 0, 0),
+        )(
+            tokens_bs,
+            targets_bs,
+            q0_mask_bs,
+            eos_mask_bs,
+            text_mask_bs,
+            jax.random.split(key, bsz),
+        )
 
         stage1_loss = stage1_loss_b.mean()
         stage1_acc = stage1_acc_b.mean()
+        stage1_q0_loss = stage1_q0_loss_b.mean()
+        stage1_q0_acc = stage1_q0_acc_b.mean()
+        stage1_eos_loss = stage1_eos_loss_b.mean()
+        stage1_eos_acc = stage1_eos_acc_b.mean()
         text_loss = text_loss_b.mean()
         text_acc = text_acc_b.mean()
 
         # Stage 2: residual prediction loss.
+        hidden_bsd_for_stage2 = hidden_bsd
+        if self.config.detach_semantic_hidden_for_stage2:
+            hidden_bsd_for_stage2 = jax.lax.stop_gradient(hidden_bsd_for_stage2)
         stage2_losses_bl, stage2_accs_bl = self._compute_stage2_losses_by_codebook(
             model,
             codes_bs=codes_bs,
             audio_codes_btf=audio_codes_btf,
-            hidden_bsd=hidden_bsd,
+            hidden_bsd=hidden_bsd_for_stage2,
             key=key,
         )
         stage2_loss_b = stage2_losses_bl.mean(axis=1)
@@ -726,6 +965,10 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             "stage2_loss": xax.Scalar(stage2_loss),
             "text_loss": xax.Scalar(text_loss),
             "stage1_accuracy": xax.Scalar(stage1_acc),
+            "stage1_q0_loss": xax.Scalar(stage1_q0_loss),
+            "stage1_q0_accuracy": xax.Scalar(stage1_q0_acc),
+            "stage1_eos_loss": xax.Scalar(stage1_eos_loss),
+            "stage1_eos_accuracy": xax.Scalar(stage1_eos_acc),
             "stage2_accuracy": xax.Scalar(stage2_acc),
             "text_accuracy": xax.Scalar(text_acc),
             "weighted_stage1_loss": xax.Scalar(weighted_stage1_loss),
@@ -741,13 +984,30 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         if heavy and self.config.enable_heavy_eval:
             if model.mimi is None or model.whisper_transcriber is None:
                 raise ValueError("enable_heavy_eval was set, but the model was built without Mimi/Whisper modules.")
-            audio_t, gt_audio_t, gt_text_t, gen_len, num_frames, invalid_count = self._generate_audio(model, batch, key)
+            (
+                audio_t,
+                gt_audio_t,
+                gt_text_t,
+                gen_len,
+                num_frames,
+                invalid_count,
+                has_eos,
+                max_frames_cap,
+            ) = self._generate_audio(model, batch, key)
             metrics["generated_audio"] = xax.Audio(audio_t, sample_rate=xax.MIMI_SAMPLE_RATE)
             metrics["real_audio"] = xax.Audio(gt_audio_t, sample_rate=xax.MIMI_SAMPLE_RATE)
+            metrics["generated_audio_rms"] = xax.Scalar(
+                jnp.sqrt(jnp.mean(audio_t.astype(jnp.float32) ** 2)).astype(jnp.float32)
+            )
+            metrics["real_audio_rms"] = xax.Scalar(
+                jnp.sqrt(jnp.mean(gt_audio_t.astype(jnp.float32) ** 2)).astype(jnp.float32)
+            )
             metrics["eval_prompt"] = xax.Tokens(self.eval_prompt_tokens, tokenizer="llm")
             metrics["generated_q0_length"] = xax.Scalar(gen_len.astype(jnp.float32))
             metrics["generated_num_frames"] = xax.Scalar(num_frames.astype(jnp.float32))
             metrics["invalid_q0_token_count"] = xax.Scalar(invalid_count.astype(jnp.float32))
+            metrics["semantic_has_eos"] = xax.Scalar(has_eos.astype(jnp.float32))
+            metrics["semantic_max_frames_cap"] = xax.Scalar(max_frames_cap.astype(jnp.float32))
 
             whisper_audio_t = self._resample_audio_for_whisper(
                 audio_t,
@@ -766,18 +1026,28 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
             # In-domain prompt sanity check.
             key, indomain_key = jax.random.split(key)
-            audio_in_domain_t, q0_len_in_domain, num_frames_in_domain, invalid_in_domain = (
-                self._generate_audio_from_prompt(
-                    model,
-                    prompt_tokens_s=self.eval_prompt_in_domain_tokens,
-                    key=indomain_key,
-                )
+            (
+                audio_in_domain_t,
+                q0_len_in_domain,
+                num_frames_in_domain,
+                invalid_in_domain,
+                has_eos_in_domain,
+                max_cap_in_domain,
+            ) = self._generate_audio_from_prompt(
+                model,
+                prompt_tokens_s=self.eval_prompt_in_domain_tokens,
+                key=indomain_key,
             )
             metrics["generated_audio_in_domain"] = xax.Audio(audio_in_domain_t, sample_rate=xax.MIMI_SAMPLE_RATE)
+            metrics["generated_audio_rms_in_domain"] = xax.Scalar(
+                jnp.sqrt(jnp.mean(audio_in_domain_t.astype(jnp.float32) ** 2)).astype(jnp.float32)
+            )
             metrics["eval_prompt_in_domain"] = xax.Tokens(self.eval_prompt_in_domain_tokens, tokenizer="llm")
             metrics["generated_q0_length_in_domain"] = xax.Scalar(q0_len_in_domain.astype(jnp.float32))
             metrics["generated_num_frames_in_domain"] = xax.Scalar(num_frames_in_domain.astype(jnp.float32))
             metrics["invalid_q0_token_count_in_domain"] = xax.Scalar(invalid_in_domain.astype(jnp.float32))
+            metrics["semantic_has_eos_in_domain"] = xax.Scalar(has_eos_in_domain.astype(jnp.float32))
+            metrics["semantic_max_frames_cap_in_domain"] = xax.Scalar(max_cap_in_domain.astype(jnp.float32))
 
             whisper_audio_in_domain_t = self._resample_audio_for_whisper(
                 audio_in_domain_t,
@@ -828,6 +1098,12 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             semantic_hidden_td = jnp.where(frame_mask_t[:, None], q0_hidden_sd, 0)
 
             audio_codes_ft = audio_codes_tf.T
+            if self.config.residual_semantic_hidden_dropout_prob > 0:
+                key, drop_key = jax.random.split(key)
+                drop_prob = self.config.residual_semantic_hidden_dropout_prob
+                keep_mask_t = jax.random.uniform(drop_key, (max_frames,)) >= drop_prob
+                keep_mask_t = keep_mask_t & frame_mask_t
+                semantic_hidden_td = jnp.where(keep_mask_t[:, None], semantic_hidden_td, 0)
             if self.config.q0_corruption_prob > 0:
                 q0_codes_t = audio_codes_ft[0]
                 frame_mask_t = q0_codes_t != AUDIO_PAD_TOKEN_ID
@@ -858,10 +1134,10 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         model: FullTTSModel,
         batch: Batch,
         key: PRNGKeyArray,
-    ) -> tuple[Array, Array, Array, Array, Array, Array]:
+    ) -> tuple[Array, Array, Array, Array, Array, Array, Array, Array]:
         if model.mimi is None:
             raise ValueError("Mimi model is required for audio generation.")
-        audio_gen_t, gen_len, num_frames, invalid_count = self._generate_audio_from_prompt(
+        audio_gen_t, gen_len, num_frames, invalid_count, has_eos, max_frames_cap = self._generate_audio_from_prompt(
             model,
             prompt_tokens_s=self.eval_prompt_tokens,
             key=key,
@@ -869,14 +1145,18 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
         # Ground-truth audio from the first sample.
         gt_codes_tf = batch["audio_codes"][0]  # (T, 8)
+        gt_num_frames = (gt_codes_tf[:, 0] != AUDIO_PAD_TOKEN_ID).sum()
         gt_codes_ft = gt_codes_tf.T
         gt_codes_ft = jnp.where((gt_codes_ft >= 0) & (gt_codes_ft < CODEBOOK_SIZE), gt_codes_ft, 0)
         audio_gt = model.mimi.decode(gt_codes_ft)
+        audio_gt_t = audio_gt[0]
+        hop_length = int(round(model.mimi.config.sampling_rate / model.mimi.config.frame_rate))
+        audio_gt_t = self._mask_audio_after_num_frames(audio_gt_t, num_frames=gt_num_frames, hop_length=hop_length)
 
         gt_ids = batch["codes"][0]
         gt_text_ids = jax.lax.dynamic_slice(gt_ids, (1,), (gt_ids.shape[0] - 1,))
 
-        return audio_gen_t, audio_gt[0], gt_text_ids, gen_len, num_frames, invalid_count
+        return audio_gen_t, audio_gt_t, gt_text_ids, gen_len, num_frames, invalid_count, has_eos, max_frames_cap
 
     def _resample_audio_for_whisper(self, audio_t: Array, *, whisper_sample_rate: int) -> Array:
         """Resample Mimi (24 kHz) audio to Whisper sample rate (usually 16 kHz).
@@ -891,24 +1171,49 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         out_len = max(1, int(round(in_len * whisper_sample_rate / xax.MIMI_SAMPLE_RATE)))
         return jax.image.resize(audio_t, (out_len,), method="linear")
 
+    def _mask_audio_after_num_frames(self, audio_t: Array, *, num_frames: Array, hop_length: int) -> Array:
+        """Zeros out audio samples after `num_frames` codec frames.
+
+        This keeps tensor shapes static (JIT-friendly) while avoiding long tails
+        of decoded garbage/silence from padded codec frames.
+        """
+        audio_t = audio_t.astype(jnp.float32)
+        num_samples = jnp.maximum(num_frames.astype(jnp.int32), 0) * jnp.asarray(hop_length, dtype=jnp.int32)
+        idx_s = jnp.arange(audio_t.shape[0], dtype=jnp.int32)
+        return jnp.where(idx_s < num_samples, audio_t, 0.0)
+
     def _generate_audio_from_prompt(
         self,
         model: FullTTSModel,
         *,
         prompt_tokens_s: Array,
         key: PRNGKeyArray,
-    ) -> tuple[Array, Array, Array, Array]:
+    ) -> tuple[Array, Array, Array, Array, Array, Array]:
         if model.mimi is None:
             raise ValueError("Mimi model is required for audio generation.")
         k1, k2 = jax.random.split(key)
+        prompt_len = int(prompt_tokens_s.shape[0])
         max_frames = self.max_audio_frames
+        if self.config.semantic_length_heuristic_frames_per_text_token is not None:
+            # [text_start] [TEXT...] [text_end] [audio_start]
+            text_token_count = max(0, prompt_len - 3)
+            pred_frames = int(
+                round(
+                    text_token_count
+                    * float(self.config.semantic_length_heuristic_frames_per_text_token)
+                    * float(self.config.semantic_length_heuristic_factor)
+                )
+            )
+            pred_frames = max(pred_frames, int(self.config.semantic_length_heuristic_min_frames))
+            max_frames = min(max_frames, pred_frames)
+        max_frames = max(1, max_frames)
 
         q0_min_id = self.first_q0_id
         q0_max_id = self.first_q0_id + CODEBOOK_SIZE
 
         # Ensure we never generate more frames than Stage 2 can decode.
         max_new_tokens = min(
-            self.max_seq_length - int(prompt_tokens_s.shape[0]),
+            self.max_seq_length - prompt_len,
             max_frames + 1,  # +1 to allow the EOS token.
         )
 
@@ -920,10 +1225,12 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             top_p=self.config.semantic_gen_top_p,
             key=k1,
             allowed_token_range=(q0_min_id, q0_max_id),
-            min_new_tokens_before_eos=self.config.semantic_gen_min_new_tokens,
+            min_new_tokens_before_eos=min(
+                self.config.semantic_gen_min_new_tokens,
+                max(0, max_new_tokens - 1),
+            ),
         )
 
-        prompt_len = int(prompt_tokens_s.shape[0])
         gen_only_s = gen_tokens_s[prompt_len:]
         gen_len = jnp.maximum(gen_pos - prompt_len, 0)
 
@@ -940,6 +1247,9 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         gen_len = jnp.where(invalid_prefix_s.any(), first_invalid_idx, gen_len)
 
         num_frames = jnp.minimum(gen_len, jnp.asarray(max_frames, dtype=jnp.int32))
+        # Avoid degenerate 0-frame generations (they can cause awkward masking
+        # patterns downstream). This only affects pathological early-EOS cases.
+        num_frames = jnp.maximum(num_frames, jnp.asarray(1, dtype=jnp.int32))
         frame_mask_t = jnp.arange(max_frames) < num_frames
 
         q0_tokens_s = jnp.where(valid_mask_s, gen_only_s, q0_min_id)
@@ -965,7 +1275,126 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         all_codes_ft = jnp.clip(all_codes_ft, 0, CODEBOOK_SIZE - 1)
         audio_gen = model.mimi.decode(all_codes_ft)
 
-        return audio_gen[0], gen_len, num_frames, invalid_count
+        audio_t = audio_gen[0]
+        hop_length = int(round(model.mimi.config.sampling_rate / model.mimi.config.frame_rate))
+        audio_t = self._mask_audio_after_num_frames(audio_t, num_frames=num_frames, hop_length=hop_length)
+
+        max_frames_cap = jnp.asarray(max_frames, dtype=jnp.int32)
+        return audio_t, gen_len, num_frames, invalid_count, has_eos, max_frames_cap
+
+    def _normalize_asr_text(self, text: str) -> str:
+        """Normalize text for ASR-based string metrics (WER/CER)."""
+        text = text.lower()
+        # Keep letters/numbers/apostrophes. Collapse all other runs to spaces.
+        text = re.sub(r"[^a-z0-9']+", " ", text)
+        return re.sub(r"\\s+", " ", text).strip()
+
+    def _edit_distance(self, ref: list[str], hyp: list[str]) -> int:
+        """Levenshtein edit distance (insert/delete/substitute)."""
+        if not ref:
+            return len(hyp)
+        if not hyp:
+            return len(ref)
+        dp = list(range(len(hyp) + 1))
+        for ref_idx, ref_tok in enumerate(ref, start=1):
+            prev = dp[0]
+            dp[0] = ref_idx
+            for hyp_idx, hyp_tok in enumerate(hyp, start=1):
+                cur = dp[hyp_idx]
+                cost = 0 if ref_tok == hyp_tok else 1
+                dp[hyp_idx] = min(
+                    dp[hyp_idx] + 1,  # delete
+                    dp[hyp_idx - 1] + 1,  # insert
+                    prev + cost,  # substitute
+                )
+                prev = cur
+        return dp[-1]
+
+    def _wer(self, ref: str, hyp: str) -> float:
+        ref_words = self._normalize_asr_text(ref).split()
+        hyp_words = self._normalize_asr_text(hyp).split()
+        denom = max(1, len(ref_words))
+        return self._edit_distance(ref_words, hyp_words) / float(denom)
+
+    def _cer(self, ref: str, hyp: str) -> float:
+        ref_norm = self._normalize_asr_text(ref).replace(" ", "")
+        hyp_norm = self._normalize_asr_text(hyp).replace(" ", "")
+        denom = max(1, len(ref_norm))
+        return self._edit_distance(list(ref_norm), list(hyp_norm)) / float(denom)
+
+    @override
+    def log_step(self, metrics: xax.FrozenDict[str, xax.Metric], state: xax.State, heavy: bool) -> None:
+        metrics_d: dict[str, xax.Metric] = dict(metrics)
+
+        # Compute WER/CER as host-side derived metrics from the text summaries.
+        if heavy and self.config.enable_heavy_eval:
+            try:
+                prompt_metric = cast(xax.Tokens, metrics_d["eval_prompt"])
+                transcript_metric = cast(xax.Tokens, metrics_d["transcript"])
+                prompt_text = self.decode_tokens(np.asarray(jax.device_get(prompt_metric.value)), "llm")
+                transcript_text = self.decode_tokens(np.asarray(jax.device_get(transcript_metric.value)), "whisper")
+                ref_words = self._normalize_asr_text(prompt_text).split()
+                hyp_words = self._normalize_asr_text(transcript_text).split()
+                hyp_prefix = " ".join(hyp_words[: len(ref_words)])
+                metrics_d["asr_wer"] = xax.Scalar(
+                    jnp.asarray(self._wer(prompt_text, transcript_text), dtype=jnp.float32)
+                )
+                metrics_d["asr_cer"] = xax.Scalar(
+                    jnp.asarray(self._cer(prompt_text, transcript_text), dtype=jnp.float32)
+                )
+                metrics_d["asr_wer_prefix"] = xax.Scalar(
+                    jnp.asarray(self._wer(prompt_text, hyp_prefix), dtype=jnp.float32)
+                )
+                metrics_d["asr_ref_num_words"] = xax.Scalar(jnp.asarray(float(len(ref_words)), dtype=jnp.float32))
+                metrics_d["asr_hyp_num_words"] = xax.Scalar(jnp.asarray(float(len(hyp_words)), dtype=jnp.float32))
+
+                prompt_in_metric = cast(xax.Tokens, metrics_d["eval_prompt_in_domain"])
+                transcript_in_metric = cast(xax.Tokens, metrics_d["transcript_in_domain"])
+                prompt_in_text = self.decode_tokens(np.asarray(jax.device_get(prompt_in_metric.value)), "llm")
+                transcript_in_text = self.decode_tokens(
+                    np.asarray(jax.device_get(transcript_in_metric.value)),
+                    "whisper",
+                )
+                ref_in_words = self._normalize_asr_text(prompt_in_text).split()
+                hyp_in_words = self._normalize_asr_text(transcript_in_text).split()
+                hyp_in_prefix = " ".join(hyp_in_words[: len(ref_in_words)])
+                metrics_d["asr_wer_in_domain"] = xax.Scalar(
+                    jnp.asarray(self._wer(prompt_in_text, transcript_in_text), dtype=jnp.float32)
+                )
+                metrics_d["asr_cer_in_domain"] = xax.Scalar(
+                    jnp.asarray(self._cer(prompt_in_text, transcript_in_text), dtype=jnp.float32)
+                )
+                metrics_d["asr_wer_prefix_in_domain"] = xax.Scalar(
+                    jnp.asarray(self._wer(prompt_in_text, hyp_in_prefix), dtype=jnp.float32)
+                )
+                metrics_d["asr_ref_num_words_in_domain"] = xax.Scalar(
+                    jnp.asarray(float(len(ref_in_words)), dtype=jnp.float32)
+                )
+                metrics_d["asr_hyp_num_words_in_domain"] = xax.Scalar(
+                    jnp.asarray(float(len(hyp_in_words)), dtype=jnp.float32)
+                )
+
+                # Sanity check: Whisper on real audio vs training text.
+                gt_text_metric = cast(xax.Tokens, metrics_d["gt_text"])
+                gt_transcript_metric = cast(xax.Tokens, metrics_d["gt_transcript"])
+                gt_text = self.decode_tokens(np.asarray(jax.device_get(gt_text_metric.value)), "llm")
+                gt_transcript = self.decode_tokens(np.asarray(jax.device_get(gt_transcript_metric.value)), "whisper")
+                metrics_d["asr_wer_gt"] = xax.Scalar(jnp.asarray(self._wer(gt_text, gt_transcript), dtype=jnp.float32))
+                metrics_d["asr_cer_gt"] = xax.Scalar(jnp.asarray(self._cer(gt_text, gt_transcript), dtype=jnp.float32))
+            except KeyError:
+                # Heavy eval is optional; if the required keys aren't present, skip.
+                pass
+            except Exception:
+                logger.exception("Failed to compute ASR WER/CER derived metrics")
+
+        for k, v in metrics_d.items():
+            try:
+                self.logger.log_metric(k, v)
+            except Exception as e:
+                raise ValueError(f"Error logging metric {k}") from e
+
+        self.log_state_timers(state)
+        self.write_logs(state, heavy)
 
     @override
     def decode_tokens(self, tokens: np.ndarray, token_type: str) -> str:
@@ -1036,29 +1465,105 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
     def unpadded_dataset(self) -> Dataset:
         ds = cast(Dataset, self.load_dataset("tokenized"))
 
-        def prepare_sample(example: dict) -> dict:
-            text_tokens = np.asarray(example["text_tokens"], dtype=np.int32)
-            # Text segment with explicit boundaries.
-            text_with_special = np.concatenate([[self.text_start_id], text_tokens, [self.text_end_id]])
+        def make_dataset_for_text_key(text_key: str) -> Dataset:
+            def prepare_sample(example: dict) -> dict:
+                text = cast(str, example[text_key])
+                text_tokens = np.asarray(self.tokenizer.encode(text), dtype=np.int32)
+                # Text segment with explicit boundaries.
+                text_with_special = np.concatenate([[self.text_start_id], text_tokens, [self.text_end_id]])
 
-            audio_codes_tc = np.asarray(example["audio_codes"], dtype=np.int32)  # (T, 8)
-            q0_codes_t = audio_codes_tc[:, 0]
-            q0_tokens = q0_codes_t + self.first_q0_id
-            audio_with_special = np.concatenate([[self.audio_start_id], q0_tokens, [self.audio_end_id]])
+                audio_codes_tc = np.asarray(example["audio_codes"], dtype=np.int32)  # (T, 8)
+                q0_codes_t = audio_codes_tc[:, 0]
+                q0_tokens = q0_codes_t + self.first_q0_id
+                audio_with_special = np.concatenate([[self.audio_start_id], q0_tokens, [self.audio_end_id]])
 
-            codes = np.concatenate([text_with_special, audio_with_special]).astype(np.int32)
-            return {"codes": codes, "audio_codes": audio_codes_tc.astype(np.int32)}
+                codes = np.concatenate([text_with_special, audio_with_special]).astype(np.int32)
+                return {"codes": codes, "audio_codes": audio_codes_tc.astype(np.int32)}
 
-        result = cast(Dataset, ds.map(prepare_sample, desc="Preparing sequences"))
+            return cast(Dataset, ds.map(prepare_sample, desc=f"Preparing sequences ({text_key})"))
+
+        text_source = self.config.text_source.strip().lower()
+        if text_source == "normalized":
+            result = make_dataset_for_text_key("text_norm")
+        elif text_source == "raw":
+            result = make_dataset_for_text_key("text_raw")
+        elif text_source == "both":
+            result = concatenate_datasets(
+                [
+                    make_dataset_for_text_key("text_norm"),
+                    make_dataset_for_text_key("text_raw"),
+                ]
+            )
+        else:
+            raise ValueError(f"Invalid text_source: {self.config.text_source!r} (expected normalized, raw, or both)")
         cols_to_keep = ["codes", "audio_codes"]
         cols_to_remove = [c for c in result.column_names if c not in cols_to_keep]
         if cols_to_remove:
             result = result.remove_columns(cols_to_remove)
         return cast(Dataset, result)
 
-    @xax.dataset_fn("tokenized", use_hash=False)
-    def tokenized_v2_dataset(self) -> Dataset:
-        columns = ["text_tokens", "audio_codes"]
+    def _load_legacy_tokenized_cache(self) -> Dataset | None:
+        """Loads a compatible tokenized cache from disk when remote rebuilds are unavailable.
+
+        Older caches stored `text_tokens` directly instead of `text_norm` / `text_raw`.
+        We can recover a usable normalized-text view by decoding those tokens with the
+        current tokenizer, which is enough to keep training/evaluation moving even when
+        the upstream dataset script is no longer supported by `datasets`.
+        """
+        tokenized_root = self.dataset_cache_dir / "tokenized"
+        candidate_names = ("v4", "v3", "default")
+        for candidate_name in candidate_names:
+            candidate_path = tokenized_root / candidate_name
+            if not candidate_path.exists():
+                continue
+
+            logger.info("Attempting to reuse tokenized cache from %s", candidate_path)
+            ds = cast(Dataset, load_from_disk(str(candidate_path)))
+            column_names = set(ds.column_names)
+            if {"text_norm", "text_raw", "audio_codes"}.issubset(column_names):
+                cols_to_keep = ["text_norm", "text_raw", "audio_codes"]
+                cols_to_remove = [column for column in ds.column_names if column not in cols_to_keep]
+                if cols_to_remove:
+                    ds = ds.remove_columns(cols_to_remove)
+                return ds
+
+            if {"text_tokens", "audio_codes"}.issubset(column_names):
+                logger.warning(
+                    "Reusing legacy tokenized cache from %s; `text_raw` will mirror the decoded normalized text",
+                    candidate_path,
+                )
+
+                def upgrade_example(example: dict) -> dict:
+                    text_tokens_s = np.asarray(example["text_tokens"], dtype=np.int32)
+                    text_norm = self.tokenizer.decode(text_tokens_s.tolist(), skip_special_tokens=True)
+                    return {
+                        "text_norm": text_norm,
+                        "text_raw": text_norm,
+                        "audio_codes": np.asarray(example["audio_codes"], dtype=np.int32),
+                    }
+
+                upgraded_ds = cast(
+                    Dataset,
+                    ds.map(upgrade_example, desc=f"Upgrading tokenized cache ({candidate_name})"),
+                )
+                cols_to_keep = ["text_norm", "text_raw", "audio_codes"]
+                cols_to_remove = [column for column in upgraded_ds.column_names if column not in cols_to_keep]
+                if cols_to_remove:
+                    upgraded_ds = upgraded_ds.remove_columns(cols_to_remove)
+                return upgraded_ds
+
+        return None
+
+    # NOTE: This stage performs Mimi encoding on GPU and can be expensive. We
+    # intentionally use a manual hash so the cache is stable across unrelated
+    # code changes; bump this hash when the encoding/tokenization logic changes.
+    @xax.dataset_fn("tokenized", hash="v4")
+    def tokenized_v4_dataset(self) -> Dataset:
+        columns = ["text_norm", "text_raw", "audio_codes"]
+
+        if (legacy_ds := self._load_legacy_tokenized_cache()) is not None:
+            logger.info("Using local tokenized cache instead of rebuilding from the remote LJSpeech script")
+            return legacy_ds
 
         logger.info("Loading LJSpeech dataset...")
         raw_ds = load_dataset("keithito/lj_speech", split="train")
@@ -1120,10 +1625,8 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
                 audio_codes_tc = audio_codes_ct[:, :valid_frames].T.astype(np.int32)
 
-                text = examples["normalized_text"][idx]
-                text_tokens = np.asarray(self.tokenizer.encode(text), dtype=np.int32)
-
-                outputs["text_tokens"].append(text_tokens)
+                outputs["text_norm"].append(cast(str, examples["normalized_text"][idx]))
+                outputs["text_raw"].append(cast(str, examples["text"][idx]))
                 outputs["audio_codes"].append(audio_codes_tc)
 
             return outputs
@@ -1140,7 +1643,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         )
 
         logger.info("Dataset preprocessing complete. %d samples", len(ds))
-        logger.info("Columns: text_tokens (T,), audio_codes (T, %d)", NUM_QUANTIZERS)
+        logger.info("Columns: text_norm (str), text_raw (str), audio_codes (T, %d)", NUM_QUANTIZERS)
         return ds
 
 

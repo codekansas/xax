@@ -714,21 +714,25 @@ def _register_dataset_functions(instance: "DataloadersMixin") -> None:
     """
     for attr_name in dir(instance):
         try:
-            attr = getattr(instance, attr_name)
+            static_attr = inspect.getattr_static(instance, attr_name)
         except AttributeError:
             continue
 
-        if callable(attr) and hasattr(attr, "_dataset_fn_metadata"):
-            metadata = attr._dataset_fn_metadata
-            ds_name = metadata["name"]
+        raw_attr = static_attr.__func__ if isinstance(static_attr, staticmethod | classmethod) else static_attr
+        metadata = getattr(raw_attr, "_dataset_fn_metadata", None)
+        if metadata is None:
+            continue
 
-            # Check for duplicate names
-            if ds_name in instance.dataset_functions:
-                raise ValueError(f"Duplicate dataset function name: '{ds_name}'")
+        # Use static lookup to find decorated methods without triggering
+        # descriptors such as cached_property during task initialization.
+        attr = getattr(instance, attr_name)
+        ds_name = metadata["name"]
 
-            # Check that dependencies exist (they may be registered later, so we defer this check)
-            instance.dataset_functions[ds_name] = DatasetFunction(
-                dataset_fn=attr,
-                dependencies=metadata["dependencies"],
-                manual_hash=metadata["manual_hash"],
-            )
+        if ds_name in instance.dataset_functions:
+            raise ValueError(f"Duplicate dataset function name: '{ds_name}'")
+
+        instance.dataset_functions[ds_name] = DatasetFunction(
+            dataset_fn=attr,
+            dependencies=metadata["dependencies"],
+            manual_hash=metadata["manual_hash"],
+        )

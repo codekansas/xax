@@ -149,6 +149,29 @@ def load_user_config() -> UserConfig:
     return _load_user_config_cached()
 
 
+def _ensure_configured_directory(path_value: str, *, field_name: str) -> Path:
+    path = Path(path_value).expanduser()
+
+    if path.exists():
+        if path.is_dir():
+            return path
+        raise NotADirectoryError(f"Configured `{field_name}` path exists but is not a directory: {path}")
+
+    if path.is_symlink():
+        target_path = path.resolve(strict=False)
+        if target_path.exists():
+            if target_path.is_dir():
+                return path
+            raise NotADirectoryError(
+                f"Configured `{field_name}` symlink target exists but is not a directory: {target_path}"
+            )
+        target_path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def get_runs_dir() -> Path | None:
     config = load_user_config().directories
     if is_missing(config, "runs"):
@@ -156,8 +179,7 @@ def get_runs_dir() -> Path | None:
     runs_value = config.runs
     if runs_value is None:
         raise RuntimeError("Expected non-empty `directories.runs` value")
-    (runs_dir := Path(runs_value)).mkdir(parents=True, exist_ok=True)
-    return runs_dir
+    return _ensure_configured_directory(runs_value, field_name="directories.runs")
 
 
 def get_experiments_dir() -> Path | None:
@@ -167,8 +189,7 @@ def get_experiments_dir() -> Path | None:
     experiments_value = config.experiments
     if experiments_value is None:
         raise RuntimeError("Expected non-empty `directories.experiments` value")
-    (experiments_dir := Path(experiments_value)).mkdir(parents=True, exist_ok=True)
-    return experiments_dir
+    return _ensure_configured_directory(experiments_value, field_name="directories.experiments")
 
 
 def get_data_dir() -> Path:

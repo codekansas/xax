@@ -1,0 +1,1 @@
+{"type":"config","name":"LJSpeech TTS Whisper-match quality after 10 minutes","metricName":"asr_wer_prefix","metricUnit":"","bestDirection":"lower"}

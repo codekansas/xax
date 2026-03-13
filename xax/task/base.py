@@ -47,6 +47,27 @@ Config = TypeVar("Config", bound=BaseConfig)
 RawConfigType = BaseConfig | dict[str, Any] | str | Path
 
 
+def _path_to_module_name(path: Path) -> str | None:
+    resolved_path = path.resolve()
+    roots = [Path.cwd(), *(Path(root).resolve() for root in sys.path if root)]
+    for root in roots:
+        try:
+            relative_path = resolved_path.relative_to(root)
+        except ValueError:
+            continue
+
+        module_path = relative_path.with_suffix("")
+        parts = module_path.parts
+        if not parts:
+            continue
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        if not parts:
+            continue
+        return ".".join(parts)
+    return None
+
+
 def _load_as_dict(path: str | Path) -> dict[str, object]:
     return load_yaml(path)
 
@@ -149,9 +170,11 @@ class BaseTask(Generic[Config]):
     def task_module(self) -> str:
         if (mod := inspect.getmodule(self.__class__)) is None:
             raise RuntimeError(f"Could not find module for task {self.__class__}!")
-        if (spec := mod.__spec__) is None:
-            raise RuntimeError(f"Could not find spec for module {mod}!")
-        return spec.name
+        if (spec := mod.__spec__) is not None and spec.name != "__main__":
+            return spec.name
+        if (module_name := _path_to_module_name(self.task_path)) is not None:
+            return module_name
+        raise RuntimeError(f"Could not resolve importable module name for task {self.__class__} at {self.task_path}")
 
     @property
     def task_key(self) -> str:
