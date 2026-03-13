@@ -411,6 +411,14 @@ class Config(xax.SupervisedConfig):
             "bias and make EOS emission more reliable under free-running generation."
         ),
     )
+    semantic_self_condition_prob: float = xax.field(
+        0.0,
+        help=(
+            "Stage-1 training only: probability of replacing a random suffix of teacher-forced Q0 inputs with "
+            "the model's own greedy predictions from a first pass. This lightweight scheduled-sampling variant "
+            "directly targets exposure bias in semantic generation."
+        ),
+    )
     detach_semantic_hidden_for_stage2: bool = xax.field(
         False,
         help=(
@@ -816,6 +824,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         text_mask_bs = text_mask_bs & (targets_bs < base_vocab_size)
 
         audio_lm_head = self._audio_lm_head(llm)
+        use_semantic_self_condition = self.config.semantic_self_condition_prob > 0 and not heavy
 
         def compute_stage1_terms(
             sample_tokens_s: Array,
@@ -825,14 +834,37 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             sample_text_mask_s: Array,
             sample_key: PRNGKeyArray,
         ) -> tuple[Array, Array, Array, Array, Array, Array, Array, Array, Array]:
+            work_key = sample_key
+            q0_input_mask_s = (sample_tokens_s >= q0_min_id) & (sample_tokens_s < q0_max_id)
+
             if self.config.semantic_q0_corruption_prob > 0:
-                mask_key, codes_key = jax.random.split(sample_key)
-                q0_input_mask_s = (sample_tokens_s >= q0_min_id) & (sample_tokens_s < q0_max_id)
+                work_key, mask_key, codes_key = jax.random.split(work_key, 3)
                 corrupt_mask_s = (
                     jax.random.uniform(mask_key, sample_tokens_s.shape) < self.config.semantic_q0_corruption_prob
                 ) & q0_input_mask_s
                 random_q0_s = jax.random.randint(codes_key, sample_tokens_s.shape, q0_min_id, q0_max_id)
                 sample_tokens_s = jnp.where(corrupt_mask_s, random_q0_s, sample_tokens_s)
+
+            if use_semantic_self_condition:
+                work_key, activate_key, keep_key = jax.random.split(work_key, 3)
+                do_self_condition = jax.random.uniform(activate_key, ()) < self.config.semantic_self_condition_prob
+
+                def self_condition(tokens_s: Array) -> Array:
+                    first_pass_hidden_sd = llm.forward_hidden(tokens_s)
+                    first_pass_logits_sv = audio_lm_head(first_pass_hidden_sd)
+                    first_pass_pred_s = jnp.argmax(first_pass_logits_sv, axis=-1).astype(jnp.int32) + base_vocab_size
+                    pred_input_s = jnp.concatenate([tokens_s[:1], first_pass_pred_s[:-1]], axis=0)
+                    valid_pred_mask_s = (pred_input_s >= q0_min_id) & (pred_input_s < q0_max_id)
+
+                    q0_input_count = jnp.maximum(q0_input_mask_s.astype(jnp.int32).sum(), 1)
+                    keep_count = jax.random.randint(keep_key, (), 0, q0_input_count + 1)
+                    q0_rank_s = jnp.cumsum(q0_input_mask_s.astype(jnp.int32), axis=0)
+                    replace_suffix_s = q0_input_mask_s & (q0_rank_s > keep_count)
+                    replace_mask_s = replace_suffix_s & valid_pred_mask_s
+                    return jnp.where(replace_mask_s, pred_input_s, tokens_s)
+
+                sample_tokens_s = jax.lax.cond(do_self_condition, self_condition, lambda t: t, sample_tokens_s)
+
             hidden_sd = llm.forward_hidden(sample_tokens_s)
 
             sample_semantic_mask_s = sample_q0_mask_s | sample_eos_mask_s
