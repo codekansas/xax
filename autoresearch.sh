@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RUN_DIR="${RUN_DIR:-/tmp/xax-ljspeech-autoresearch}"
-LOG_PATH="$RUN_DIR/stdout.log"
-JSON_LOG="$RUN_DIR/json/log.jsonl"
+BENCH_RUN_DIR="${BENCH_RUN_DIR:-/tmp/xax-ljspeech-autoresearch}"
+BENCH_CUDA_VISIBLE_DEVICES="${BENCH_CUDA_VISIBLE_DEVICES:-0,1}"
+LOG_PATH="$BENCH_RUN_DIR/stdout.log"
+JSON_LOG="$BENCH_RUN_DIR/json/log.jsonl"
 
-rm -rf "$RUN_DIR"
-mkdir -p "$RUN_DIR"
+rm -rf "$BENCH_RUN_DIR"
+mkdir -p "$BENCH_RUN_DIR"
 
+XAX_IN_QUEUE_JOB=1 \
+CUDA_VISIBLE_DEVICES="$BENCH_CUDA_VISIBLE_DEVICES" \
+NVIDIA_VISIBLE_DEVICES="$BENCH_CUDA_VISIBLE_DEVICES" \
 uv run examples/ljspeech.py \
-  run_dir="$RUN_DIR" \
+  --launcher multi \
+  run_dir="$BENCH_RUN_DIR" \
   max_steps=600 \
   step_kind=second \
   batch_size=8 \

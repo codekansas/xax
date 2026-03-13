@@ -280,6 +280,24 @@ class SupervisedMixin(
                 self.on_step_end()
 
             state = state.replace(elapsed_time_s=state.elapsed_time_s + timer.elapsed_time)
+            is_done = self.is_training_over(state)
+
+            # If the time/sample/step budget was crossed by the just-finished
+            # training step and that step was logged in light mode, run one
+            # final heavy eval on the updated model before exiting. This keeps
+            # benchmark metrics aligned with "train for N, then evaluate"
+            # instead of reporting the most recent mid-run heavy eval.
+            if is_done and not heavy:
+                final_batch = jax.tree.map(lambda x: x[-1], batches_stacked)
+                final_batch = jax.tree.map(self.cast_compute_dtype, final_batch)
+                final_model = eqx.combine(trainable_arr, frozen_arr, static_parts)
+                key, final_eval_key = jax.random.split(key)
+                _, final_metrics = self.compute_loss(final_model, final_batch, state, True, final_eval_key)
+                if "loss" in metrics:
+                    final_metrics["loss"] = metrics["loss"]
+                if "grad_norm" in metrics:
+                    final_metrics["grad_norm"] = metrics["grad_norm"]
+                self.log_step(FrozenDict(final_metrics), state, True)
 
             if state.num_steps <= 3:
                 logger.log(LOG_PING, "Step %d took %.2f second", state.num_steps, timer.elapsed_time)
