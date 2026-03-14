@@ -568,6 +568,20 @@ class Config(xax.SupervisedConfig):
         0,
         help="Minimum Q0 tokens to generate before allowing EOS",
     )
+    semantic_block_decode_size: int = xax.field(
+        1,
+        help=(
+            "Optional blockwise stage-1 generation size for autoregressive decoding. "
+            "1 keeps standard token-by-token decoding; values >1 use future-Q0 heads to append small token blocks."
+        ),
+    )
+    semantic_block_decode_max_grouped_tokens: int = xax.field(
+        0,
+        help=(
+            "Optional limit on how many new semantic tokens to decode with grouped blockwise inference before "
+            "falling back to one-at-a-time decoding. <=0 keeps grouped decoding active for the whole utterance."
+        ),
+    )
     semantic_length_heuristic_frames_per_text_token: float | None = xax.field(
         None,
         help=(
@@ -927,6 +941,137 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             return jnp.where(allowed_v[None, :], logits, min_logit)
 
         return lm_head
+
+    def _generate_semantic_tokens_blockwise_greedy(
+        self,
+        model: FullTTSModel,
+        *,
+        prompt_tokens_s: Array,
+        max_new_tokens: int,
+    ) -> tuple[Array, Array]:
+        llm = model.semantic.llm
+        future_heads = model.semantic.future_q0_heads
+        if future_heads is None or len(future_heads) == 0:
+            raise ValueError("Blockwise semantic generation requires Stage-1 future-Q0 heads.")
+        if max_new_tokens <= 0:
+            return prompt_tokens_s, jnp.asarray(prompt_tokens_s.shape[0], dtype=jnp.int32)
+
+        block_decode_size = max(1, min(int(self.config.semantic_block_decode_size), 1 + len(future_heads)))
+        if block_decode_size <= 1:
+            return prompt_tokens_s, jnp.asarray(prompt_tokens_s.shape[0], dtype=jnp.int32)
+        if self.config.semantic_gen_temperature != 0.0 or self.config.semantic_gen_top_p < 1.0:
+            raise ValueError("Blockwise semantic generation currently only supports greedy decoding.")
+
+        audio_lm_head = self._audio_lm_head(llm)
+        base_vocab_size = llm.config.vocab_size
+        q0_min_id = self.first_q0_id
+        audio_end_extra_id = self.audio_end_id - base_vocab_size
+        used_future_heads = future_heads[: block_decode_size - 1]
+        max_grouped_tokens = jnp.asarray(int(self.config.semantic_block_decode_max_grouped_tokens), dtype=jnp.int32)
+
+        initial_len = int(prompt_tokens_s.shape[0])
+        max_len = initial_len + max_new_tokens
+        padded_tokens = jnp.zeros((max_len,), dtype=jnp.int32)
+        padded_tokens = padded_tokens.at[:initial_len].set(prompt_tokens_s)
+
+        caches = llm.init_cache(max_len, dtype=llm.embed.weight.dtype)
+        prompt_hidden_sd, caches = llm.forward_hidden(prompt_tokens_s, caches=caches)
+        current_hidden_d = prompt_hidden_sd[-1]
+
+        min_new_tokens_before_eos = int(self.config.semantic_gen_min_new_tokens)
+        min_logit_value = jnp.asarray(jnp.finfo(jnp.float32).min, dtype=jnp.float32)
+
+        def cond_fn(state: tuple[Array, Array, Array, Array, list[xax.TransformerBlockCache], Array]) -> Array:
+            _, cur_pos, _, done, _, _ = state
+            return (cur_pos < max_len) & ~done
+
+        def body_fn(
+            state: tuple[Array, Array, Array, Array, list[xax.TransformerBlockCache], Array],
+        ) -> tuple[Array, Array, Array, Array, list[xax.TransformerBlockCache], Array]:
+            tokens_t, cur_pos, generated_count, done, caches, current_hidden_d = state
+
+            next_logits_v = audio_lm_head(current_hidden_d[None, :].astype(jnp.float32))[0]
+            next_logits_v = jax.lax.cond(
+                (self.audio_end_id >= 0) & (generated_count < min_new_tokens_before_eos),
+                lambda logits_v: logits_v.at[audio_end_extra_id].set(min_logit_value),
+                lambda logits_v: logits_v,
+                next_logits_v,
+            )
+            first_extra_id = jnp.argmax(next_logits_v).astype(jnp.int32)
+            first_token = first_extra_id + base_vocab_size
+            first_is_eos = first_token == self.audio_end_id
+
+            future_block_tokens = []
+            for head in used_future_heads:
+                future_logits_v = apply_linear(current_hidden_d[None, :].astype(jnp.float32), head)[0]
+                future_code = jnp.argmax(future_logits_v).astype(jnp.int32)
+                future_block_tokens.append(future_code + q0_min_id)
+            if future_block_tokens:
+                future_tokens_t = jnp.stack(future_block_tokens)
+            else:
+                future_tokens_t = jnp.zeros((0,), dtype=jnp.int32)
+
+            use_grouped = (max_grouped_tokens <= 0) | (generated_count < max_grouped_tokens)
+            remaining_after_first = jnp.maximum(max_len - (cur_pos + 1), 0)
+            grouped_extra_tokens = jnp.minimum(
+                jnp.asarray(block_decode_size - 1, dtype=jnp.int32),
+                remaining_after_first,
+            )
+            max_extra_tokens = jnp.where(use_grouped & ~first_is_eos, grouped_extra_tokens, 0)
+            block_len = jnp.asarray(1, dtype=jnp.int32) + max_extra_tokens
+
+            block_tokens_t = jnp.full((block_decode_size,), q0_min_id, dtype=jnp.int32)
+            block_tokens_t = block_tokens_t.at[0].set(first_token)
+            for idx in range(block_decode_size - 1):
+                block_tokens_t = block_tokens_t.at[idx + 1].set(
+                    jnp.where(
+                        (jnp.asarray(idx, dtype=jnp.int32) < max_extra_tokens),
+                        future_tokens_t[idx],
+                        q0_min_id,
+                    )
+                )
+            tokens_t = jax.lax.dynamic_update_slice(tokens_t, block_tokens_t, (cur_pos,))
+
+            def feed_one(
+                carry: tuple[list[xax.TransformerBlockCache], Array],
+                idx: Array,
+            ) -> tuple[tuple[list[xax.TransformerBlockCache], Array], None]:
+                caches, current_hidden_d = carry
+
+                def do_feed(
+                    inner_carry: tuple[list[xax.TransformerBlockCache], Array],
+                ) -> tuple[list[xax.TransformerBlockCache], Array]:
+                    inner_caches, _ = inner_carry
+                    token_1 = jax.lax.dynamic_slice(block_tokens_t, (idx,), (1,))
+                    hidden_1d, next_caches = llm.forward_hidden(token_1, caches=inner_caches)
+                    return next_caches, hidden_1d[0]
+
+                next_caches, next_hidden_d = jax.lax.cond(
+                    idx < block_len,
+                    do_feed,
+                    lambda inner_carry: inner_carry,
+                    (caches, current_hidden_d),
+                )
+                return (next_caches, next_hidden_d), None
+
+            (caches, current_hidden_d), _ = jax.lax.scan(
+                feed_one,
+                (caches, current_hidden_d),
+                jnp.arange(block_decode_size, dtype=jnp.int32),
+            )
+
+            return tokens_t, cur_pos + block_len, generated_count + block_len, done | first_is_eos, caches, current_hidden_d
+
+        init_state = (
+            padded_tokens,
+            jnp.asarray(initial_len, dtype=jnp.int32),
+            jnp.asarray(0, dtype=jnp.int32),
+            jnp.asarray(False),
+            caches,
+            current_hidden_d,
+        )
+        final_tokens, final_pos, _, _, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_state)
+        return final_tokens, final_pos
 
     def _semantic_packed_prefix_hidden(
         self,
@@ -1561,19 +1706,26 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
                 max_frames + 1,  # +1 to allow the EOS token.
             )
 
-            gen_tokens_s, gen_pos = model.semantic.generate_tokens(
-                prompt_tokens_s=prompt_tokens_s,
-                max_new_tokens=max_new_tokens,
-                audio_end_id=self.audio_end_id,
-                temperature=self.config.semantic_gen_temperature,
-                top_p=self.config.semantic_gen_top_p,
-                key=k1,
-                allowed_token_range=(q0_min_id, q0_max_id),
-                min_new_tokens_before_eos=min(
-                    self.config.semantic_gen_min_new_tokens,
-                    max(0, max_new_tokens - 1),
-                ),
-            )
+            if self.config.semantic_block_decode_size > 1 and model.semantic.future_q0_heads is not None:
+                gen_tokens_s, gen_pos = self._generate_semantic_tokens_blockwise_greedy(
+                    model,
+                    prompt_tokens_s=prompt_tokens_s,
+                    max_new_tokens=max_new_tokens,
+                )
+            else:
+                gen_tokens_s, gen_pos = model.semantic.generate_tokens(
+                    prompt_tokens_s=prompt_tokens_s,
+                    max_new_tokens=max_new_tokens,
+                    audio_end_id=self.audio_end_id,
+                    temperature=self.config.semantic_gen_temperature,
+                    top_p=self.config.semantic_gen_top_p,
+                    key=k1,
+                    allowed_token_range=(q0_min_id, q0_max_id),
+                    min_new_tokens_before_eos=min(
+                        self.config.semantic_gen_min_new_tokens,
+                        max(0, max_new_tokens - 1),
+                    ),
+                )
 
             gen_only_s = gen_tokens_s[prompt_len:]
             gen_len = jnp.maximum(gen_pos - prompt_len, 0)
