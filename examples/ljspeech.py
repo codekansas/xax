@@ -499,7 +499,8 @@ class Config(xax.SupervisedConfig):
             "Which LJSpeech text field to use for conditioning. "
             "`normalized` matches keithito/lj_speech normalized_text. "
             "`raw` uses the original text with punctuation/casing. "
-            "`both` doubles the dataset by including both variants."
+            "`both` doubles the dataset by including both variants. "
+            "`both_plus_normalized` keeps both variants but oversamples normalized text 2:1 over raw."
         ),
     )
     q0_corruption_prob: float = xax.field(
@@ -826,9 +827,18 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
                             text_raw_lengths + audio_lengths + 4,
                         ]
                     )
+                elif text_source == "both_plus_normalized":
+                    code_lengths = np.concatenate(
+                        [
+                            text_norm_lengths + audio_lengths + 4,
+                            text_norm_lengths + audio_lengths + 4,
+                            text_raw_lengths + audio_lengths + 4,
+                        ]
+                    )
                 else:
                     raise ValueError(
-                        f"Invalid text_source: {self.config.text_source!r} (expected normalized, raw, or both)"
+                        "Invalid text_source: "
+                        f"{self.config.text_source!r} (expected normalized, raw, both, or both_plus_normalized)"
                     )
             elif "text_tokens" in columns:
                 text_lengths = np.asarray([len(tokens_s) for tokens_s in ds["text_tokens"]], dtype=np.int32)
@@ -2564,8 +2574,19 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
                     make_dataset_for_text_key("text_raw"),
                 ]
             )
+        elif text_source == "both_plus_normalized":
+            result = concatenate_datasets(
+                [
+                    make_dataset_for_text_key("text_norm"),
+                    make_dataset_for_text_key("text_norm"),
+                    make_dataset_for_text_key("text_raw"),
+                ]
+            )
         else:
-            raise ValueError(f"Invalid text_source: {self.config.text_source!r} (expected normalized, raw, or both)")
+            raise ValueError(
+                "Invalid text_source: "
+                f"{self.config.text_source!r} (expected normalized, raw, both, or both_plus_normalized)"
+            )
         cols_to_keep = ["codes", "audio_codes"]
         cols_to_remove = [c for c in result.column_names if c not in cols_to_keep]
         if cols_to_remove:
