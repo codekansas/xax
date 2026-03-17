@@ -500,8 +500,17 @@ class Config(xax.SupervisedConfig):
             "`normalized` matches keithito/lj_speech normalized_text. "
             "`raw` uses the original text with punctuation/casing. "
             "`both` doubles the dataset by including both variants. "
-            "`both_plus_normalized` keeps both variants but oversamples normalized text 2:1 over raw."
+            "`both_plus_normalized` keeps both variants but oversamples normalized text 2:1 over raw. "
+            "`both_weighted` uses the repeat counts below for a generic normalized/raw mixture."
         ),
+    )
+    text_source_weighted_normalized_repeats: int = xax.field(
+        1,
+        help="Only used when text_source=both_weighted. Number of normalized-text copies per utterance.",
+    )
+    text_source_weighted_raw_repeats: int = xax.field(
+        1,
+        help="Only used when text_source=both_weighted. Number of raw-text copies per utterance.",
     )
     q0_corruption_prob: float = xax.field(
         0.0,
@@ -835,10 +844,18 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
                             text_raw_lengths + audio_lengths + 4,
                         ]
                     )
+                elif text_source == "both_weighted":
+                    norm_repeats = max(0, int(self.config.text_source_weighted_normalized_repeats))
+                    raw_repeats = max(0, int(self.config.text_source_weighted_raw_repeats))
+                    code_length_parts = [text_norm_lengths + audio_lengths + 4] * norm_repeats
+                    code_length_parts.extend([text_raw_lengths + audio_lengths + 4] * raw_repeats)
+                    if not code_length_parts:
+                        raise ValueError("text_source=both_weighted requires at least one normalized or raw repeat.")
+                    code_lengths = np.concatenate(code_length_parts)
                 else:
                     raise ValueError(
                         "Invalid text_source: "
-                        f"{self.config.text_source!r} (expected normalized, raw, both, or both_plus_normalized)"
+                        f"{self.config.text_source!r} (expected normalized, raw, both, both_plus_normalized, or both_weighted)"
                     )
             elif "text_tokens" in columns:
                 text_lengths = np.asarray([len(tokens_s) for tokens_s in ds["text_tokens"]], dtype=np.int32)
@@ -924,6 +941,8 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             "length_percentile": float(self.config.length_percentile),
             "llm_repo": str(self.config.llm_repo),
             "text_source": str(self.config.text_source),
+            "text_source_weighted_normalized_repeats": int(self.config.text_source_weighted_normalized_repeats),
+            "text_source_weighted_raw_repeats": int(self.config.text_source_weighted_raw_repeats),
             "base_vocab_size": int(self.base_vocab_size),
             "first_q0_id": int(self.first_q0_id),
         }
@@ -2582,10 +2601,18 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
                     make_dataset_for_text_key("text_raw"),
                 ]
             )
+        elif text_source == "both_weighted":
+            norm_repeats = max(0, int(self.config.text_source_weighted_normalized_repeats))
+            raw_repeats = max(0, int(self.config.text_source_weighted_raw_repeats))
+            result_parts = [make_dataset_for_text_key("text_norm") for _ in range(norm_repeats)]
+            result_parts.extend(make_dataset_for_text_key("text_raw") for _ in range(raw_repeats))
+            if not result_parts:
+                raise ValueError("text_source=both_weighted requires at least one normalized or raw repeat.")
+            result = concatenate_datasets(result_parts)
         else:
             raise ValueError(
                 "Invalid text_source: "
-                f"{self.config.text_source!r} (expected normalized, raw, both, or both_plus_normalized)"
+                f"{self.config.text_source!r} (expected normalized, raw, both, both_plus_normalized, or both_weighted)"
             )
         cols_to_keep = ["codes", "audio_codes"]
         cols_to_remove = [c for c in result.column_names if c not in cols_to_keep]
