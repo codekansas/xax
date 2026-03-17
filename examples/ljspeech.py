@@ -68,6 +68,20 @@ Q0_TOKEN_FMT = "<|audio_q0_{idx}|>"
 DEFAULT_LORA_TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate", "up")
 
 
+def weighted_text_sample_bucket(example_idx: int, pass_idx: int, total_weight: int) -> int:
+    """Deterministically pick a weighted text bucket for an example/pass pair."""
+    if total_weight <= 0:
+        raise ValueError(f"total_weight must be positive, got {total_weight}")
+    mask = (1 << 64) - 1
+    x = ((example_idx + 1) * 0x9E3779B185EBCA87 + (pass_idx + 1) * 0xC2B2AE3D27D4EB4F) & mask
+    x ^= x >> 30
+    x = (x * 0xBF58476D1CE4E5B9) & mask
+    x ^= x >> 27
+    x = (x * 0x94D049BB133111EB) & mask
+    x ^= x >> 31
+    return x % total_weight
+
+
 class Batch(TypedDict):
     codes: Array  # (bsz, seq_len) text + Q0 tokens
     audio_codes: Array  # (bsz, max_frames, 8) full codec codes (padded)
@@ -501,16 +515,32 @@ class Config(xax.SupervisedConfig):
             "`raw` uses the original text with punctuation/casing. "
             "`both` doubles the dataset by including both variants. "
             "`both_plus_normalized` keeps both variants but oversamples normalized text 2:1 over raw. "
-            "`both_weighted` uses the repeat counts below for a generic normalized/raw mixture."
+            "`both_weighted` uses the repeat counts below for a generic normalized/raw mixture. "
+            "`both_weighted_sampled` uses weighted normalized/raw sampling per pass instead of fixed duplicates."
         ),
     )
     text_source_weighted_normalized_repeats: int = xax.field(
         1,
-        help="Only used when text_source=both_weighted. Number of normalized-text copies per utterance.",
+        help=(
+            "Used when text_source is both_weighted or both_weighted_sampled. "
+            "For both_weighted this is the number of normalized-text copies per utterance; "
+            "for both_weighted_sampled it is the normalized-text sampling weight."
+        ),
     )
     text_source_weighted_raw_repeats: int = xax.field(
         1,
-        help="Only used when text_source=both_weighted. Number of raw-text copies per utterance.",
+        help=(
+            "Used when text_source is both_weighted or both_weighted_sampled. "
+            "For both_weighted this is the number of raw-text copies per utterance; "
+            "for both_weighted_sampled it is the raw-text sampling weight."
+        ),
+    )
+    text_source_weighted_sampled_passes: int = xax.field(
+        0,
+        help=(
+            "Only used when text_source=both_weighted_sampled. Number of deterministic sampled passes to build. "
+            "<=0 defaults to normalized_repeats + raw_repeats. Lower values decouple sampling weights from total dataset mass."
+        ),
     )
     q0_corruption_prob: float = xax.field(
         0.0,
@@ -852,10 +882,34 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
                     if not code_length_parts:
                         raise ValueError("text_source=both_weighted requires at least one normalized or raw repeat.")
                     code_lengths = np.concatenate(code_length_parts)
+                elif text_source == "both_weighted_sampled":
+                    norm_repeats = max(0, int(self.config.text_source_weighted_normalized_repeats))
+                    raw_repeats = max(0, int(self.config.text_source_weighted_raw_repeats))
+                    total_weight = norm_repeats + raw_repeats
+                    if total_weight <= 0:
+                        raise ValueError(
+                            "text_source=both_weighted_sampled requires at least one normalized or raw repeat."
+                        )
+                    sampled_passes = int(self.config.text_source_weighted_sampled_passes)
+                    if sampled_passes <= 0:
+                        sampled_passes = total_weight
+                    code_length_parts = []
+                    for pass_idx in range(sampled_passes):
+                        use_norm = np.fromiter(
+                            (
+                                weighted_text_sample_bucket(idx, pass_idx, total_weight) < norm_repeats
+                                for idx in range(len(audio_lengths))
+                            ),
+                            dtype=bool,
+                            count=len(audio_lengths),
+                        )
+                        pass_text_lengths = np.where(use_norm, text_norm_lengths, text_raw_lengths)
+                        code_length_parts.append(pass_text_lengths + audio_lengths + 4)
+                    code_lengths = np.concatenate(code_length_parts)
                 else:
                     raise ValueError(
                         "Invalid text_source: "
-                        f"{self.config.text_source!r} (expected normalized, raw, both, both_plus_normalized, or both_weighted)"
+                        f"{self.config.text_source!r} (expected normalized, raw, both, both_plus_normalized, both_weighted, or both_weighted_sampled)"
                     )
             elif "text_tokens" in columns:
                 text_lengths = np.asarray([len(tokens_s) for tokens_s in ds["text_tokens"]], dtype=np.int32)
@@ -943,6 +997,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             "text_source": str(self.config.text_source),
             "text_source_weighted_normalized_repeats": int(self.config.text_source_weighted_normalized_repeats),
             "text_source_weighted_raw_repeats": int(self.config.text_source_weighted_raw_repeats),
+            "text_source_weighted_sampled_passes": int(self.config.text_source_weighted_sampled_passes),
             "base_vocab_size": int(self.base_vocab_size),
             "first_q0_id": int(self.first_q0_id),
         }
@@ -2564,22 +2619,41 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
     def unpadded_dataset(self) -> Dataset:
         ds = cast(Dataset, self.load_dataset("tokenized"))
 
+        def prepare_sample_with_text(example: dict, text: str) -> dict:
+            text_tokens = np.asarray(self.tokenizer.encode(text), dtype=np.int32)
+            # Text segment with explicit boundaries.
+            text_with_special = np.concatenate([[self.text_start_id], text_tokens, [self.text_end_id]])
+
+            audio_codes_tc = np.asarray(example["audio_codes"], dtype=np.int32)  # (T, 8)
+            q0_codes_t = audio_codes_tc[:, 0]
+            q0_tokens = q0_codes_t + self.first_q0_id
+            audio_with_special = np.concatenate([[self.audio_start_id], q0_tokens, [self.audio_end_id]])
+
+            codes = np.concatenate([text_with_special, audio_with_special]).astype(np.int32)
+            return {"codes": codes, "audio_codes": audio_codes_tc.astype(np.int32)}
+
         def make_dataset_for_text_key(text_key: str) -> Dataset:
             def prepare_sample(example: dict) -> dict:
                 text = cast(str, example[text_key])
-                text_tokens = np.asarray(self.tokenizer.encode(text), dtype=np.int32)
-                # Text segment with explicit boundaries.
-                text_with_special = np.concatenate([[self.text_start_id], text_tokens, [self.text_end_id]])
-
-                audio_codes_tc = np.asarray(example["audio_codes"], dtype=np.int32)  # (T, 8)
-                q0_codes_t = audio_codes_tc[:, 0]
-                q0_tokens = q0_codes_t + self.first_q0_id
-                audio_with_special = np.concatenate([[self.audio_start_id], q0_tokens, [self.audio_end_id]])
-
-                codes = np.concatenate([text_with_special, audio_with_special]).astype(np.int32)
-                return {"codes": codes, "audio_codes": audio_codes_tc.astype(np.int32)}
+                return prepare_sample_with_text(example, text)
 
             return cast(Dataset, ds.map(prepare_sample, desc=f"Preparing sequences ({text_key})"))
+
+        def make_weighted_sampled_pass(pass_idx: int, norm_repeats: int, total_weight: int) -> Dataset:
+            def prepare_sample(example: dict, idx: int) -> dict:
+                bucket = weighted_text_sample_bucket(idx, pass_idx, total_weight)
+                text_key = "text_norm" if bucket < norm_repeats else "text_raw"
+                text = cast(str, example[text_key])
+                return prepare_sample_with_text(example, text)
+
+            return cast(
+                Dataset,
+                ds.map(
+                    prepare_sample,
+                    with_indices=True,
+                    desc=f"Preparing sequences (both_weighted_sampled pass {pass_idx + 1})",
+                ),
+            )
 
         text_source = self.config.text_source.strip().lower()
         if text_source == "normalized":
@@ -2609,10 +2683,27 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             if not result_parts:
                 raise ValueError("text_source=both_weighted requires at least one normalized or raw repeat.")
             result = concatenate_datasets(result_parts)
+        elif text_source == "both_weighted_sampled":
+            norm_repeats = max(0, int(self.config.text_source_weighted_normalized_repeats))
+            raw_repeats = max(0, int(self.config.text_source_weighted_raw_repeats))
+            total_weight = norm_repeats + raw_repeats
+            if total_weight <= 0:
+                raise ValueError(
+                    "text_source=both_weighted_sampled requires at least one normalized or raw repeat."
+                )
+            sampled_passes = int(self.config.text_source_weighted_sampled_passes)
+            if sampled_passes <= 0:
+                sampled_passes = total_weight
+            result = concatenate_datasets(
+                [
+                    make_weighted_sampled_pass(pass_idx, norm_repeats, total_weight)
+                    for pass_idx in range(sampled_passes)
+                ]
+            )
         else:
             raise ValueError(
                 "Invalid text_source: "
-                f"{self.config.text_source!r} (expected normalized, raw, both, both_plus_normalized, or both_weighted)"
+                f"{self.config.text_source!r} (expected normalized, raw, both, both_plus_normalized, both_weighted, or both_weighted_sampled)"
             )
         cols_to_keep = ["codes", "audio_codes"]
         cols_to_remove = [c for c in result.column_names if c not in cols_to_keep]
