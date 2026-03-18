@@ -516,29 +516,31 @@ class Config(xax.SupervisedConfig):
             "`both` doubles the dataset by including both variants. "
             "`both_plus_normalized` keeps both variants but oversamples normalized text 2:1 over raw. "
             "`both_weighted` uses the repeat counts below for a generic normalized/raw mixture. "
-            "`both_weighted_sampled` uses weighted normalized/raw sampling per pass instead of fixed duplicates."
+            "`both_weighted_sampled` uses weighted normalized/raw sampling per pass instead of fixed duplicates. "
+            "`both_weighted_sampled_diff` keeps the same sampled-pass geometry but only uses raw text on utterances "
+            "where `text_raw != text_norm`, otherwise falling back to normalized text."
         ),
     )
     text_source_weighted_normalized_repeats: int = xax.field(
         1,
         help=(
-            "Used when text_source is both_weighted or both_weighted_sampled. "
+            "Used when text_source is both_weighted, both_weighted_sampled, or both_weighted_sampled_diff. "
             "For both_weighted this is the number of normalized-text copies per utterance; "
-            "for both_weighted_sampled it is the normalized-text sampling weight."
+            "for both_weighted_sampled and both_weighted_sampled_diff it is the normalized-text sampling weight."
         ),
     )
     text_source_weighted_raw_repeats: int = xax.field(
         1,
         help=(
-            "Used when text_source is both_weighted or both_weighted_sampled. "
+            "Used when text_source is both_weighted, both_weighted_sampled, or both_weighted_sampled_diff. "
             "For both_weighted this is the number of raw-text copies per utterance; "
-            "for both_weighted_sampled it is the raw-text sampling weight."
+            "for both_weighted_sampled and both_weighted_sampled_diff it is the raw-text sampling weight."
         ),
     )
     text_source_weighted_sampled_passes: int = xax.field(
         0,
         help=(
-            "Only used when text_source=both_weighted_sampled. Number of deterministic sampled passes to build. "
+            "Only used when text_source=both_weighted_sampled or both_weighted_sampled_diff. Number of deterministic sampled passes to build. "
             "<=0 defaults to normalized_repeats + raw_repeats. Lower values decouple sampling weights from total dataset mass."
         ),
     )
@@ -882,17 +884,24 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
                     if not code_length_parts:
                         raise ValueError("text_source=both_weighted requires at least one normalized or raw repeat.")
                     code_lengths = np.concatenate(code_length_parts)
-                elif text_source == "both_weighted_sampled":
+                elif text_source in {"both_weighted_sampled", "both_weighted_sampled_diff"}:
                     norm_repeats = max(0, int(self.config.text_source_weighted_normalized_repeats))
                     raw_repeats = max(0, int(self.config.text_source_weighted_raw_repeats))
                     total_weight = norm_repeats + raw_repeats
                     if total_weight <= 0:
                         raise ValueError(
-                            "text_source=both_weighted_sampled requires at least one normalized or raw repeat."
+                            f"text_source={text_source} requires at least one normalized or raw repeat."
                         )
                     sampled_passes = int(self.config.text_source_weighted_sampled_passes)
                     if sampled_passes <= 0:
                         sampled_passes = total_weight
+                    text_diff_mask = np.asarray(
+                        [
+                            text_norm != text_raw
+                            for text_norm, text_raw in zip(cast(list[str], ds["text_norm"]), cast(list[str], ds["text_raw"]), strict=True)
+                        ],
+                        dtype=bool,
+                    )
                     code_length_parts = []
                     for pass_idx in range(sampled_passes):
                         use_norm = np.fromiter(
@@ -903,13 +912,16 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
                             dtype=bool,
                             count=len(audio_lengths),
                         )
-                        pass_text_lengths = np.where(use_norm, text_norm_lengths, text_raw_lengths)
+                        use_raw = ~use_norm
+                        if text_source == "both_weighted_sampled_diff":
+                            use_raw = use_raw & text_diff_mask
+                        pass_text_lengths = np.where(use_raw, text_raw_lengths, text_norm_lengths)
                         code_length_parts.append(pass_text_lengths + audio_lengths + 4)
                     code_lengths = np.concatenate(code_length_parts)
                 else:
                     raise ValueError(
                         "Invalid text_source: "
-                        f"{self.config.text_source!r} (expected normalized, raw, both, both_plus_normalized, both_weighted, or both_weighted_sampled)"
+                        f"{self.config.text_source!r} (expected normalized, raw, both, both_plus_normalized, both_weighted, both_weighted_sampled, or both_weighted_sampled_diff)"
                     )
             elif "text_tokens" in columns:
                 text_lengths = np.asarray([len(tokens_s) for tokens_s in ds["text_tokens"]], dtype=np.int32)
@@ -2639,19 +2651,29 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
             return cast(Dataset, ds.map(prepare_sample, desc=f"Preparing sequences ({text_key})"))
 
-        def make_weighted_sampled_pass(pass_idx: int, norm_repeats: int, total_weight: int) -> Dataset:
+        def make_weighted_sampled_pass(
+            pass_idx: int,
+            norm_repeats: int,
+            total_weight: int,
+            *,
+            diff_only_raw: bool = False,
+        ) -> Dataset:
             def prepare_sample(example: dict, idx: int) -> dict:
                 bucket = weighted_text_sample_bucket(idx, pass_idx, total_weight)
-                text_key = "text_norm" if bucket < norm_repeats else "text_raw"
+                use_raw = bucket >= norm_repeats
+                if diff_only_raw and cast(str, example["text_raw"]) == cast(str, example["text_norm"]):
+                    use_raw = False
+                text_key = "text_raw" if use_raw else "text_norm"
                 text = cast(str, example[text_key])
                 return prepare_sample_with_text(example, text)
 
+            mode = "both_weighted_sampled_diff" if diff_only_raw else "both_weighted_sampled"
             return cast(
                 Dataset,
                 ds.map(
                     prepare_sample,
                     with_indices=True,
-                    desc=f"Preparing sequences (both_weighted_sampled pass {pass_idx + 1})",
+                    desc=f"Preparing sequences ({mode} pass {pass_idx + 1})",
                 ),
             )
 
@@ -2683,27 +2705,32 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             if not result_parts:
                 raise ValueError("text_source=both_weighted requires at least one normalized or raw repeat.")
             result = concatenate_datasets(result_parts)
-        elif text_source == "both_weighted_sampled":
+        elif text_source in {"both_weighted_sampled", "both_weighted_sampled_diff"}:
             norm_repeats = max(0, int(self.config.text_source_weighted_normalized_repeats))
             raw_repeats = max(0, int(self.config.text_source_weighted_raw_repeats))
             total_weight = norm_repeats + raw_repeats
             if total_weight <= 0:
                 raise ValueError(
-                    "text_source=both_weighted_sampled requires at least one normalized or raw repeat."
+                    f"text_source={text_source} requires at least one normalized or raw repeat."
                 )
             sampled_passes = int(self.config.text_source_weighted_sampled_passes)
             if sampled_passes <= 0:
                 sampled_passes = total_weight
             result = concatenate_datasets(
                 [
-                    make_weighted_sampled_pass(pass_idx, norm_repeats, total_weight)
+                    make_weighted_sampled_pass(
+                        pass_idx,
+                        norm_repeats,
+                        total_weight,
+                        diff_only_raw=text_source == "both_weighted_sampled_diff",
+                    )
                     for pass_idx in range(sampled_passes)
                 ]
             )
         else:
             raise ValueError(
                 "Invalid text_source: "
-                f"{self.config.text_source!r} (expected normalized, raw, both, both_plus_normalized, both_weighted, or both_weighted_sampled)"
+                f"{self.config.text_source!r} (expected normalized, raw, both, both_plus_normalized, both_weighted, both_weighted_sampled, or both_weighted_sampled_diff)"
             )
         cols_to_keep = ["codes", "audio_codes"]
         cols_to_remove = [c for c in result.column_names if c not in cols_to_keep]
