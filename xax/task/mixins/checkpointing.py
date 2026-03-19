@@ -5,7 +5,7 @@ import logging
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Generic, Literal, Self, Sequence, TypeVar, cast, overload
+from typing import Any, Generic, Literal, Self, Sequence, TypeVar, overload
 
 import equinox as eqx
 import jax
@@ -13,12 +13,11 @@ import optax
 import orbax.checkpoint as ocp
 from etils import epath
 from jaxtyping import PyTree
-from omegaconf import DictConfig, OmegaConf
 
-from xax.core.conf import field
 from xax.core.state import State
 from xax.nn.parallel import is_master
 from xax.task.mixins.artifacts import ArtifactsConfig, ArtifactsMixin
+from xax.utils.structured_config import field, load_yaml, to_yaml_text
 from xax.utils.types.training import Optimizer
 
 logger = logging.getLogger(__name__)
@@ -26,19 +25,19 @@ logger = logging.getLogger(__name__)
 CheckpointPart = Literal["model", "opt_state", "state", "config", "model_state_config", "all"]
 
 
-def get_ckpt_path(exp_dir: Path, state: State | None = None) -> Path:
+def get_ckpt_path(run_dir: Path, state: State | None = None) -> Path:
     """Defines the path to the checkpoint for a given state.
 
     Args:
-        exp_dir: The experiment directory
+        run_dir: The run directory
         state: The current trainer state
 
     Returns:
         The path to the checkpoint directory.
     """
     if state is None:
-        return exp_dir / "checkpoints" / "latest"
-    return exp_dir / "checkpoints" / f"step_{int(state.num_steps.item())}"
+        return run_dir / "checkpoints" / "latest"
+    return run_dir / "checkpoints" / f"step_{int(state.num_steps.item())}"
 
 
 @jax.tree_util.register_dataclass
@@ -60,7 +59,7 @@ def load_ckpt(
     part: Literal["all"],
     model_templates: Sequence[PyTree],
     opt_state_templates: Sequence[optax.OptState],
-) -> tuple[list[PyTree], list[optax.OptState], State, DictConfig]: ...
+) -> tuple[list[PyTree], list[optax.OptState], State, dict[str, Any]]: ...
 
 
 @overload
@@ -69,7 +68,7 @@ def load_ckpt(
     *,
     part: Literal["model_state_config"],
     model_templates: Sequence[PyTree],
-) -> tuple[list[PyTree], State, DictConfig]: ...
+) -> tuple[list[PyTree], State, dict[str, Any]]: ...
 
 
 @overload
@@ -95,7 +94,7 @@ def load_ckpt(path: Path, *, part: Literal["state"]) -> State: ...
 
 
 @overload
-def load_ckpt(path: Path, *, part: Literal["config"]) -> DictConfig: ...
+def load_ckpt(path: Path, *, part: Literal["config"]) -> dict[str, Any]: ...
 
 
 def load_ckpt(
@@ -105,12 +104,12 @@ def load_ckpt(
     model_templates: Sequence[PyTree] | None = None,
     opt_state_templates: Sequence[optax.OptState] | None = None,
 ) -> (
-    tuple[list[PyTree], list[optax.OptState], State, DictConfig]
-    | tuple[list[PyTree], State, DictConfig]
+    tuple[list[PyTree], list[optax.OptState], State, dict[str, Any]]
+    | tuple[list[PyTree], State, dict[str, Any]]
     | list[PyTree]
     | list[optax.OptState]
     | State
-    | DictConfig
+    | dict[str, Any]
 ):
     ckpt_path = epath.Path(path)
     checkpointer = ocp.Checkpointer(ocp.PyTreeCheckpointHandler())
@@ -146,12 +145,11 @@ def load_ckpt(
         with state_path.open() as f:
             return State.from_dict(**json.load(f))
 
-    def get_config() -> DictConfig:
+    def get_config() -> dict[str, Any]:
         config_path = ckpt_path / "config.yaml"
         if not config_path.exists():
             raise ValueError(f"Checkpoint does not contain a config file: {config_path}")
-        # Convert epath.Path to string for OmegaConf.load
-        return cast(DictConfig, OmegaConf.load(str(config_path)))
+        return load_yaml(Path(str(config_path)))
 
     match part:
         case "model":
@@ -177,16 +175,16 @@ class CheckpointingMixin(ArtifactsMixin[Config], Generic[Config]):
         self.__last_ckpt_time = 0.0
 
     def get_ckpt_path(self, state: State | None = None) -> Path:
-        return get_ckpt_path(self.exp_dir, state)
+        return get_ckpt_path(self.run_dir, state)
 
     def get_init_ckpt_path(self) -> Path | None:
-        if self._exp_dir is not None:
+        if self._run_dir is not None:
             ckpt_path = self.get_ckpt_path()
             # Check if latest checkpoint exists
             if ckpt_path.exists() and ckpt_path.is_dir():
                 return ckpt_path
             # Also check for step-based checkpoints
-            checkpoints_dir = self.exp_dir / "checkpoints"
+            checkpoints_dir = self.run_dir / "checkpoints"
             if checkpoints_dir.exists():
                 step_dirs = sorted(
                     [d for d in checkpoints_dir.iterdir() if d.is_dir() and d.name.startswith("step_")],
@@ -280,8 +278,7 @@ class CheckpointingMixin(ArtifactsMixin[Config], Generic[Config]):
                 json.dump(state.to_dict(), f, indent=2)
 
         config_path = ckpt_epath / "config.yaml"
-        with config_path.open("w") as f:
-            f.write(OmegaConf.to_yaml(self.config, sort_keys=True))
+        config_path.write_text(to_yaml_text(self.config, sort_keys=True), encoding="utf-8")
 
         # Update the symlink to the new checkpoint
         if last_ckpt_path != ckpt_path:

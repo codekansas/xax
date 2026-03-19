@@ -15,18 +15,15 @@ from typing import (
     Iterator,
     Sequence,
     TypeVar,
-    cast,
 )
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
 from jax.sharding import NamedSharding, PartitionSpec
 from jaxtyping import Array, PRNGKeyArray, PyTree
 
-from xax.core.conf import field
 from xax.core.state import Batch, State
 from xax.nn.parallel import is_master
 from xax.task.logger import Metric, Scalar
@@ -36,6 +33,7 @@ from xax.utils.experiments import ContextTimer
 from xax.utils.jax import fix_unspecified_sharding, jit as xax_jit
 from xax.utils.logging import LOG_PING, LOG_STATUS
 from xax.utils.pytree import get_pytree_param_count
+from xax.utils.structured_config import field
 from xax.utils.text import show_info
 from xax.utils.types.frozen_dict import FrozenDict
 
@@ -85,16 +83,10 @@ class SupervisedMixin(
         """
         raise NotImplementedError("`compute_loss` must be implemented by the subclass")
 
-    def decode_tokens(self, tokens: Array | np.ndarray) -> str:
-        raise NotImplementedError(
-            "When using a Tokens metric you must implement the `decode_tokens` method "
-            "to convert to a string which can be logged."
-        )
-
     def log_step(self, metrics: FrozenDict[str, Metric], state: State, heavy: bool) -> None:
         for k, v in metrics.items():
             try:
-                self.logger.log_metric(k, v, decode_tokens=self.decode_tokens)
+                self.logger.log_metric(k, v)
             except Exception as e:
                 raise ValueError(f"Error logging metric {k}") from e
         self.log_state_timers(state)
@@ -102,7 +94,6 @@ class SupervisedMixin(
 
     @xax_jit(
         static_argnames=["self", "static_parts", "optimizer", "heavy"],
-        donate_argnames=["trainable_arr", "opt_state", "state", "key"],
         jit_level=3,
     )
     def train_step(
@@ -158,7 +149,7 @@ class SupervisedMixin(
         acc_loss = acc_loss / num_accum_steps
 
         # Clip gradients if configured
-        grad_norm = cast(Array, optax.global_norm(acc_grads))
+        grad_norm = jnp.asarray(optax.global_norm(acc_grads))
         if max_grad_norm is not None:
             clip_fn = optax.clip_by_global_norm(max_grad_norm)
             clip_state = clip_fn.init(acc_grads)
@@ -288,6 +279,24 @@ class SupervisedMixin(
                 self.on_step_end()
 
             state = state.replace(elapsed_time_s=state.elapsed_time_s + timer.elapsed_time)
+            is_done = self.is_training_over(state)
+
+            # If the time/sample/step budget was crossed by the just-finished
+            # training step and that step was logged in light mode, run one
+            # final heavy eval on the updated model before exiting. This keeps
+            # benchmark metrics aligned with "train for N, then evaluate"
+            # instead of reporting the most recent mid-run heavy eval.
+            if is_done and not heavy:
+                final_batch = jax.tree.map(lambda x: x[-1], batches_stacked)
+                final_batch = jax.tree.map(self.cast_compute_dtype, final_batch)
+                final_model = eqx.combine(trainable_arr, frozen_arr, static_parts)
+                key, final_eval_key = jax.random.split(key)
+                _, final_metrics = self.compute_loss(final_model, final_batch, state, True, final_eval_key)
+                if "loss" in metrics:
+                    final_metrics["loss"] = metrics["loss"]
+                if "grad_norm" in metrics:
+                    final_metrics["grad_norm"] = metrics["grad_norm"]
+                self.log_step(FrozenDict(final_metrics), state, True)
 
             if state.num_steps <= 3:
                 logger.log(LOG_PING, "Step %d took %.2f second", state.num_steps, timer.elapsed_time)

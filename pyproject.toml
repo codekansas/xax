@@ -22,25 +22,26 @@ dependencies = [
     "jaxtyping",
     "optax",
     "orbax-checkpoint",
-
     # Data processing and serialization
     "pillow",
-
     # Configuration and project management
-    "omegaconf",
+    "pyyaml",
     "gitpython",
-
     # Monitoring and logging
     "tensorboard",
     "psutil",
-
     # Networking
     "requests",
+    "cattrs",
 ]
 
 [project.urls]
 
 Repository = "https://github.com/codekansas/xax"
+
+[project.scripts]
+
+xax = "xax.cli.main:main"
 
 [project.optional-dependencies]
 
@@ -103,7 +104,18 @@ include = ["xax*"]
 
 [tool.setuptools.package-data]
 
-xax = ["*.py", "*.txt", "py.typed"]
+xax = [
+    "*.py",
+    "*.txt",
+    "py.typed",
+    "agents/**/*.md",
+    "agents/**/*.txt",
+    "agents/**/*.json",
+    "agents/**/*.yaml",
+    "agents/**/*.yml",
+    "agents/**/*.csv",
+    "agents/**/*.py",
+]
 
 [tool.setuptools.dynamic]
 

@@ -32,8 +32,9 @@ class StateLogger(LoggerImpl):
         self.remove_unicode_from_namespaces = remove_unicode_from_namespaces
 
     def log_file(self, name: str, contents: str) -> None:
-        with open(self.run_directory / name, "w") as f:
-            f.write(contents)
+        if not (file_path := self.run_directory / name).exists():
+            with open(file_path, "w") as f:
+                f.write(contents)
 
     def write(self, line: LogLine) -> None:
         pass

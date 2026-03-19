@@ -32,11 +32,11 @@ from urllib.parse import urlparse
 import git
 import requests
 from jaxtyping import Array
-from omegaconf import MISSING, DictConfig, ListConfig, OmegaConf
 
 from xax.core.conf import get_data_dir, get_pretrained_models_dir, load_user_config
 from xax.core.state import State
 from xax.utils.jax import to_scalar
+from xax.utils.structured_config import MISSING, load_yaml, save_yaml, to_primitive
 from xax.utils.text import colored
 
 logger = logging.getLogger(__name__)
@@ -172,23 +172,14 @@ def abs_path(path: str) -> str:
     return str(Path(path).resolve())
 
 
-OmegaConf.register_new_resolver("xax.abs_path", abs_path, replace=True)
-
-
 def cpu_count(default: int) -> int:
     if (cpu_count := os.cpu_count()) is not None:
         return cpu_count
     return default
 
 
-OmegaConf.register_new_resolver("xax.cpu_count", cpu_count, replace=True)
-
-
 def date_str(_: str) -> str:
     return time.strftime("%Y-%m-%d")
-
-
-OmegaConf.register_new_resolver("xax.date_str", date_str, replace=True)
 
 
 def get_random_port(default: int = 1337) -> int:
@@ -198,16 +189,13 @@ def get_random_port(default: int = 1337) -> int:
         return default
 
 
-OmegaConf.register_new_resolver("xax.get_random_port", get_random_port, replace=True)
-
-
 class NaNError(Exception):
     """Raised when NaNs are detected in the model parameters."""
 
 
 def diff_configs(
-    first: Mapping | Sequence,
-    second: Mapping | Sequence,
+    first: object,
+    second: object,
     prefix: str | None = None,
 ) -> tuple[list[str], list[str]]:
     """Returns the difference between two configs.
@@ -232,10 +220,12 @@ def diff_configs(
     new_first: list[str] = []
     new_second: list[str] = []
 
-    any_config = (ListConfig, DictConfig)
+    any_config = (list, dict)
 
     if isinstance(first, Mapping) and isinstance(second, Mapping):
-        first_keys, second_keys = cast(set[str], set(first.keys())), cast(set[str], set(second.keys()))
+        first_mapping = cast(Mapping[str, object], first)
+        second_mapping = cast(Mapping[str, object], second)
+        first_keys, second_keys = set(first_mapping.keys()), set(second_mapping.keys())
 
         # Gets the new keys in each config.
         new_first += [f"{prefix}.{key}" for key in first_keys.difference(second_keys)]
@@ -244,32 +234,39 @@ def diff_configs(
         # Gets the new sub-keys in each config.
         for key in first_keys.intersection(second_keys):
             sub_prefix = key if prefix is None else f"{prefix}.{key}"
-            if isinstance(first, DictConfig) and isinstance(second, DictConfig):
-                if OmegaConf.is_missing(first, key) or OmegaConf.is_missing(second, key):
-                    if not OmegaConf.is_missing(first, key):
-                        new_first += [get_diff_string(sub_prefix, first[key])]
-                    if not OmegaConf.is_missing(second, key):
-                        new_second += [get_diff_string(sub_prefix, second[key])]
-            elif isinstance(first[key], any_config) and isinstance(second[key], any_config):
-                sub_new_first, sub_new_second = diff_configs(first[key], second[key], prefix=sub_prefix)
+            first_val = first_mapping[key]
+            second_val = second_mapping[key]
+            if first_val is MISSING or second_val is MISSING:
+                if first_val is not MISSING:
+                    new_first += [get_diff_string(sub_prefix, first_val)]
+                if second_val is not MISSING:
+                    new_second += [get_diff_string(sub_prefix, second_val)]
+            elif isinstance(first_val, any_config) and isinstance(second_val, any_config):
+                sub_new_first, sub_new_second = diff_configs(first_val, second_val, prefix=sub_prefix)
                 new_first, new_second = new_first + sub_new_first, new_second + sub_new_second
-            elif cast_enums(first[key]) != cast_enums(second[key]):
-                first_val, second_val = first[key], second[key]
+            elif cast_enums(first_val) != cast_enums(second_val):
                 new_first += [get_diff_string(sub_prefix, first_val)]
                 new_second += [get_diff_string(sub_prefix, second_val)]
 
-    elif isinstance(first, Sequence) and isinstance(second, Sequence):
-        if len(first) > len(second):
-            for i in range(len(second), len(first)):
-                new_first += [get_diff_string(prefix, first[i])]
-        elif len(second) > len(first):
-            for i in range(len(first), len(second)):
-                new_second += [get_diff_string(prefix, second[i])]
+    elif (
+        isinstance(first, Sequence)
+        and isinstance(second, Sequence)
+        and not isinstance(first, str | bytes | bytearray)
+        and not isinstance(second, str | bytes | bytearray)
+    ):
+        first_seq = cast(Sequence[object], first)
+        second_seq = cast(Sequence[object], second)
+        if len(first_seq) > len(second_seq):
+            for idx in range(len(second_seq), len(first_seq)):
+                new_first += [get_diff_string(prefix, first_seq[idx])]
+        elif len(second_seq) > len(first_seq):
+            for idx in range(len(first_seq), len(second_seq)):
+                new_second += [get_diff_string(prefix, second_seq[idx])]
 
-        for i in range(min(len(first), len(second))):
-            sub_prefix = str(i) if prefix is None else f"{prefix}.{i}"
-            if isinstance(first[i], any_config) and isinstance(second[i], any_config):
-                sub_new_first, sub_new_second = diff_configs(first[i], second[i], prefix=sub_prefix)
+        for idx in range(min(len(first_seq), len(second_seq))):
+            sub_prefix = str(idx) if prefix is None else f"{prefix}.{idx}"
+            if isinstance(first_seq[idx], any_config) and isinstance(second_seq[idx], any_config):
+                sub_new_first, sub_new_second = diff_configs(first_seq[idx], second_seq[idx], prefix=sub_prefix)
                 new_first, new_second = new_first + sub_new_first, new_second + sub_new_second
     else:
         new_first += [get_diff_string(prefix, first)]
@@ -289,20 +286,20 @@ def get_diff_string(config_diff: tuple[list[str], list[str]]) -> str | None:
     return change_summary
 
 
-def save_config(config_path: Path, raw_config: DictConfig) -> None:
+def save_config(config_path: Path, raw_config: dict[str, object]) -> None:
     if config_path.exists():
-        config_diff = diff_configs(raw_config, cast(DictConfig, OmegaConf.load(config_path)))
+        config_diff = diff_configs(raw_config, load_yaml(config_path))
         diff_string = get_diff_string(config_diff)
         if diff_string is not None:
             logger.warning("Overwriting config %s:\n%s", config_path, diff_string)
-            OmegaConf.save(raw_config, config_path)
+            save_yaml(config_path, raw_config)
     else:
         config_path.parent.mkdir(exist_ok=True, parents=True)
-        OmegaConf.save(raw_config, config_path)
+        save_yaml(config_path, raw_config)
         logger.info("Saved config to %s", config_path)
 
 
-def to_markdown_table(config: DictConfig) -> str:
+def to_markdown_table(config: dict[str, object] | object) -> str:
     """Converts a config to a markdown table string.
 
     Args:
@@ -347,7 +344,10 @@ def to_markdown_table(config: DictConfig) -> str:
             else:
                 yield [format_as_string(key)], format_as_string(value)
 
-    config_dict = cast(dict, OmegaConf.to_container(config, resolve=True, throw_on_missing=False, enum_to_str=True))
+    config_payload = to_primitive(config)
+    if not isinstance(config_payload, dict):
+        raise TypeError(f"Expected config payload to be a mapping/object, got {type(config_payload)!r}")
+    config_dict = cast(dict, config_payload)
     config_flat = list(iter_flat(config_dict))
 
     # Gets rows of strings.
@@ -849,6 +849,3 @@ def num_workers(default: int) -> int:
     if (cpu_count := os.cpu_count()) is not None:
         return min(cpu_count, max_workers)
     return min(default, max_workers)
-
-
-OmegaConf.register_new_resolver("xax.num_workers", num_workers, replace=True)

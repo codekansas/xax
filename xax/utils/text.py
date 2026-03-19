@@ -4,7 +4,8 @@ import datetime
 import itertools
 import re
 import sys
-from typing import Literal
+import unicodedata
+from typing import Iterator, Literal
 
 RESET_SEQ = "\033[0m"
 REG_COLOR_SEQ = "\033[%dm"
@@ -65,6 +66,120 @@ def colored(s: str, color: Color | None = None, bold: bool = False) -> str:
     return start + s + end
 
 
+_ZWJ = "\u200d"
+
+
+def _is_variation_selector(char: str) -> bool:
+    codepoint = ord(char)
+    return 0xFE00 <= codepoint <= 0xFE0F or 0xE0100 <= codepoint <= 0xE01EF
+
+
+def _is_skin_tone_modifier(char: str) -> bool:
+    codepoint = ord(char)
+    return 0x1F3FB <= codepoint <= 0x1F3FF
+
+
+def _is_regional_indicator(char: str) -> bool:
+    codepoint = ord(char)
+    return 0x1F1E6 <= codepoint <= 0x1F1FF
+
+
+def _is_zero_width_char(char: str) -> bool:
+    if char == _ZWJ:
+        return True
+    if _is_variation_selector(char) or _is_skin_tone_modifier(char):
+        return True
+    if unicodedata.combining(char) > 0:
+        return True
+    return unicodedata.category(char) in {"Cc", "Cf", "Cs"}
+
+
+def _char_display_width(char: str) -> int:
+    if _is_zero_width_char(char):
+        return 0
+    if _is_regional_indicator(char):
+        return 2
+    if unicodedata.east_asian_width(char) in {"F", "W"}:
+        return 2
+    if ord(char) >= 0x1F000 and unicodedata.category(char) == "So":
+        return 2
+    return 1
+
+
+def _iter_display_clusters(s: str) -> Iterator[str]:
+    cluster_chars: list[str] = []
+    prev_char = ""
+    regional_indicators_in_cluster = 0
+    for char in s:
+        if not cluster_chars:
+            cluster_chars = [char]
+            prev_char = char
+            regional_indicators_in_cluster = 1 if _is_regional_indicator(char) else 0
+            continue
+        if prev_char == _ZWJ or _is_zero_width_char(char):
+            cluster_chars.append(char)
+            prev_char = char
+            if _is_regional_indicator(char):
+                regional_indicators_in_cluster += 1
+            continue
+        if _is_regional_indicator(char) and regional_indicators_in_cluster == 1:
+            cluster_chars.append(char)
+            prev_char = char
+            regional_indicators_in_cluster += 1
+            continue
+        yield "".join(cluster_chars)
+        cluster_chars = [char]
+        prev_char = char
+        regional_indicators_in_cluster = 1 if _is_regional_indicator(char) else 0
+    if cluster_chars:
+        yield "".join(cluster_chars)
+
+
+def _cluster_display_width(cluster: str) -> int:
+    if not cluster:
+        return 0
+    if all(_is_regional_indicator(char) for char in cluster):
+        if len(cluster) == 1:
+            return 2
+        return 2 * ((len(cluster) + 1) // 2)
+    widths = [_char_display_width(char) for char in cluster]
+    if _ZWJ in cluster:
+        return max(widths, default=0)
+    return sum(widths)
+
+
+def display_width(s: str) -> int:
+    return sum(_cluster_display_width(cluster) for cluster in _iter_display_clusters(uncolored(s)))
+
+
+def _slice_to_display_width(s: str, max_width: int) -> str:
+    if max_width <= 0:
+        return ""
+    output_parts: list[str] = []
+    current_width = 0
+    for cluster in _iter_display_clusters(s):
+        cluster_width = _cluster_display_width(cluster)
+        if current_width + cluster_width > max_width:
+            break
+        output_parts.append(cluster)
+        current_width += cluster_width
+    return "".join(output_parts)
+
+
+def truncate_to_display_width(s: str, max_width: int, suffix: str = "...") -> str:
+    plain_s = uncolored(s)
+    plain_suffix = uncolored(suffix)
+    if max_width <= 0:
+        return ""
+    if display_width(plain_s) <= max_width:
+        return plain_s
+    suffix_width = display_width(plain_suffix)
+    if suffix_width >= max_width:
+        return _slice_to_display_width(plain_s, max_width)
+    prefix_width = max_width - suffix_width
+    return _slice_to_display_width(plain_s, prefix_width) + plain_suffix
+
+
 def wrapped(
     s: str,
     length: int | None = None,
@@ -74,6 +189,7 @@ def wrapped(
     too_long_suffix: str = "...",
 ) -> list[str]:
     strings = []
+    space_width = display_width(space)
     lines = re.split(newlines, s.strip(), flags=re.MULTILINE | re.UNICODE)
     for line in lines:
         cur_string = []
@@ -81,17 +197,17 @@ def wrapped(
         for part in re.split(spaces, line.strip(), flags=re.MULTILINE | re.UNICODE):
             if length is None:
                 cur_string.append(part)
-                cur_length += len(space) + len(part)
+                cur_length += space_width + display_width(part)
             else:
-                if len(part) > length:
-                    part = part[: length - len(too_long_suffix)] + too_long_suffix
-                if cur_length + len(part) > length:
+                if display_width(part) > length:
+                    part = truncate_to_display_width(part, length, too_long_suffix)
+                if cur_length + display_width(part) > length:
                     strings.append(space.join(cur_string))
                     cur_string = [part]
-                    cur_length = len(part)
+                    cur_length = display_width(part)
                 else:
                     cur_string.append(part)
-                    cur_length += len(space) + len(part)
+                    cur_length += space_width + display_width(part)
         if cur_length > 0:
             strings.append(space.join(cur_string))
     return strings
@@ -108,8 +224,8 @@ def outlined(
     newlines: str | re.Pattern = r"[\n\r]",
 ) -> str:
     strs = wrapped(uncolored(s), max_length, space, spaces, newlines)
-    max_len = max(len(s) for s in strs)
-    strs = [f"{s}{' ' * (max_len - len(s))}" for s in strs]
+    max_len = max(display_width(s) for s in strs)
+    strs = [f"{s}{' ' * (max_len - display_width(s))}" for s in strs]
     strs = [colored(s, inner, bold=bold) for s in strs]
     strs_with_sides = [f"{colored('│', side)} {s} {colored('│', side)}" for s in strs]
     top = colored("┌─" + "─" * max_len + "─┐", side)
@@ -191,7 +307,10 @@ def render_text_blocks(
     if align_all_blocks:
         if any(len(row) != len(blocks[0]) for row in blocks):
             raise ValueError("All rows must have the same number of blocks in order to align them")
-        widths = [[max(len(line) for line in i.lines) if i.width is None else i.width for i in r] for r in blocks]
+        widths = [
+            [max(display_width(line) for line in block.lines) if block.width is None else block.width for block in row]
+            for row in blocks
+        ]
         row_widths = [max(i) for i in zip(*widths, strict=True)]
         for row in blocks:
             for i, block in enumerate(row):
@@ -199,7 +318,7 @@ def render_text_blocks(
 
     def get_widths(row: list[TextBlock], n: int = 0) -> list[int]:
         return [
-            (max(len(line) for line in block.lines) if block.width is None else block.width) + n + padding
+            (max(display_width(line) for line in block.lines) if block.width is None else block.width) + n + padding
             for block in row
         ]
 
@@ -210,7 +329,7 @@ def render_text_blocks(
         return max(len(block.lines) for block in row)
 
     def pad(s: str, width: int, center: bool) -> str:
-        swidth = len(s)
+        swidth = display_width(s)
         if center:
             lpad, rpad = (width - swidth) // 2, (width - swidth + 1) // 2
         else:
@@ -330,7 +449,11 @@ def format_datetime(dt: datetime.datetime) -> str:
 
 
 def camelcase_to_snakecase(s: str) -> str:
-    return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s).lower()
+    # Handle consecutive uppercase letters before uppercase+lowercase (e.g., "TTS" before "Model")
+    s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", s)
+    # Handle lowercase/digit before uppercase.
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s)
+    return s.lower()
 
 
 def snakecase_to_camelcase(s: str) -> str:

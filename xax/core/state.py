@@ -7,9 +7,8 @@ from typing import Any, Literal, NotRequired, TypedDict, Unpack, cast, get_args
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array
-from omegaconf import MISSING
 
-from xax.core.conf import field
+from xax.utils.structured_config import MISSING, field
 
 # Batch = TypeVar("Batch")
 # Output = TypeVar("Output")

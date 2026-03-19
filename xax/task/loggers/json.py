@@ -71,11 +71,16 @@ class JsonLogger(LoggerImpl):
         pass
 
     def stop(self) -> None:
-        pass
-
-    def __del__(self) -> None:
+        self._log_fp.flush()
+        self._err_fp.flush()
         self._log_fp.close()
         self._err_fp.close()
+
+    def __del__(self) -> None:
+        if not self._log_fp.closed:
+            self._log_fp.close()
+        if not self._err_fp.closed:
+            self._err_fp.close()
 
     @property
     def fp(self) -> TextIO:

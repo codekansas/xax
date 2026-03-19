@@ -11,8 +11,7 @@ import numpy as np
 import optax
 from datasets import Dataset, load_dataset
 from jaxtyping import Array, PRNGKeyArray
-from transformers import AutoTokenizer
-from transformers.models.qwen2.tokenization_qwen2_fast import Qwen2TokenizerFast
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 import xax
 
@@ -51,7 +50,7 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
     def __init__(self, config: Config) -> None:
         super().__init__(config)
 
-        self.tokenizer: Qwen2TokenizerFast = AutoTokenizer.from_pretrained(config.llm_repo.value)
+        self.tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(config.llm_repo.value)
 
         # Pre-encode the generation prompt for use in compute_metrics
         self._generation_prompt_tokens = jnp.array(
@@ -137,7 +136,7 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
         loss = jax.vmap(xax.chunked_cross_entropy_loss, in_axes=(0, 0, None, 0, None))(
             hidden_btd,
             targets_bt,
-            model.lm_head.weight,
+            model.lm_head,
             mask_bt,
             256,  # Chunk size
         )
@@ -154,7 +153,7 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
             accuracy = jax.vmap(xax.chunked_cross_entropy_acc, in_axes=(0, 0, None, 0, None))(
                 hidden_btd,
                 targets_bt,
-                model.lm_head.weight,
+                model.lm_head,
                 mask_bt,
                 256,
             )
@@ -170,6 +169,7 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
                 prompt_tokens,
                 eos_id,
                 max_new_tokens=64,
+                context_tn=None,
                 temperature=0.8,
                 top_p=0.9,
                 key=gen_key,
@@ -180,14 +180,15 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
         return loss, metrics
 
     @override
-    def decode_tokens(self, tokens: Array | np.ndarray) -> str:
+    def decode_tokens(self, tokens: np.ndarray, token_type: str) -> str:
         # Convert to list and strip trailing zeros (padding from generation)
         token_list: list[int] = tokens.tolist()
         last_zero = len(token_list)
         while last_zero > 0 and token_list[last_zero - 1] == 0:
             last_zero -= 1
         token_list = token_list[:last_zero]
-        return self.tokenizer.decode(token_list, skip_special_tokens=True)
+        decoded = self.tokenizer.decode(token_list, skip_special_tokens=True)
+        return decoded if isinstance(decoded, str) else "".join(decoded)
 
     @override
     def get_dataset(self) -> Dataset:
@@ -204,7 +205,7 @@ class ShakespeareLora(xax.SupervisedTask[Config]):
 
 def _tokenize_with_tokenizer(
     examples: dict[str, str],
-    tokenizer: Qwen2TokenizerFast,
+    tokenizer: PreTrainedTokenizerBase,
     max_length: int,
 ) -> dict[str, list[int]]:
     """Standalone tokenization function that can be properly hashed for dataset fingerprinting."""

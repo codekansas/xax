@@ -1,8 +1,7 @@
 """Defines types that are used during training."""
 
-import enum
 from dataclasses import dataclass
-from typing import Any, Protocol, TypeVar, runtime_checkable
+from typing import Any, Literal, Protocol, TypeVar, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -10,8 +9,8 @@ import optax
 import orbax.checkpoint as ocp
 from jaxtyping import Array, PyTree
 
-from xax.core.conf import field
 from xax.core.state import State
+from xax.utils.structured_config import field
 
 S = TypeVar("S")
 
@@ -28,25 +27,19 @@ class Optimizer(Protocol):
     ) -> tuple[optax.Updates, S]: ...
 
 
-class Precision(enum.Enum):
-    """Precision enum for dtype configuration."""
+Precision = Literal["float32", "bfloat16", "float16", "float8_e4m3fn", "float8_e5m2"]
 
-    FLOAT32 = "float32"
-    BFLOAT16 = "bfloat16"
-    FLOAT16 = "float16"
-    FLOAT8_E4M3FN = "float8_e4m3fn"
-    FLOAT8_E5M2 = "float8_e5m2"
 
-    def to_jax_dtype(self) -> jnp.dtype:
-        """Convert to a JAX dtype."""
-        dtype_map = {
-            Precision.FLOAT32: jnp.float32,
-            Precision.BFLOAT16: jnp.bfloat16,
-            Precision.FLOAT16: jnp.float16,
-            Precision.FLOAT8_E4M3FN: jnp.float8_e4m3fn,
-            Precision.FLOAT8_E5M2: jnp.float8_e5m2,
-        }
-        return dtype_map[self]
+def precision_to_jax_dtype(precision: Precision) -> jnp.dtype:
+    if precision == "float32":
+        return jnp.float32
+    if precision == "bfloat16":
+        return jnp.bfloat16
+    if precision == "float16":
+        return jnp.float16
+    if precision == "float8_e4m3fn":
+        return jnp.float8_e4m3fn
+    return jnp.float8_e5m2
 
 
 @jax.tree_util.register_dataclass
@@ -61,26 +54,26 @@ class PrecisionConfig:
     - grad_dtype: Precision for gradient accumulation
     """
 
-    data_dtype: Precision = field(Precision.BFLOAT16, help="Precision for input data")
-    param_dtype: Precision = field(Precision.BFLOAT16, help="Precision for model weights")
-    compute_dtype: Precision = field(Precision.BFLOAT16, help="Precision for matrix multiplications")
-    grad_dtype: Precision = field(Precision.FLOAT32, help="Precision for gradients")
+    data_dtype: Precision = field("bfloat16", help="Precision for input data")
+    param_dtype: Precision = field("bfloat16", help="Precision for model weights")
+    compute_dtype: Precision = field("bfloat16", help="Precision for matrix multiplications")
+    grad_dtype: Precision = field("float32", help="Precision for gradients")
 
     @property
     def data_jax_dtype(self) -> jnp.dtype:
-        return self.data_dtype.to_jax_dtype()
+        return precision_to_jax_dtype(self.data_dtype)
 
     @property
     def param_jax_dtype(self) -> jnp.dtype:
-        return self.param_dtype.to_jax_dtype()
+        return precision_to_jax_dtype(self.param_dtype)
 
     @property
     def compute_jax_dtype(self) -> jnp.dtype:
-        return self.compute_dtype.to_jax_dtype()
+        return precision_to_jax_dtype(self.compute_dtype)
 
     @property
     def grad_jax_dtype(self) -> jnp.dtype:
-        return self.grad_dtype.to_jax_dtype()
+        return precision_to_jax_dtype(self.grad_dtype)
 
 
 def as_shape_dtype(x: Any) -> Any:  # noqa: ANN401

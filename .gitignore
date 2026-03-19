@@ -24,3 +24,6 @@ scratch/
 # Package management
 uv.lock
 .venv/
+
+# Experiments
+.optimize/

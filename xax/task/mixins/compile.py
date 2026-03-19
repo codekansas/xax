@@ -12,17 +12,17 @@ from typing import Generic, TypeVar
 
 import jax
 
-from xax.core.conf import field
 from xax.task.base import BaseConfig, BaseTask
+from xax.utils.structured_config import field
 
 logger = logging.getLogger(__name__)
 
 
 def get_cache_dir() -> str | None:
-    # By default, only cache on MacOS, since Jax caching on Linux is very
-    # prone to NaNs.
+    # By default, only cache on macOS. Linux runners can restore or discover
+    # CPU-specific cache entries that are incompatible with the current host.
     match sys.platform:
-        case "darwin" | "linux":
+        case "darwin":
             return str((Path.home() / ".cache" / "jax" / "jaxcache").resolve())
         case _:
             return None
@@ -51,7 +51,7 @@ class CompileOptions:
 
     # JAX logging options
     logging_level: str = field(
-        value="INFO",
+        value="WARNING",
         help="JAX logging verbosity level",
     )
 

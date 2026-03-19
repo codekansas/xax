@@ -25,9 +25,9 @@ class Batch(TypedDict):
 
 @dataclass
 class Config(xax.SupervisedConfig):
-    learning_rate: float = xax.field(1e-3, help="The learning rate")
-    hidden_dim: int = xax.field(512, help="Hidden layer dimension")
-    num_hidden_layers: int = xax.field(2, help="Number of hidden layers")
+    learning_rate: float = xax.field(2e-3, help="The learning rate")
+    hidden_dim: int = xax.field(1024, help="Hidden layer dimension")
+    num_hidden_layers: int = xax.field(4, help="Number of hidden layers")
 
 
 class Model(eqx.Module):
@@ -60,11 +60,17 @@ class Model(eqx.Module):
 
         # Add hidden layers
         for i in range(num_hidden_layers):
-            layers.extend([eqx.nn.Linear(current_dim, hidden_dim, key=keys[i]), jax.nn.relu])
+            layers.extend(
+                [
+                    eqx.nn.Linear(current_dim, hidden_dim, key=keys[i]),
+                    eqx.nn.LayerNorm(hidden_dim),
+                    jax.nn.gelu,
+                ]
+            )
             current_dim = hidden_dim
 
-        # Add output layer
-        layers.extend([eqx.nn.Linear(current_dim, output_dim, key=keys[-1]), jax.nn.log_softmax])
+        # Add output layer (returns raw logits).
+        layers.append(eqx.nn.Linear(current_dim, output_dim, key=keys[-1]))
 
         self.layers = tuple(layers)
 

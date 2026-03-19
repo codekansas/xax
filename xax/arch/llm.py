@@ -7,7 +7,7 @@ import sys
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import Iterator, overload
+from typing import Callable, Iterator, Literal, overload
 
 import chex
 import equinox as eqx
@@ -16,10 +16,11 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jaxtyping import Array, PRNGKeyArray
-from omegaconf import MISSING
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field as PydanticField
 
 from xax.arch.attention import (
+    AttentionCache,
+    CrossAttentionBlock,
     RMSNorm,
     SelfAttentionBlock,
     SwiGLU,
@@ -27,8 +28,8 @@ from xax.arch.attention import (
     TransformerBlockCache,
     apply_linear,
 )
-from xax.core.conf import field
 from xax.utils.jax import filter_jit as xax_filter_jit
+from xax.utils.structured_config import MISSING, field
 
 try:
     from huggingface_hub import snapshot_download
@@ -85,12 +86,24 @@ class LLM(eqx.Module):
     blocks: tuple[TransformerBlock, ...]
     norm: RMSNorm
     lm_head: eqx.nn.Linear
-    config: LLMConfig
+    config: LLMConfig = eqx.field(static=True)
+
+    # These are used to support adding extra tokens to the vocabulary.
+    extra_embed: eqx.nn.Embedding | None = None
+    extra_lm_head: eqx.nn.Linear | None = None
+    tied_extra_embed: bool = eqx.field(static=True, default=False)
 
     @classmethod
-    def build(cls, config: LLMConfig, *, key: jax.Array) -> "LLM":
+    def build(
+        cls,
+        config: LLMConfig,
+        *,
+        extra_tokens: int | None = None,
+        tied_extra_embed: bool = False,
+        key: PRNGKeyArray,
+    ) -> "LLM":
         """Initialize LLM with random weights."""
-        k_emb, *block_keys, k_head = jax.random.split(key, config.num_layers + 2)
+        key, k_emb = jax.random.split(key)
         embed = eqx.nn.Embedding(config.vocab_size, config.embed_dim, key=k_emb)
         blocks: list[TransformerBlock] = []
         mlp_width = config.mlp_hidden_dim or (config.embed_dim * config.mlp_mult)
@@ -98,7 +111,7 @@ class LLM(eqx.Module):
         mlp_bias = config.mlp_bias
 
         for i in range(config.num_layers):
-            k_attn, k_mlp = jax.random.split(block_keys[i], 2)
+            key, k_attn, k_mlp = jax.random.split(key, 3)
 
             # Determine sliding window for this layer
             layer_window: int | None = None
@@ -147,8 +160,63 @@ class LLM(eqx.Module):
             )
 
         norm = RMSNorm.build(config.embed_dim, eps=config.rms_eps)
+        key, k_head = jax.random.split(key)
         lm_head = eqx.nn.Linear(config.embed_dim, config.vocab_size, use_bias=False, key=k_head)
-        return cls(embed=embed, blocks=tuple(blocks), norm=norm, lm_head=lm_head, config=config)
+
+        if extra_tokens is None:
+            return cls(
+                embed=embed,
+                blocks=tuple(blocks),
+                norm=norm,
+                lm_head=lm_head,
+                config=config,
+            )
+
+        # Adds extra embeddings for the extra tokens.
+        key, k_extra_embed, k_extra_lm_head = jax.random.split(key, 3)
+        extra_embed = eqx.nn.Embedding(
+            extra_tokens,
+            config.embed_dim,
+            key=k_extra_embed,
+            dtype=embed.weight.dtype,
+        )
+        extra_lm_head = (
+            None
+            if tied_extra_embed
+            else eqx.nn.Linear(
+                config.embed_dim,
+                extra_tokens,
+                use_bias=False,
+                dtype=lm_head.weight.dtype,
+                key=k_extra_lm_head,
+            )
+        )
+        return cls(
+            embed=embed,
+            blocks=tuple(blocks),
+            norm=norm,
+            lm_head=lm_head,
+            config=config,
+            extra_embed=extra_embed,
+            extra_lm_head=extra_lm_head,
+            tied_extra_embed=tied_extra_embed,
+        )
+
+    def embed_tokens(self, tokens_t: Array) -> Array:
+        if self.extra_embed is None:
+            return jax.vmap(self.embed)(tokens_t)
+        mask_t = tokens_t >= self.config.vocab_size
+        text_embeds_td = jax.vmap(self.embed)(jnp.clip(tokens_t, max=self.config.vocab_size - 1))
+        extra_embeds_td = jax.vmap(self.extra_embed)(jnp.clip(tokens_t - self.config.vocab_size, min=0))
+        return jnp.where(mask_t[:, None], extra_embeds_td, text_embeds_td)
+
+    def get_logits(self, hidden_td: Array) -> Array:
+        extra_head = self.extra_embed if self.tied_extra_embed else self.extra_lm_head
+        if extra_head is None:
+            return apply_linear(hidden_td, self.lm_head)
+        text_logits_tv = apply_linear(hidden_td, self.lm_head)
+        extra_logits_tv = apply_linear(hidden_td, extra_head)
+        return jnp.concatenate([text_logits_tv, extra_logits_tv], axis=1)
 
     def init_cache(self, max_len: int | None = None, dtype: jnp.dtype = jnp.bfloat16) -> list[TransformerBlockCache]:
         """Initialize KV cache for autoregressive generation.
@@ -166,12 +234,17 @@ class LLM(eqx.Module):
         return caches
 
     @overload
-    def forward_hidden(self, tokens_t: Array) -> Array: ...
+    def forward_hidden(
+        self,
+        tokens_t: Array,
+        context_tn: Array | None = None,
+    ) -> Array: ...
 
     @overload
     def forward_hidden(
         self,
         tokens_t: Array,
+        context_tn: Array | None = None,
         *,
         caches: list[TransformerBlockCache],
     ) -> tuple[Array, list[TransformerBlockCache]]: ...
@@ -179,6 +252,7 @@ class LLM(eqx.Module):
     def forward_hidden(
         self,
         tokens_t: Array,
+        context_tn: Array | None = None,
         *,
         caches: list[TransformerBlockCache] | None = None,
     ) -> tuple[Array, list[TransformerBlockCache]] | Array:
@@ -189,13 +263,16 @@ class LLM(eqx.Module):
 
         Args:
             tokens_t: Tokens, shape (seq_len,).
+            context_tn: Contextual embeddings, shape (seq_len, context_dim).
             caches: List of KV caches, one per layer.
 
         Returns:
             Tuple of (hidden states, updated caches).
         """
         chex.assert_rank(tokens_t, 1)
-        x_tn = jax.vmap(self.embed)(tokens_t)
+        x_tn = self.embed_tokens(tokens_t)
+        if context_tn is not None:
+            x_tn = context_tn + x_tn
         if caches is None:
             for block in self.blocks:
                 x_tn, cache = block.forward(x_tn, cache=None)
@@ -208,12 +285,18 @@ class LLM(eqx.Module):
             return self.norm(x_tn), caches_out
 
     @overload
-    def forward(self, tokens_t: Array) -> Array: ...
+    def forward(
+        self,
+        tokens_t: Array,
+        *,
+        context_tn: Array | None = None,
+    ) -> Array: ...
 
     @overload
     def forward(
         self,
         tokens_t: Array,
+        context_tn: Array | None = None,
         *,
         caches: list[TransformerBlockCache],
     ) -> tuple[Array, list[TransformerBlockCache]]: ...
@@ -221,16 +304,323 @@ class LLM(eqx.Module):
     def forward(
         self,
         tokens_t: Array,
+        context_tn: Array | None = None,
         *,
         caches: list[TransformerBlockCache] | None = None,
     ) -> tuple[Array, list[TransformerBlockCache]] | Array:
         if caches is None:
-            x_td = self.forward_hidden(tokens_t)
-            return apply_linear(x_td, self.lm_head)
+            x_td = self.forward_hidden(
+                tokens_t,
+                context_tn=context_tn,
+            )
+            return self.get_logits(x_td)
         else:
-            x_td, cache = self.forward_hidden(tokens_t, caches=caches)
-            logits_tv = apply_linear(x_td, self.lm_head)
+            x_td, cache = self.forward_hidden(
+                tokens_t,
+                context_tn=context_tn,
+                caches=caches,
+            )
+            logits_tv = self.get_logits(x_td)
             return logits_tv, cache
+
+    def get_loss(
+        self,
+        tokens_t: Array,
+        targets_t: Array,
+        context_tn: Array | None = None,
+        mask_t: Array | None = None,
+        chunk_size: int = 1,
+    ) -> Array:
+        hidden_td = self.forward_hidden(tokens_t, context_tn=context_tn)
+        return chunked_cross_entropy_loss(hidden_td, targets_t, self.get_logits, mask_t, chunk_size)
+
+    def get_accuracy(
+        self,
+        tokens_t: Array,
+        targets_t: Array,
+        context_tn: Array | None = None,
+        mask_t: Array | None = None,
+        chunk_size: int = 1,
+    ) -> Array:
+        hidden_td = self.forward_hidden(tokens_t, context_tn=context_tn)
+        return chunked_cross_entropy_acc(hidden_td, targets_t, self.get_logits, mask_t, chunk_size)
+
+    def get_loss_and_accuracy(
+        self,
+        tokens_t: Array,
+        targets_t: Array,
+        context_tn: Array | None = None,
+        mask_t: Array | None = None,
+        chunk_size: int = 1,
+    ) -> tuple[Array, Array, Array]:
+        hidden_td = self.forward_hidden(tokens_t, context_tn=context_tn)
+        loss = chunked_cross_entropy_loss(hidden_td, targets_t, self.get_logits, mask_t, chunk_size)
+        accuracy = chunked_cross_entropy_acc(hidden_td, targets_t, self.get_logits, mask_t, chunk_size)
+        return loss, accuracy, hidden_td
+
+
+class CrossAttentionLLM(eqx.Module):
+    """LLM with shared cross-attention layer for encoder-decoder style models.
+
+    This wraps a base LLM and adds a single CrossAttentionBlock that is shared
+    across all transformer layers. The cross-attention is applied after each
+    self-attention block, allowing the decoder to attend to encoder outputs.
+
+    This is useful for tasks like text-to-speech where we want to cross-attend
+    to text embeddings while generating audio tokens.
+    """
+
+    llm: LLM
+    cross_attn: CrossAttentionBlock
+    cross_attn_norm: RMSNorm
+    config: LLMConfig
+
+    @classmethod
+    def build(
+        cls,
+        config: LLMConfig,
+        *,
+        key: PRNGKeyArray,
+        extra_tokens: int | None = None,
+    ) -> "CrossAttentionLLM":
+        """Build CrossAttentionLLM with a shared cross-attention layer.
+
+        Args:
+            config: LLM configuration
+            key: PRNG key for initialization
+            extra_tokens: Number of extra tokens to add to the vocabulary.
+                If None, no extra tokens are added.
+
+        Returns:
+            CrossAttentionLLM with shared cross-attention
+        """
+        k1, k2 = jax.random.split(key)
+
+        llm = LLM.build(config, extra_tokens=extra_tokens, key=k1)
+        cross_attn = CrossAttentionBlock.build(
+            embed_dim=config.embed_dim,
+            num_heads=config.q_heads,
+            key=k2,
+            use_rotary_embeddings=False,
+        )
+        cross_attn_norm = RMSNorm.build(config.embed_dim, eps=config.rms_eps)
+
+        return cls(
+            llm=llm,
+            cross_attn=cross_attn,
+            cross_attn_norm=cross_attn_norm,
+            config=config,
+        )
+
+    @classmethod
+    def from_llm(
+        cls,
+        llm: LLM,
+        *,
+        key: PRNGKeyArray,
+    ) -> "CrossAttentionLLM":
+        """Create CrossAttentionLLM from an existing LLM.
+
+        Args:
+            llm: Existing LLM model (can be pretrained)
+            key: PRNG key for cross-attention initialization
+
+        Returns:
+            CrossAttentionLLM wrapping the provided LLM
+        """
+        cross_attn = CrossAttentionBlock.build(
+            embed_dim=llm.config.embed_dim,
+            num_heads=llm.config.q_heads,
+            key=key,
+            use_rotary_embeddings=False,
+        )
+        cross_attn_norm = RMSNorm.build(llm.config.embed_dim, eps=llm.config.rms_eps)
+
+        return cls(
+            llm=llm,
+            cross_attn=cross_attn,
+            cross_attn_norm=cross_attn_norm,
+            config=llm.config,
+        )
+
+    def init_cache(
+        self,
+        max_len: int | None = None,
+        dtype: jnp.dtype = jnp.bfloat16,
+        encoder_output_sn: Array | None = None,
+    ) -> tuple[list[TransformerBlockCache], AttentionCache | None]:
+        """Initialize KV caches for autoregressive generation.
+
+        Args:
+            max_len: Maximum sequence length for self-attention cache
+            dtype: Data type for cache arrays
+            encoder_output_sn: Encoder output for cross-attention cache.
+                Shape (encoder_seq_len, embed_dim). If provided, computes
+                and caches K/V projections for cross-attention.
+
+        Returns:
+            Tuple of (self-attention caches, cross-attention cache)
+        """
+        self_caches = self.llm.init_cache(max_len=max_len, dtype=dtype)
+
+        cross_cache = None
+        if encoder_output_sn is not None:
+            cross_cache, _ = self.cross_attn.init_cache(kv_sn=encoder_output_sn)
+
+        return self_caches, cross_cache
+
+    @overload
+    def forward_hidden(self, tokens_t: Array, *, context_tn: Array | None = None) -> Array: ...
+
+    @overload
+    def forward_hidden(
+        self,
+        tokens_t: Array,
+        *,
+        context_tn: Array | None = None,
+        encoder_output_sn: Array,
+    ) -> Array: ...
+
+    @overload
+    def forward_hidden(
+        self,
+        tokens_t: Array,
+        *,
+        context_tn: Array | None = None,
+        caches: list[TransformerBlockCache],
+        cross_cache: AttentionCache | None = None,
+        encoder_output_sn: Array | None = None,
+    ) -> tuple[Array, list[TransformerBlockCache], AttentionCache | None]: ...
+
+    def forward_hidden(
+        self,
+        tokens_t: Array,
+        *,
+        encoder_output_sn: Array | None = None,
+        context_tn: Array | None = None,
+        caches: list[TransformerBlockCache] | None = None,
+        cross_cache: AttentionCache | None = None,
+    ) -> tuple[Array, list[TransformerBlockCache], AttentionCache | None] | Array:
+        """Forward pass with cross-attention to encoder output.
+
+        Args:
+            tokens_t: Input token IDs, shape (seq_len,)
+            encoder_output_sn: Encoder output for cross-attention,
+                shape (encoder_seq_len, embed_dim). Required if no cross_cache.
+            context_tn: Optional conditioning embeddings to add to token embeddings.
+            caches: Self-attention KV caches per layer
+            cross_cache: Cross-attention KV cache (precomputed from encoder)
+
+        Returns:
+            Hidden states and updated caches if caching, else just hidden states
+        """
+        chex.assert_rank(tokens_t, 1)
+        x_tn = self.llm.embed_tokens(tokens_t)
+        if context_tn is not None:
+            x_tn = context_tn + x_tn
+
+        if caches is None:
+            # No caching - simple forward pass
+            for block in self.llm.blocks:
+                x_tn, _ = block.forward(x_tn, cache=None)
+
+                # Apply shared cross-attention if encoder output provided
+                if encoder_output_sn is not None:
+                    norm_x = jax.vmap(self.cross_attn_norm)(x_tn)
+                    cross_out, _, _ = self.cross_attn.forward(
+                        q_tn=norm_x,
+                        kv_sn=encoder_output_sn,
+                    )
+                    x_tn = x_tn + cross_out
+
+            return self.llm.norm(x_tn)
+
+        else:
+            # With caching for autoregressive generation
+            caches_out: list[TransformerBlockCache] = []
+            updated_cross_cache = cross_cache
+
+            for block, cache in zip(self.llm.blocks, caches, strict=True):
+                x_tn, cache = block.forward(x_tn, cache=cache)
+                caches_out.append(cache)
+
+                # Apply shared cross-attention using cached K/V
+                if cross_cache is not None or encoder_output_sn is not None:
+                    norm_x = jax.vmap(self.cross_attn_norm)(x_tn)
+                    cross_out, updated_cross_cache, _ = self.cross_attn.forward(
+                        q_tn=norm_x,
+                        cache=cross_cache,
+                        kv_sn=encoder_output_sn if cross_cache is None else None,
+                    )
+                    x_tn = x_tn + cross_out
+
+            return self.llm.norm(x_tn), caches_out, updated_cross_cache
+
+    @overload
+    def forward(
+        self,
+        tokens_t: Array,
+        *,
+        context_tn: Array | None = None,
+    ) -> Array: ...
+
+    @overload
+    def forward(
+        self,
+        tokens_t: Array,
+        *,
+        context_tn: Array | None = None,
+        encoder_output_sn: Array,
+    ) -> Array: ...
+
+    @overload
+    def forward(
+        self,
+        tokens_t: Array,
+        *,
+        context_tn: Array | None = None,
+        caches: list[TransformerBlockCache],
+        cross_cache: AttentionCache | None = None,
+        encoder_output_sn: Array | None = None,
+    ) -> tuple[Array, list[TransformerBlockCache], AttentionCache | None]: ...
+
+    def forward(
+        self,
+        tokens_t: Array,
+        *,
+        context_tn: Array | None = None,
+        encoder_output_sn: Array | None = None,
+        caches: list[TransformerBlockCache] | None = None,
+        cross_cache: AttentionCache | None = None,
+    ) -> tuple[Array, list[TransformerBlockCache], AttentionCache | None] | Array:
+        """Forward pass returning logits.
+
+        Args:
+            tokens_t: Input token IDs, shape (seq_len,)
+            context_tn: Contextual embeddings, shape (seq_len, context_dim).
+            encoder_output_sn: Encoder output for cross-attention
+            caches: Self-attention KV caches per layer
+            cross_cache: Cross-attention KV cache
+
+        Returns:
+            Logits and updated caches if caching, else just logits
+        """
+        if caches is None:
+            if encoder_output_sn is None:
+                x_td = self.forward_hidden(tokens_t, context_tn=context_tn)
+            else:
+                x_td = self.forward_hidden(tokens_t, context_tn=context_tn, encoder_output_sn=encoder_output_sn)
+            return apply_linear(x_td, self.llm.lm_head)
+        else:
+            x_td, caches_out, cross_cache_out = self.forward_hidden(
+                tokens_t,
+                context_tn=context_tn,
+                encoder_output_sn=encoder_output_sn,
+                caches=caches,
+                cross_cache=cross_cache,
+            )
+            logits_tv = apply_linear(x_td, self.llm.lm_head)
+            return logits_tv, caches_out, cross_cache_out
 
 
 class LLMRepo(Enum):
@@ -242,8 +632,39 @@ class LLMRepo(Enum):
     QWEN3_32B = "Qwen/Qwen3-32B"
 
 
-def build_pretrained_llm(repo: LLMRepo, dtype: jnp.dtype | None = None) -> LLM:
-    """Loads a pretrained model.
+@overload
+def build_pretrained_llm(
+    repo: LLMRepo,
+    dtype: jnp.dtype | None = None,
+    *,
+    extra_tokens: int | None = None,
+    tied_extra_embed: bool = False,
+    key: PRNGKeyArray | None = None,
+) -> LLM: ...
+
+
+@overload
+def build_pretrained_llm(
+    repo: LLMRepo,
+    dtype: jnp.dtype | None = None,
+    *,
+    use_cross_attention: Literal[True],
+    key: PRNGKeyArray,
+    extra_tokens: int | None = None,
+    tied_extra_embed: bool = False,
+) -> CrossAttentionLLM: ...
+
+
+def build_pretrained_llm(
+    repo: LLMRepo,
+    dtype: jnp.dtype | None = None,
+    *,
+    use_cross_attention: bool = False,
+    extra_tokens: int | None = None,
+    tied_extra_embed: bool = False,
+    key: PRNGKeyArray | None = None,
+) -> LLM | CrossAttentionLLM:
+    """Loads a pretrained model, optionally with cross-attention support.
 
     For tensor parallelism, set up a mesh with a 'model' axis before calling:
 
@@ -254,13 +675,39 @@ def build_pretrained_llm(repo: LLMRepo, dtype: jnp.dtype | None = None) -> LLM:
     Args:
         repo: Pretrained model repository.
         dtype: Optional dtype for the model.
+        use_cross_attention: If True, wraps the LLM with a CrossAttentionLLM
+            that adds a shared cross-attention layer. The cross-attention
+            weights are randomly initialized.
+        extra_tokens: Number of extra tokens to add to the vocabulary. If None,
+            no extra tokens are added.
+        tied_extra_embed: If True, tie the extra embeddings to the main
+            embeddings. If False, use a separate embedding matrix for the extra
+            tokens.
+        key: PRNG key for initializing the model. If not provided, defaults
+            to jax.random.key(0).
 
     Returns:
-        LLM model with loaded weights, sharded according to the mesh.
+        LLM model with loaded weights, optionally wrapped with cross-attention.
     """
     config = hf_config_to_llm_config(cfg=load_hf_config(repo.value))
-    model_shape = eqx.filter_eval_shape(LLM.build, config, key=jax.random.key(0))
-    return load_hf_weights_into_llm(model_shape, repo.value, dtype=dtype)
+    if key is None:
+        if use_cross_attention or extra_tokens is not None:
+            raise ValueError("key is required if use_cross_attention is True or extra_tokens is not None.")
+        key = jax.random.key(0)
+    model_shape = eqx.filter_eval_shape(
+        LLM.build,
+        config,
+        extra_tokens=extra_tokens,
+        tied_extra_embed=tied_extra_embed,
+        key=key,
+    )
+    llm = load_hf_weights_into_llm(model_shape, repo.value, dtype=dtype)
+
+    if use_cross_attention:
+        assert key is not None, "key is required if use_cross_attention is True."
+        return CrossAttentionLLM.from_llm(llm, key=key)
+
+    return llm
 
 
 def tie_embedding_and_head(model: LLM) -> LLM:
@@ -271,7 +718,7 @@ def tie_embedding_and_head(model: LLM) -> LLM:
 def chunked_cross_entropy_loss(
     hidden_td: Array,
     targets_t: Array,
-    lm_head_weight: Array,
+    lm_head: Callable[[Array], Array],
     mask_t: Array | None = None,
     chunk_size: int = 1,
 ) -> Array:
@@ -293,8 +740,10 @@ def chunked_cross_entropy_loss(
     Args:
         hidden_td: Hidden states from model.forward_hidden(), shape (seq, hidden_dim)
         targets_t: Target token indices, shape (seq,)
-        lm_head_weight: The lm_head weight matrix, shape (vocab_size, hidden_dim)
-        mask_t: Optional mask for valid positions, shape (seq,). If None, all positions are valid.
+        lm_head: The lm_head function, shape (hidden_dim) -> (vocab_size)
+        mask_t: Optional mask for valid positions, shape (seq,). If None,
+            all positions are valid. "True" indicates that the value is
+            included in the loss computation.
         chunk_size: Number of sequence positions to process at once.
 
     Returns:
@@ -329,10 +778,9 @@ def chunked_cross_entropy_loss(
 
         # Cast to float32 for numerical stability (inputs may be bfloat16)
         chunk_hidden_f32 = chunk_hidden.astype(jnp.float32)
-        lm_head_f32 = lm_head_weight.astype(jnp.float32)
 
         # Compute logits: (batch, chunk, hidden) @ (hidden, vocab) -> (batch, chunk, vocab)
-        chunk_logits = chunk_hidden_f32 @ lm_head_f32.T
+        chunk_logits = lm_head(chunk_hidden_f32)
 
         # log_softmax is numerically stable: log(softmax(x)) = x - max(x) - log(sum(exp(x - max(x))))
         log_probs = jax.nn.log_softmax(chunk_logits, axis=-1)
@@ -362,7 +810,7 @@ def chunked_cross_entropy_loss(
 def chunked_cross_entropy_acc(
     hidden_td: Array,
     targets_t: Array,
-    lm_head_weight: Array,
+    lm_head: Callable[[Array], Array],
     mask_t: Array | None = None,
     chunk_size: int = 1,
 ) -> Array:
@@ -374,7 +822,7 @@ def chunked_cross_entropy_acc(
     Args:
         hidden_td: Hidden states from model.forward_hidden(), shape (seq, hidden_dim)
         targets_t: Target token indices, shape (seq,)
-        lm_head_weight: The lm_head weight matrix, shape (vocab_size, hidden_dim)
+        lm_head: The lm_head function, shape (hidden_dim) -> (vocab_size)
         mask_t: Optional mask for valid positions, shape (seq,). If None, all positions are valid.
         chunk_size: Number of sequence positions to process at once.
 
@@ -410,10 +858,9 @@ def chunked_cross_entropy_acc(
 
         # Cast to float32 for numerical stability (inputs may be bfloat16)
         chunk_hidden_f32 = chunk_hidden.astype(jnp.float32)
-        lm_head_f32 = lm_head_weight.astype(jnp.float32)
 
         # Compute logits: (chunk, hidden) @ (hidden, vocab) -> (chunk, vocab)
-        chunk_logits = chunk_hidden_f32 @ lm_head_f32.T
+        chunk_logits = lm_head(chunk_hidden_f32)
 
         # Compute accuracy: check if argmax matches target
         predictions = jnp.argmax(chunk_logits, axis=-1)
@@ -952,6 +1399,20 @@ def load_hf_weights_into_llm(
     if final_gamma is not None:
         model = eqx.tree_at(lambda m: m.norm.weight, model, to_dtype_replicated(final_gamma))
 
+    # Initializes the extra embeddigns to random values.
+    if model.extra_embed is not None:
+        model = eqx.tree_at(
+            lambda m: m.extra_embed.weight,
+            model,
+            jax.random.normal(jax.random.key(0), model.extra_embed.weight.shape, dtype) * 0.01,
+        )
+    if model.extra_lm_head is not None:
+        model = eqx.tree_at(
+            lambda m: m.extra_lm_head.weight,
+            model,
+            jax.random.normal(jax.random.key(0), model.extra_lm_head.weight.shape, dtype) * 0.01,
+        )
+
     return model
 
 
@@ -961,18 +1422,23 @@ def llm_generate(
     eos_id: int | None,
     max_new_tokens: int = 20,
     *,
+    context_tn: Array | None = None,
     temperature: float = 0.7,
     top_p: float = 0.9,
+    key: PRNGKeyArray | None = None,
 ) -> list[int]:
     """Sampling-based decoding for quick sanity checks (non-JIT version)."""
+    if key is None:
+        key = jax.random.key(0)
     tokens_arr, final_len = xax_filter_jit(llm_generate_jit)(
         model,
         jnp.array(tokens, dtype=jnp.int32),
         eos_id if eos_id is not None else -1,
         max_new_tokens,
+        context_tn,
         temperature,
         top_p,
-        jax.random.key(0),
+        key,
     )
     return tokens_arr[: int(final_len)].tolist()
 
@@ -999,12 +1465,16 @@ def _sample_next_token(
     """
     logits_tv = logits_tv.astype(jnp.float32)
 
-    # Temperature scaling
-    logits_tv = jnp.where(temperature > 0, logits_tv / temperature, logits_tv)
+    # True greedy decoding when temperature is 0
+    is_greedy = temperature <= 0
+    greedy_tokens = jnp.argmax(logits_tv, axis=-1, keepdims=True)
+
+    # Temperature scaling for sampling
+    scaled_logits = jnp.where(temperature > 0, logits_tv / temperature, logits_tv)
 
     # Top-p nucleus sampling
-    sort_idx_tv = jnp.argsort(logits_tv, axis=-1, descending=True)
-    sort_logits_tv = jnp.take_along_axis(logits_tv, sort_idx_tv, axis=-1)
+    sort_idx_tv = jnp.argsort(scaled_logits, axis=-1, descending=True)
+    sort_logits_tv = jnp.take_along_axis(scaled_logits, sort_idx_tv, axis=-1)
     sort_probs_tv = jax.nn.softmax(sort_logits_tv, axis=-1)
     cum_probs_tv = jnp.cumsum(sort_probs_tv, axis=-1)
     mask_tv = cum_probs_tv > top_p
@@ -1015,7 +1485,8 @@ def _sample_next_token(
     sampled_idx_tn = jax.random.categorical(key, masked_logits_tv, axis=-1, shape=shape)
     next_token_tn = jnp.take_along_axis(sort_idx_tv, sampled_idx_tn, axis=-1)
 
-    return next_token_tn
+    # Use greedy result when temperature <= 0
+    return jnp.where(is_greedy, greedy_tokens, next_token_tn)
 
 
 def llm_generate_jit(
@@ -1023,20 +1494,94 @@ def llm_generate_jit(
     tokens_t: Array,
     eos_id: int,
     max_new_tokens: int,
+    context_tn: Array | None,
     temperature: float,
     top_p: float,
     key: PRNGKeyArray,
+    allowed_token_range: tuple[int, int] | None = None,
+    min_new_tokens_before_eos: int = 0,
 ) -> tuple[Array, Array]:
+    """JIT-compiled autoregressive generation with optional context.
+
+    Args:
+        model: The LLM model.
+        tokens_t: Initial token sequence, shape (initial_len,).
+        eos_id: End-of-sequence token ID (-1 to disable).
+        max_new_tokens: Maximum number of new tokens to generate.
+        context_tn: Optional contextual embeddings, shape (max_len, context_dim).
+            Must be padded to max_len = initial_len + max_new_tokens if provided.
+        temperature: Sampling temperature.
+        top_p: Top-p (nucleus) sampling probability.
+        key: PRNG key for sampling.
+        allowed_token_range: Optional inclusive/exclusive range for allowed
+            sampled token IDs, represented as `(min_id, max_id)`.
+        min_new_tokens_before_eos: Minimum number of generated tokens required
+            before EOS can be sampled.
+
+    Returns:
+        Tuple of (generated tokens, final sequence length).
+    """
+    if allowed_token_range is None:
+        allowed_token_min_id: int | None = None
+        allowed_token_max_id: int | None = None
+    else:
+        allowed_token_min_id, allowed_token_max_id = allowed_token_range
+        if allowed_token_max_id <= allowed_token_min_id:
+            raise ValueError("allowed_token_range must satisfy max_id > min_id.")
+    if min_new_tokens_before_eos < 0:
+        raise ValueError("min_new_tokens_before_eos must be >= 0.")
+
     initial_len = tokens_t.shape[-1]
     max_len = initial_len + max_new_tokens
 
-    # Initialize output token buffer
+    if max_new_tokens <= 0:
+        return tokens_t, jnp.asarray(initial_len, dtype=jnp.int32)
+
+    # Initializes output token buffer.
     padded_tokens = jnp.zeros(max_len, dtype=jnp.int32)
     padded_tokens = padded_tokens.at[:initial_len].set(tokens_t)
 
     dtype = model.embed.weight.dtype
-    init_caches = model.init_cache(max_len, dtype)
-    init_state = (padded_tokens, jnp.int32(initial_len), key, jnp.bool_(False), init_caches)
+    caches = model.init_cache(max_len, dtype)
+
+    if allowed_token_min_id is None:
+
+        def apply_sampling_mask(logits_1v: Array, generated_count: Array) -> Array:
+            token_ids_v = jnp.arange(logits_1v.shape[-1], dtype=jnp.int32)
+            allowed_mask_v = jnp.ones_like(token_ids_v, dtype=jnp.bool_)
+            if eos_id >= 0:
+                allow_eos = generated_count >= min_new_tokens_before_eos
+                eos_mask_v = token_ids_v == eos_id
+                allowed_mask_v = jnp.where(allow_eos, allowed_mask_v, allowed_mask_v & ~eos_mask_v)
+            min_logit = jnp.asarray(jnp.finfo(logits_1v.dtype).min, dtype=logits_1v.dtype)
+            return jnp.where(allowed_mask_v[None, :], logits_1v, min_logit)
+
+    else:
+        assert allowed_token_max_id is not None
+
+        def apply_sampling_mask(logits_1v: Array, generated_count: Array) -> Array:
+            token_ids_v = jnp.arange(logits_1v.shape[-1], dtype=jnp.int32)
+            allowed_mask_v = (token_ids_v >= allowed_token_min_id) & (token_ids_v < allowed_token_max_id)
+            if eos_id >= 0:
+                allow_eos = generated_count >= min_new_tokens_before_eos
+                eos_mask_v = token_ids_v == eos_id
+                allowed_mask_v = jnp.where(allow_eos, allowed_mask_v | eos_mask_v, allowed_mask_v)
+            min_logit = jnp.asarray(jnp.finfo(logits_1v.dtype).min, dtype=logits_1v.dtype)
+            return jnp.where(allowed_mask_v[None, :], logits_1v, min_logit)
+
+    # Prime the KV cache with the prompt so subsequent iterations can decode one token at a time.
+    prompt_context_tn = None if context_tn is None else context_tn[:initial_len]
+    prompt_logits_tv, caches = model.forward(tokens_t, context_tn=prompt_context_tn, caches=caches)
+    prompt_logits_1v = prompt_logits_tv[-1:, :]
+    prompt_logits_1v = apply_sampling_mask(prompt_logits_1v, jnp.int32(0))
+
+    # Samples first generated token from the prompt's last position.
+    key, sample_key = jax.random.split(key)
+    next_token = _sample_next_token(prompt_logits_1v, temperature, top_p, sample_key, num_samples=1)[0, 0]
+    padded_tokens = padded_tokens.at[initial_len].set(next_token)
+    done = jnp.bool_((eos_id >= 0) & (next_token == eos_id))
+
+    init_state = (padded_tokens, jnp.int32(initial_len + 1), key, done, caches)
 
     def cond_fn(state: tuple[Array, Array, Array, Array, list[TransformerBlockCache]]) -> Array:
         _, cur_pos, _, done, _ = state
@@ -1047,17 +1592,23 @@ def llm_generate_jit(
     ) -> tuple[Array, Array, Array, Array, list[TransformerBlockCache]]:
         tokens_t, cur_pos, key, _, caches = state
 
-        # Forward pass on full buffer - recompute everything each step
-        key, subkey = jax.random.split(key)
-        logits_tv, caches = model.forward(tokens_t, caches=caches)
-        logits = logits_tv[..., cur_pos - 1, :]
+        prev_token_1 = jax.lax.dynamic_slice(tokens_t, (cur_pos - 1,), (1,))
+        step_context_1n = (
+            None
+            if context_tn is None
+            else jax.lax.dynamic_slice_in_dim(context_tn, start_index=cur_pos - 1, slice_size=1, axis=0)
+        )
 
-        key, subkey = jax.random.split(key)
-        next_token = _sample_next_token(logits, temperature, top_p, subkey, num_samples=1)[..., 0]
-        new_tokens = tokens_t.at[cur_pos].set(next_token)
+        logits_1v, caches = model.forward(prev_token_1, context_tn=step_context_1n, caches=caches)
+        generated_count = cur_pos - initial_len
+        logits_1v = apply_sampling_mask(logits_1v, generated_count)
+
+        key, sample_key = jax.random.split(key)
+        next_token = _sample_next_token(logits_1v, temperature, top_p, sample_key, num_samples=1)[0, 0]
+        tokens_t = tokens_t.at[cur_pos].set(next_token)
         done = jnp.bool_((eos_id >= 0) & (next_token == eos_id))
 
-        return (new_tokens, cur_pos + 1, key, done, caches)
+        return tokens_t, cur_pos + 1, key, done, caches
 
     final_tokens, final_pos, _, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_state)
     return final_tokens, final_pos
@@ -1069,6 +1620,7 @@ def llm_generate_stream(
     eos_id: int | None,
     max_new_tokens: int = 256,
     *,
+    context_tn: Array | None = None,
     temperature: float = 0.7,
     top_p: float = 0.9,
     key: PRNGKeyArray | None = None,
@@ -1083,6 +1635,8 @@ def llm_generate_stream(
         tokens: Initial token sequence as a list of integers.
         eos_id: End-of-sequence token ID (None to disable).
         max_new_tokens: Maximum number of new tokens to generate.
+        context_tn: Optional contextual embeddings, shape (max_len, context_dim).
+            Must be padded to max_len = len(tokens) + max_new_tokens if provided.
         temperature: Sampling temperature (>0).
         top_p: Top-p (nucleus) sampling probability.
         key: Optional PRNG key for sampling (defaults to key(0)).
@@ -1107,16 +1661,17 @@ def llm_generate_stream(
     def step(
         model: LLM,
         tokens_t: Array,
+        context_tn: Array | None,
         caches: list[TransformerBlockCache],
         key: PRNGKeyArray,
     ) -> tuple[Array, list[TransformerBlockCache], PRNGKeyArray]:
-        logits_tv, caches = model.forward(tokens_t, caches=caches)
+        logits_tv, caches = model.forward(tokens_t, context_tn=context_tn, caches=caches)
         logits_1v = logits_tv[..., -1:, :]
         key, subkey = jax.random.split(key)
         next_token_1 = _sample_next_token(logits_1v, temperature, top_p, subkey, num_samples=1)[..., 0]
         return next_token_1, caches, key
 
-    next_token_1, caches, key = step(model, tokens_t, caches, key)
+    next_token_1, caches, key = step(model, tokens_t, context_tn, caches, key)
     next_token_int = int(next_token_1.item())
 
     # Check EOS
@@ -1125,10 +1680,10 @@ def llm_generate_stream(
 
     yield next_token_int
 
-    # Continue generating
+    # Continue generating - context_tn is only used for initial forward pass with caching
     for _ in range(max_new_tokens - 1):
-        # Forward with cache
-        next_token_1, caches, key = step(model, next_token_1, caches, key)
+        # Forward with cache - no context needed since it's already incorporated
+        next_token_1, caches, key = step(model, next_token_1, None, caches, key)
         next_token_int = int(next_token_1.item())
 
         # Check EOS

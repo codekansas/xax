@@ -4,10 +4,9 @@ import logging
 import math
 import socket
 import sys
-from typing import Any
+from typing import Any, TextIO, cast
 
 from jaxtyping import Array
-from omegaconf import OmegaConf
 
 from xax.core.conf import load_user_config
 from xax.utils.jax import to_scalar
@@ -25,6 +24,8 @@ LOG_STATUS: int = logging.INFO + 3
 
 # Reserved for error summary.
 LOG_ERROR_SUMMARY: int = logging.INFO + 4
+
+_XAX_STREAM_HANDLER_FLAG = "_xax_stream_handler"
 
 
 def format_number(value: int | float, precision: int = 4) -> str:
@@ -159,6 +160,14 @@ class ColoredFormatter(logging.Formatter):
         return logging.Formatter.format(self, record)
 
 
+def _is_console_stream_handler(handler: logging.Handler) -> bool:
+    return isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler)
+
+
+def _is_xax_stream_handler(handler: logging.Handler) -> bool:
+    return _is_console_stream_handler(handler) and bool(getattr(handler, _XAX_STREAM_HANDLER_FLAG, False))
+
+
 def configure_logging(
     prefix: str | None = None,
     *,
@@ -187,15 +196,37 @@ def configure_logging(
     # Captures warnings from the warnings module.
     logging.captureWarnings(True)
 
-    filter = RankFilter(rank=rank)
+    rank_filter = RankFilter(rank=rank)
 
-    stream_handler = logging.StreamHandler(sys.stdout)
+    existing_xax_handlers: list[logging.Handler] = []
+    for handler in list(root_logger.handlers):
+        if _is_xax_stream_handler(handler):
+            existing_xax_handlers.append(handler)
+            continue
+        if _is_console_stream_handler(handler):
+            root_logger.removeHandler(handler)
+
+    if existing_xax_handlers:
+        stream_handler = cast(logging.StreamHandler[TextIO], existing_xax_handlers[0])
+        for extra_handler in existing_xax_handlers[1:]:
+            root_logger.removeHandler(extra_handler)
+    else:
+        stream_handler = logging.StreamHandler(sys.stdout)
+        setattr(stream_handler, _XAX_STREAM_HANDLER_FLAG, True)
+        root_logger.addHandler(stream_handler)
+
+    stream_handler.setStream(sys.stdout)
     stream_handler.setFormatter(ColoredFormatter(prefix=prefix, rank=rank, world_size=world_size))
-    stream_handler.addFilter(filter)
-    root_logger.addHandler(stream_handler)
+    for handler_filter in list(stream_handler.filters):
+        if isinstance(handler_filter, RankFilter):
+            stream_handler.removeFilter(handler_filter)
+    stream_handler.addFilter(rank_filter)
 
     if debug is None:
-        root_logger.setLevel(logging._nameToLevel[config.log_level])
+        configured_level = str(config.log_level).upper()
+        if configured_level not in logging._nameToLevel:
+            raise ValueError(f"Invalid log level {config.log_level!r}")
+        root_logger.setLevel(logging._nameToLevel[configured_level])
     else:
         root_logger.setLevel(logging.DEBUG if debug else logging.INFO)
 
@@ -232,9 +263,6 @@ def get_unused_port(default: int | None = None) -> int:
     sock = socket.socket()
     sock.bind(("", 0))
     return sock.getsockname()[1]
-
-
-OmegaConf.register_new_resolver("xax.unused_port", get_unused_port, replace=True)
 
 
 def port_is_busy(port: int) -> int:

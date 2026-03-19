@@ -1,20 +1,19 @@
-"""Defines a launcher that can be toggled from the command line."""
+"""Defines a launcher that can be toggled from typed CLI flags."""
 
-import argparse
 import sys
-from typing import TYPE_CHECKING, Literal, get_args
+from typing import TYPE_CHECKING
 
 from xax.task.base import RawConfigType
 from xax.task.launchers.base import BaseLauncher
+from xax.task.launchers.dataset import DatasetLauncher
 from xax.task.launchers.multi_cpu import MultiCpuLauncher
 from xax.task.launchers.multi_device import MultiDeviceLauncher
+from xax.task.launchers.queued import QueuedLauncher
 from xax.task.launchers.single_device import SingleDeviceLauncher
+from xax.utils.launcher.cli import parse_launcher_args
 
 if TYPE_CHECKING:
     from xax.task.mixins.runnable import Config, RunnableMixin
-
-
-LauncherChoice = Literal["single", "multi", "multi_cpu"]
 
 
 class CliLauncher(BaseLauncher):
@@ -25,24 +24,24 @@ class CliLauncher(BaseLauncher):
         use_cli: bool | list[str] = True,
     ) -> None:
         args = use_cli if isinstance(use_cli, list) else sys.argv[1:]
-        parser = argparse.ArgumentParser(add_help=False)
-        parser.add_argument(
-            "-l",
-            "--launcher",
-            choices=get_args(LauncherChoice),
-            default="multi",
-            help="The launcher to use",
-        )
-        args, cli_args_rest = parser.parse_known_intermixed_args(args=args)
-        launcher_choice: LauncherChoice = args.launcher
+        parsed_args, cli_args_rest = parse_launcher_args(args)
+        launcher_choice = parsed_args.launcher
         use_cli_next: bool | list[str] = False if not use_cli else cli_args_rest
 
         match launcher_choice:
-            case "single":
+            case "single" | "s":
                 SingleDeviceLauncher().launch(task, *cfgs, use_cli=use_cli_next)
-            case "multi":
+            case "multi" | "m":
                 MultiDeviceLauncher().launch(task, *cfgs, use_cli=use_cli_next)
-            case "multi_cpu":
+            case "multi_cpu" | "mc":
                 MultiCpuLauncher().launch(task, *cfgs, use_cli=use_cli_next)
+            case "dataset" | "d":
+                from xax.task.mixins.data_loader import DataloadersMixin  # noqa: PLC0415
+
+                if not issubclass(task, DataloadersMixin):
+                    raise ValueError("The task must be a subclass of DataloadersMixin to use the dataset launcher.")
+                DatasetLauncher().launch(task, *cfgs, use_cli=use_cli_next)
+            case "queued" | "q":
+                QueuedLauncher().launch(task, *cfgs, use_cli=use_cli_next)
             case _:
                 raise ValueError(f"Invalid launcher choice: {launcher_choice}")
