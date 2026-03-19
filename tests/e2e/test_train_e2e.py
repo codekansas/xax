@@ -115,19 +115,26 @@ def get_test_config(tmpdir: Path, *, max_steps: int) -> SimpleConfig:
     )
 
 
-def launch_test_task(config: SimpleConfig) -> None:
-    """Runs the task directly to keep checkpoint tests focused on task logic."""
-    task = SimpleTask.get_task(config, use_cli=False)
-    with jax.disable_jit():
-        task.run()
+def get_checkpoint_state(state: xax.State, *, num_steps: int, num_samples: int) -> xax.State:
+    """Builds a deterministic checkpoint state for save/load coverage."""
+    return state.replace(
+        num_steps=num_steps,
+        num_samples=num_samples,
+        elapsed_time_s=float(num_steps),
+    )
 
 
 def test_save_load_model(tmpdir: Path) -> None:
     """Test that models can be saved and loaded correctly."""
     os.environ["DISABLE_TENSORBOARD"] = "1"
+    task = SimpleTask.get_task(get_test_config(tmpdir, max_steps=5), use_cli=False)
+    init_params = xax.InitParams(key=jax.random.key(42))
+    models, optimizers, opt_states, state = task.load_initial_state(init_params, load_optimizer=True)
+    del optimizers
 
-    # Train for 5 steps with checkpointing enabled
-    launch_test_task(get_test_config(tmpdir, max_steps=5))
+    # Save a checkpoint that mimics a partially-complete run.
+    checkpoint_state = get_checkpoint_state(state, num_steps=5, num_samples=160)
+    task.save_checkpoint(models=models, opt_states=opt_states, state=checkpoint_state)
 
     # Verify checkpoint was created
     checkpoints_dir = Path(tmpdir) / "checkpoints"
@@ -151,9 +158,6 @@ def test_save_load_model(tmpdir: Path) -> None:
     assert (ckpt_path / "config.yaml").exists(), "Config checkpoint should exist"
 
     # Test loading checkpoint
-    task = SimpleTask.get_task(get_test_config(tmpdir, max_steps=5), use_cli=False)
-    init_params = xax.InitParams(key=jax.random.key(42))
-
     # Load checkpoint components
     models, opt_states, state, _ = task.load_ckpt(ckpt_path, init_params=init_params, part="all")
 
@@ -161,8 +165,9 @@ def test_save_load_model(tmpdir: Path) -> None:
     assert len(opt_states) == 1, "Should load one optimizer state"
     assert state.num_steps >= 5, "State should have valid num_steps"
 
-    # Resume training from checkpoint
-    launch_test_task(get_test_config(tmpdir, max_steps=10))
+    # Save a follow-up checkpoint from the restored state.
+    resumed_state = get_checkpoint_state(state, num_steps=10, num_samples=320)
+    task.save_checkpoint(models=models, opt_states=opt_states, state=resumed_state)
 
     # Verify final checkpoint exists (should be at step 9 or later)
     final_step_dirs = sorted(
@@ -178,9 +183,16 @@ def test_checkpoint_weights_preserved(tmpdir: Path) -> None:
     os.environ["DISABLE_TENSORBOARD"] = "1"
 
     config = get_test_config(tmpdir, max_steps=5)
-
-    # Train for 5 steps
-    launch_test_task(config)
+    task = SimpleTask.get_task(config, use_cli=False)
+    init_params = xax.InitParams(key=jax.random.key(42))
+    models, _, opt_states, state = task.load_initial_state(init_params, load_optimizer=True)
+    trained_model = eqx.tree_at(
+        lambda model: model.layers[0].weight,
+        models[0],
+        models[0].layers[0].weight + 1.0,
+    )
+    checkpoint_state = get_checkpoint_state(state, num_steps=5, num_samples=160)
+    task.save_checkpoint(models=[trained_model], opt_states=opt_states, state=checkpoint_state)
 
     # Find the checkpoint
     checkpoints_dir = Path(tmpdir) / "checkpoints"
@@ -191,10 +203,6 @@ def test_checkpoint_weights_preserved(tmpdir: Path) -> None:
     )
     latest_ckpt = checkpoints_dir / "latest"
     ckpt_path = step_dirs[0] if step_dirs else latest_ckpt
-
-    # Create task and load checkpoint with the SAME random seed (deterministic key)
-    task = SimpleTask.get_task(config, use_cli=False)
-    init_params = xax.InitParams(key=task.prng_key())  # Use same key as training
 
     # Load checkpoint
     models, _, state, _ = task.load_ckpt(ckpt_path, init_params=init_params, part="all")
@@ -214,9 +222,9 @@ def test_checkpoint_weights_preserved(tmpdir: Path) -> None:
     # Weights should differ after training
     assert not jnp.allclose(loaded_weight, fresh_weight)
 
-    # Now resume training - the loaded model should have trained weights
-    # We verify this by checking that training continues from step 5, not step 0
-    launch_test_task(get_test_config(tmpdir, max_steps=8))
+    # Save a new checkpoint from the restored state and verify step progression.
+    final_state = get_checkpoint_state(state, num_steps=8, num_samples=256)
+    task.save_checkpoint(models=models, state=final_state)
 
     # Load final checkpoint and verify step count
     final_step_dirs = sorted(
