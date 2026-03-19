@@ -19,10 +19,10 @@ logger = logging.getLogger(__name__)
 
 
 def get_cache_dir() -> str | None:
-    # By default, only cache on MacOS, since Jax caching on Linux is very
-    # prone to NaNs.
+    # By default, only cache on macOS. Linux runners can restore or discover
+    # CPU-specific cache entries that are incompatible with the current host.
     match sys.platform:
-        case "darwin" | "linux":
+        case "darwin":
             return str((Path.home() / ".cache" / "jax" / "jaxcache").resolve())
         case _:
             return None
