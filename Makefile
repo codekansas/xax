@@ -2,7 +2,7 @@
 
 RUFF := uv run --with 'ruff==0.14.13' ruff
 TY := uv run --extra all --with 'ty==0.0.12' ty
-PYTEST := uv run --extra all --with pytest python -m pytest
+PYTEST := uv run --extra all --with pytest python -m pytest -vv -ra
 
 all: format static-checks test
 .PHONY: all
