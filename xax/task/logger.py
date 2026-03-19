@@ -67,6 +67,13 @@ class DecodeTokensProtocol(Protocol):
     def __call__(self, tokens: np.ndarray, token_type: str) -> str: ...
 
 
+def resolve_lazy_value(value: T | Callable[[], T]) -> T:
+    """Resolves a lazily provided logging value."""
+    if callable(value):
+        return cast(Callable[[], T], value)()
+    return value
+
+
 def standardize_text(text: str, max_line_length: int | None = None, remove_non_ascii: bool = False) -> list[str]:
     """Standardizes a text string to a list of lines.
 
@@ -953,7 +960,7 @@ class Logger:
         @functools.lru_cache(maxsize=None)
         def scalar_future() -> LogScalar:
             with ContextTimer() as timer:
-                value_concrete = value() if callable(value) else value
+                value_concrete = resolve_lazy_value(value)
             logger.debug("Scalar Key: %s, Time: %s", key, timer.elapsed_time)
             return LogScalar(value=value_concrete, secondary=secondary)
 
@@ -980,7 +987,7 @@ class Logger:
         @functools.lru_cache(maxsize=None)
         def distribution_future() -> LogDistribution:
             with ContextTimer() as timer:
-                value_concrete = value() if callable(value) else value
+                value_concrete = resolve_lazy_value(value)
             logger.debug("Distribution Key: %s, Time: %s", key, timer.elapsed_time)
             mean, std = value_concrete
             return LogDistribution(mean=mean, std=std)
@@ -1010,7 +1017,7 @@ class Logger:
         @functools.lru_cache(maxsize=None)
         def histogram_future() -> LogHistogram:
             with ContextTimer() as timer:
-                values = value() if callable(value) else value
+                values = resolve_lazy_value(value)
                 values = values.reshape(-1)  # Must be flat.
 
                 if isinstance(values, Array):
@@ -1067,7 +1074,7 @@ class Logger:
 
         @functools.lru_cache(maxsize=None)
         def value_future() -> LogString:
-            tokens = value() if callable(value) else value
+            tokens = resolve_lazy_value(value)
             tokens_np = to_numpy(tokens)
             string_value = decode_tokens(tokens_np, token_type)
             return LogString(value=string_value, secondary=secondary)
@@ -1152,7 +1159,7 @@ class Logger:
 
         @functools.lru_cache(maxsize=None)
         def value_future() -> LogString:
-            value_concrete = value() if callable(value) else value
+            value_concrete = resolve_lazy_value(value)
             return LogString(value=value_concrete, secondary=secondary)
 
         self.strings[namespace][key] = value_future
@@ -1181,7 +1188,7 @@ class Logger:
         @functools.lru_cache(maxsize=None)
         def image_future() -> LogImage:
             with ContextTimer() as timer:
-                value_concrete = value() if callable(value) else value
+                value_concrete = resolve_lazy_value(value)
                 try:
                     image = get_image(value_concrete, target_resolution)
                 except Exception as e:
@@ -1226,7 +1233,7 @@ class Logger:
         @functools.lru_cache(maxsize=None)
         def image_future() -> LogImage:
             with ContextTimer() as timer:
-                image, label = value() if callable(value) else value
+                image, label = resolve_lazy_value(value)
                 try:
                     image_concrete = get_image(image, target_resolution)
                 except Exception as e:
@@ -1281,7 +1288,7 @@ class Logger:
         @functools.lru_cache(maxsize=None)
         def images_future() -> LogImage:
             with ContextTimer() as timer:
-                images = value() if callable(value) else value
+                images = resolve_lazy_value(value)
                 if max_images is not None:
                     images = images[:max_images]
                 if isinstance(images, Array):
@@ -1342,7 +1349,7 @@ class Logger:
         @functools.lru_cache(maxsize=None)
         def images_future() -> LogImage:
             with ContextTimer() as timer:
-                images, labels = value() if callable(value) else value
+                images, labels = resolve_lazy_value(value)
                 if max_images is not None:
                     images = images[:max_images]
                     labels = labels[:max_images]
@@ -1392,7 +1399,7 @@ class Logger:
         @functools.lru_cache(maxsize=None)
         def video_future() -> LogVideo:
             with ContextTimer() as timer:
-                video = get_video(value() if callable(value) else value, fps=fps)
+                video = get_video(resolve_lazy_value(value), fps=fps)
 
             logger.debug("Video Key: %s, Time: %s", key, timer.elapsed_time)
             return video
@@ -1424,7 +1431,7 @@ class Logger:
         @functools.lru_cache(maxsize=None)
         def audio_future() -> LogAudio:
             with ContextTimer() as timer:
-                audio = get_audio(value() if callable(value) else value, sample_rate=sample_rate)
+                audio = get_audio(resolve_lazy_value(value), sample_rate=sample_rate)
 
             logger.debug("Audio Key: %s, Time: %s", key, timer.elapsed_time)
             return audio
@@ -1449,9 +1456,9 @@ class Logger:
         def mesh_future() -> LogMesh:
             with ContextTimer() as timer:
                 # Get the raw values
-                vertices_val = vertices() if callable(vertices) else vertices
-                colors_val = colors() if callable(colors) else colors
-                faces_val = faces() if callable(faces) else faces
+                vertices_val = resolve_lazy_value(vertices)
+                colors_val = resolve_lazy_value(colors)
+                faces_val = resolve_lazy_value(faces)
 
                 # Convert to numpy arrays with proper type handling
                 vertices_np = as_numpy(vertices_val)

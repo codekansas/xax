@@ -15,7 +15,6 @@ from typing import (
     Iterator,
     Sequence,
     TypeVar,
-    cast,
 )
 
 import equinox as eqx
@@ -150,7 +149,7 @@ class SupervisedMixin(
         acc_loss = acc_loss / num_accum_steps
 
         # Clip gradients if configured
-        grad_norm = cast(Array, optax.global_norm(acc_grads))
+        grad_norm = jnp.asarray(optax.global_norm(acc_grads))
         if max_grad_norm is not None:
             clip_fn = optax.clip_by_global_norm(max_grad_norm)
             clip_state = clip_fn.init(acc_grads)
