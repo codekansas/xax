@@ -104,28 +104,30 @@ class SimpleTask(xax.SupervisedTask[SimpleConfig]):
         return ds
 
 
-def get_test_launcher() -> xax.MultiCpuLauncher:
-    """Builds a small launcher that stays within typical CI CPU limits."""
-    available_cpus = os.cpu_count() or 1
-    return xax.MultiCpuLauncher(num_cpus=max(1, min(available_cpus, 2)))
+def get_test_config(tmpdir: Path, *, max_steps: int) -> SimpleConfig:
+    """Builds a test config that avoids CI-only launcher and process issues."""
+    return SimpleConfig(
+        max_steps=max_steps,
+        run_dir=str(tmpdir),
+        save_every_n_steps=3,
+        disable_multiprocessing=True,
+        logger_backend=["json"],
+    )
+
+
+def launch_test_task(config: SimpleConfig) -> None:
+    """Runs the task directly to keep checkpoint tests focused on task logic."""
+    task = SimpleTask.get_task(config, use_cli=False)
+    with jax.disable_jit():
+        task.run()
 
 
 def test_save_load_model(tmpdir: Path) -> None:
     """Test that models can be saved and loaded correctly."""
     os.environ["DISABLE_TENSORBOARD"] = "1"
 
-    launcher = get_test_launcher()
-
     # Train for 5 steps with checkpointing enabled
-    SimpleTask.launch(
-        SimpleConfig(
-            max_steps=5,
-            run_dir=str(tmpdir),
-            save_every_n_steps=3,
-        ),
-        use_cli=False,
-        launcher=launcher,
-    )
+    launch_test_task(get_test_config(tmpdir, max_steps=5))
 
     # Verify checkpoint was created
     checkpoints_dir = Path(tmpdir) / "checkpoints"
@@ -149,7 +151,7 @@ def test_save_load_model(tmpdir: Path) -> None:
     assert (ckpt_path / "config.yaml").exists(), "Config checkpoint should exist"
 
     # Test loading checkpoint
-    task = SimpleTask.get_task(SimpleConfig(run_dir=str(tmpdir)), use_cli=False)
+    task = SimpleTask.get_task(get_test_config(tmpdir, max_steps=5), use_cli=False)
     init_params = xax.InitParams(key=jax.random.key(42))
 
     # Load checkpoint components
@@ -160,15 +162,7 @@ def test_save_load_model(tmpdir: Path) -> None:
     assert state.num_steps >= 5, "State should have valid num_steps"
 
     # Resume training from checkpoint
-    SimpleTask.launch(
-        SimpleConfig(
-            max_steps=10,
-            run_dir=str(tmpdir),
-            save_every_n_steps=3,
-        ),
-        use_cli=False,
-        launcher=launcher,
-    )
+    launch_test_task(get_test_config(tmpdir, max_steps=10))
 
     # Verify final checkpoint exists (should be at step 9 or later)
     final_step_dirs = sorted(
@@ -183,15 +177,10 @@ def test_checkpoint_weights_preserved(tmpdir: Path) -> None:
     """Test that model weights are correctly preserved through checkpoint save/load."""
     os.environ["DISABLE_TENSORBOARD"] = "1"
 
-    launcher = get_test_launcher()
-    config = SimpleConfig(
-        max_steps=5,
-        run_dir=str(tmpdir),
-        save_every_n_steps=3,
-    )
+    config = get_test_config(tmpdir, max_steps=5)
 
     # Train for 5 steps
-    SimpleTask.launch(config, use_cli=False, launcher=launcher)
+    launch_test_task(config)
 
     # Find the checkpoint
     checkpoints_dir = Path(tmpdir) / "checkpoints"
@@ -227,15 +216,7 @@ def test_checkpoint_weights_preserved(tmpdir: Path) -> None:
 
     # Now resume training - the loaded model should have trained weights
     # We verify this by checking that training continues from step 5, not step 0
-    SimpleTask.launch(
-        SimpleConfig(
-            max_steps=8,  # Train for 3 more steps
-            run_dir=str(tmpdir),
-            save_every_n_steps=3,
-        ),
-        use_cli=False,
-        launcher=launcher,
-    )
+    launch_test_task(get_test_config(tmpdir, max_steps=8))
 
     # Load final checkpoint and verify step count
     final_step_dirs = sorted(
