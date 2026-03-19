@@ -37,9 +37,7 @@ import optax
 from datasets import Dataset, concatenate_datasets, load_dataset, load_from_disk
 from jaxtyping import Array, PRNGKeyArray
 from scipy.signal import resample_poly
-from transformers import AutoConfig, AutoTokenizer
-from transformers.models.qwen2.tokenization_qwen2_fast import Qwen2TokenizerFast
-from transformers.models.whisper.tokenization_whisper_fast import WhisperTokenizerFast
+from transformers import AutoConfig, AutoTokenizer, PreTrainedTokenizerBase
 
 import xax
 from xax.arch.attention import RMSNorm, TransformerStack, apply_linear
@@ -723,8 +721,8 @@ class Config(xax.SupervisedConfig):
 
 
 class LJSpeechTTS(xax.SupervisedTask[Config]):
-    tokenizer: Qwen2TokenizerFast
-    whisper_tokenizer: WhisperTokenizerFast | None
+    tokenizer: PreTrainedTokenizerBase
+    whisper_tokenizer: PreTrainedTokenizerBase | None
 
     text_start_id: int
     text_end_id: int
@@ -773,7 +771,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         if self.config.enable_heavy_eval:
             logger.info("Loading Whisper tokenizer for ASR evaluation")
             path = xax.download_whisper_repo(self.config.whisper_repo_id)
-            self.whisper_tokenizer = WhisperTokenizerFast.from_pretrained(str(path))
+            self.whisper_tokenizer = AutoTokenizer.from_pretrained(str(path))
         else:
             self.whisper_tokenizer = None
 
@@ -2595,10 +2593,12 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
                 if self.whisper_tokenizer is None:
                     return ""
                 transcript_tokens = [t for t in token_list[4:]]
-                return self.whisper_tokenizer.decode(transcript_tokens, skip_special_tokens=True)
+                decoded = self.whisper_tokenizer.decode(transcript_tokens, skip_special_tokens=True)
+                return decoded if isinstance(decoded, str) else "".join(decoded)
             case "llm":
                 transcript_tokens = [t for t in token_list if t < self.first_q0_id]
-                return self.tokenizer.decode(transcript_tokens, skip_special_tokens=True)
+                decoded = self.tokenizer.decode(transcript_tokens, skip_special_tokens=True)
+                return decoded if isinstance(decoded, str) else "".join(decoded)
             case _:
                 raise ValueError(f"Invalid token type: {token_type}")
 

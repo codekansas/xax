@@ -1322,7 +1322,7 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        from transformers import WhisperTokenizerFast  # noqa: PLC0415
+        from transformers import AutoTokenizer  # noqa: PLC0415
     except ImportError:
         logger.error("Please install transformers: pip install transformers")
         sys.exit(1)
@@ -1368,7 +1368,7 @@ def main() -> None:
     # Load tokenizer
     logger.info("Loading tokenizer")
     path = download_whisper_repo(args.repo)
-    tokenizer: WhisperTokenizerFast = WhisperTokenizerFast.from_pretrained(str(path))
+    tokenizer = AutoTokenizer.from_pretrained(str(path))
 
     # Transcribe
     logger.info("Transcribing...")
