@@ -104,11 +104,17 @@ class SimpleTask(xax.SupervisedTask[SimpleConfig]):
         return ds
 
 
+def get_test_launcher() -> xax.MultiCpuLauncher:
+    """Builds a small launcher that stays within typical CI CPU limits."""
+    available_cpus = os.cpu_count() or 1
+    return xax.MultiCpuLauncher(num_cpus=max(1, min(available_cpus, 2)))
+
+
 def test_save_load_model(tmpdir: Path) -> None:
     """Test that models can be saved and loaded correctly."""
     os.environ["DISABLE_TENSORBOARD"] = "1"
 
-    launcher = xax.MultiCpuLauncher(num_cpus=8)
+    launcher = get_test_launcher()
 
     # Train for 5 steps with checkpointing enabled
     SimpleTask.launch(
@@ -177,7 +183,7 @@ def test_checkpoint_weights_preserved(tmpdir: Path) -> None:
     """Test that model weights are correctly preserved through checkpoint save/load."""
     os.environ["DISABLE_TENSORBOARD"] = "1"
 
-    launcher = xax.MultiCpuLauncher(num_cpus=8)
+    launcher = get_test_launcher()
     config = SimpleConfig(
         max_steps=5,
         run_dir=str(tmpdir),
