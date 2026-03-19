@@ -654,7 +654,7 @@ def test_wait_polls_until_original_running_job_finishes(monkeypatch: pytest.Monk
     monkeypatch.setattr("xax.cli.queue.xax.get_running_job", lambda: running_job)
     monkeypatch.setattr("xax.cli.queue.xax.read_queue_state", lambda: next(polled_states))
     monkeypatch.setattr("xax.cli.queue.xax.get_job", lambda job_id: finished_job if job_id == "job-0000010" else None)
-    monkeypatch.setattr("xax.cli.queue.time.sleep", lambda seconds: sleep_calls.append(seconds))
+    monkeypatch.setattr("xax.cli.queue.time.sleep", sleep_calls.append)
 
     with pytest.raises(SystemExit) as system_exit:
         main(["wait", "--poll-seconds", "0.5"])

@@ -20,7 +20,6 @@ Sequence format (stage 1):
   [TEXT_START] [TEXT] [TEXT_END] [AUDIO_START] [Q0_CODES] [AUDIO_END]
 """
 
-import functools
 import hashlib
 import json
 import logging
@@ -540,8 +539,10 @@ class Config(xax.SupervisedConfig):
     text_source_weighted_sampled_passes: int = xax.field(
         0,
         help=(
-            "Only used when text_source=both_weighted_sampled or both_weighted_sampled_diff. Number of deterministic sampled passes to build. "
-            "<=0 defaults to normalized_repeats + raw_repeats. Lower values decouple sampling weights from total dataset mass."
+            "Only used when text_source=both_weighted_sampled or "
+            "both_weighted_sampled_diff. Number of deterministic sampled passes "
+            "to build. <=0 defaults to normalized_repeats + raw_repeats. "
+            "Lower values decouple sampling weights from total dataset mass."
         ),
     )
     q0_corruption_prob: float = xax.field(
@@ -889,16 +890,16 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
                     raw_repeats = max(0, int(self.config.text_source_weighted_raw_repeats))
                     total_weight = norm_repeats + raw_repeats
                     if total_weight <= 0:
-                        raise ValueError(
-                            f"text_source={text_source} requires at least one normalized or raw repeat."
-                        )
+                        raise ValueError(f"text_source={text_source} requires at least one normalized or raw repeat.")
                     sampled_passes = int(self.config.text_source_weighted_sampled_passes)
                     if sampled_passes <= 0:
                         sampled_passes = total_weight
                     text_diff_mask = np.asarray(
                         [
                             text_norm != text_raw
-                            for text_norm, text_raw in zip(cast(list[str], ds["text_norm"]), cast(list[str], ds["text_raw"]), strict=True)
+                            for text_norm, text_raw in zip(
+                                cast(list[str], ds["text_norm"]), cast(list[str], ds["text_raw"]), strict=True
+                            )
                         ],
                         dtype=bool,
                     )
@@ -921,7 +922,9 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
                 else:
                     raise ValueError(
                         "Invalid text_source: "
-                        f"{self.config.text_source!r} (expected normalized, raw, both, both_plus_normalized, both_weighted, both_weighted_sampled, or both_weighted_sampled_diff)"
+                        f"{self.config.text_source!r} (expected normalized, raw, "
+                        "both, both_plus_normalized, both_weighted, "
+                        "both_weighted_sampled, or both_weighted_sampled_diff)"
                     )
             elif "text_tokens" in columns:
                 text_lengths = np.asarray([len(tokens_s) for tokens_s in ds["text_tokens"]], dtype=np.int32)
@@ -1030,16 +1033,24 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
                 else tuple(jax.tree.map(eqx.is_inexact_array, head) for head in model.semantic.future_q0_heads)
             ),
             non_ar_in_proj=(
-                None if model.semantic.non_ar_in_proj is None else jax.tree.map(eqx.is_inexact_array, model.semantic.non_ar_in_proj)
+                None
+                if model.semantic.non_ar_in_proj is None
+                else jax.tree.map(eqx.is_inexact_array, model.semantic.non_ar_in_proj)
             ),
             non_ar_stack=(
-                None if model.semantic.non_ar_stack is None else jax.tree.map(eqx.is_inexact_array, model.semantic.non_ar_stack)
+                None
+                if model.semantic.non_ar_stack is None
+                else jax.tree.map(eqx.is_inexact_array, model.semantic.non_ar_stack)
             ),
             non_ar_norm=(
-                None if model.semantic.non_ar_norm is None else jax.tree.map(eqx.is_inexact_array, model.semantic.non_ar_norm)
+                None
+                if model.semantic.non_ar_norm is None
+                else jax.tree.map(eqx.is_inexact_array, model.semantic.non_ar_norm)
             ),
             non_ar_out_proj=(
-                None if model.semantic.non_ar_out_proj is None else jax.tree.map(eqx.is_inexact_array, model.semantic.non_ar_out_proj)
+                None
+                if model.semantic.non_ar_out_proj is None
+                else jax.tree.map(eqx.is_inexact_array, model.semantic.non_ar_out_proj)
             ),
             non_ar_to_llm_proj=(
                 None
@@ -1153,7 +1164,9 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             else bool(exact_last_token_override)
         )
         max_supported_block_decode_size = len(future_heads) + (2 if exact_last_token else 1)
-        fixed_block_decode_size = max(1, min(int(self.config.semantic_block_decode_size), max_supported_block_decode_size))
+        fixed_block_decode_size = max(
+            1, min(int(self.config.semantic_block_decode_size), max_supported_block_decode_size)
+        )
         raw_block_decode_schedule = (
             self.config.semantic_block_decode_schedule
             if block_decode_schedule_override is None
@@ -1164,9 +1177,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             try:
                 schedule_sizes = [int(part.strip()) for part in raw_block_decode_schedule.split(",") if part.strip()]
             except ValueError as exc:
-                raise ValueError(
-                    f"Invalid semantic_block_decode_schedule: {raw_block_decode_schedule!r}"
-                ) from exc
+                raise ValueError(f"Invalid semantic_block_decode_schedule: {raw_block_decode_schedule!r}") from exc
             if not schedule_sizes or any(size <= 0 for size in schedule_sizes):
                 raise ValueError(
                     "semantic_block_decode_schedule must contain one or more positive integers, e.g. '3,3,1,2,2,1'."
@@ -1178,7 +1189,9 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         if self.config.semantic_gen_temperature != 0.0 or self.config.semantic_gen_top_p < 1.0:
             raise ValueError("Blockwise semantic generation currently only supports greedy decoding.")
 
-        max_block_decode_size = max([fixed_block_decode_size, *schedule_sizes]) if schedule_sizes else fixed_block_decode_size
+        max_block_decode_size = (
+            max([fixed_block_decode_size, *schedule_sizes]) if schedule_sizes else fixed_block_decode_size
+        )
         schedule_len = len(schedule_sizes)
         schedule_sizes_t = jnp.asarray(schedule_sizes if schedule_sizes else [1], dtype=jnp.int32)
 
@@ -1321,7 +1334,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
                     block_tokens_t = block_tokens_t.at[idx + 1].set(speculative_token)
                     step_caches, step_hidden_d = jax.lax.cond(
                         jnp.asarray(idx, dtype=jnp.int32) < speculative_count,
-                        lambda carry: feed_token(speculative_token, carry),
+                        lambda carry, token=speculative_token: feed_token(token, carry),
                         lambda carry: carry,
                         (step_caches, step_hidden_d),
                     )
@@ -1552,20 +1565,22 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
                     int(part.strip()) for part in raw_block_decode_schedule.split(",") if part.strip()
                 ]
             except ValueError as exc:
-                raise ValueError(
-                    f"Invalid semantic_block_decode_schedule: {raw_block_decode_schedule!r}"
-                ) from exc
+                raise ValueError(f"Invalid semantic_block_decode_schedule: {raw_block_decode_schedule!r}") from exc
             if not parsed_block_decode_schedule or any(size <= 0 for size in parsed_block_decode_schedule):
                 raise ValueError(
                     "semantic_block_decode_schedule must contain one or more positive integers, e.g. '3,3,1,2,2,1'."
                 )
             future_head_count = len(model.semantic.future_q0_heads) if model.semantic.future_q0_heads is not None else 0
-            max_supported_block_decode_size = future_head_count + (2 if self.config.semantic_block_decode_exact_last_token else 1)
+            max_supported_block_decode_size = future_head_count + (
+                2 if self.config.semantic_block_decode_exact_last_token else 1
+            )
             parsed_block_decode_schedule = [
                 max(1, min(size, max_supported_block_decode_size)) for size in parsed_block_decode_schedule
             ]
         has_block_decode_schedule = bool(parsed_block_decode_schedule)
-        schedule_sizes_t = jnp.asarray(parsed_block_decode_schedule if parsed_block_decode_schedule else [1], dtype=jnp.int32)
+        schedule_sizes_t = jnp.asarray(
+            parsed_block_decode_schedule if parsed_block_decode_schedule else [1], dtype=jnp.int32
+        )
         schedule_cum_sizes_t = jnp.cumsum(schedule_sizes_t)
         schedule_len_t = jnp.asarray(len(parsed_block_decode_schedule), dtype=jnp.int32)
         schedule_total_tokens_t = jnp.asarray(sum(parsed_block_decode_schedule), dtype=jnp.int32)
@@ -1675,14 +1690,17 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
                         raw_keep_count = jax.random.randint(keep_key, (), 0, safe_q0_input_count + 1)
                         q0_rank_s = jnp.cumsum(q0_input_mask_s.astype(jnp.int32), axis=0)
                         use_inference_policy = (
-                            jax.random.uniform(policy_key, ()) < self.config.semantic_self_condition_inference_policy_prob
+                            jax.random.uniform(policy_key, ())
+                            < self.config.semantic_self_condition_inference_policy_prob
                             if (use_blockwise_self_condition or use_schedule_self_condition_early_prefix)
                             else jnp.asarray(False)
                         )
 
                         first_pass_hidden_sd = llm.forward_hidden(tokens_s)
                         first_pass_logits_sv = audio_lm_head(first_pass_hidden_sd)
-                        first_pass_pred_s = jnp.argmax(first_pass_logits_sv, axis=-1).astype(jnp.int32) + base_vocab_size
+                        first_pass_pred_s = (
+                            jnp.argmax(first_pass_logits_sv, axis=-1).astype(jnp.int32) + base_vocab_size
+                        )
                         pred_input_s = jnp.concatenate([tokens_s[:1], first_pass_pred_s[:-1]], axis=0)
                         valid_pred_mask_s = (pred_input_s >= q0_min_id) & (pred_input_s < q0_max_id)
 
@@ -1732,15 +1750,21 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
                                 step_rank_s = q0_rank_s - prev_cum_s
                                 step_source_rank_s = prev_cum_s
                             elif self.config.semantic_block_decode_size > 1:
-                                block_size_t = jnp.asarray(max(1, int(self.config.semantic_block_decode_size)), dtype=jnp.int32)
+                                block_size_t = jnp.asarray(
+                                    max(1, int(self.config.semantic_block_decode_size)), dtype=jnp.int32
+                                )
                                 step_size_s = jnp.where(q0_rank_s <= grouped_new_tokens, block_size_t, 1)
-                                step_source_rank_s = ((jnp.maximum(q0_rank_s - 1, 0) // block_size_t) * block_size_t).astype(jnp.int32)
+                                step_source_rank_s = (
+                                    (jnp.maximum(q0_rank_s - 1, 0) // block_size_t) * block_size_t
+                                ).astype(jnp.int32)
                                 step_rank_s = q0_rank_s - step_source_rank_s
 
                             if self.config.semantic_self_condition_match_grouped_future_slots_only:
                                 replace_prefix_s = replace_prefix_s & (step_size_s > 1)
                                 if self.config.semantic_block_decode_exact_last_token:
-                                    replace_prefix_s = replace_prefix_s & (step_rank_s > 1) & (step_rank_s < step_size_s)
+                                    replace_prefix_s = (
+                                        replace_prefix_s & (step_rank_s > 1) & (step_rank_s < step_size_s)
+                                    )
                                 else:
                                     replace_prefix_s = replace_prefix_s & (step_rank_s > 1)
 
@@ -1756,8 +1780,8 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
                                     max_new_tokens=grouped_new_tokens,
                                     initial_generated_count=0,
                                 )
-                                grouped_valid_pred_mask_s = (
-                                    (generated_tokens_s >= q0_min_id) & (generated_tokens_s < q0_max_id)
+                                grouped_valid_pred_mask_s = (generated_tokens_s >= q0_min_id) & (
+                                    generated_tokens_s < q0_max_id
                                 )
                                 replace_mask_s = replace_prefix_s & grouped_valid_pred_mask_s
                                 return jnp.where(replace_mask_s, generated_tokens_s, tokens_s)
@@ -1770,7 +1794,9 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
                             )
 
                         if use_blockwise_self_condition:
-                            block_size_t = jnp.asarray(max(1, int(self.config.semantic_block_decode_size)), dtype=jnp.int32)
+                            block_size_t = jnp.asarray(
+                                max(1, int(self.config.semantic_block_decode_size)), dtype=jnp.int32
+                            )
                             max_grouped_tokens_t = jnp.asarray(
                                 int(self.config.semantic_block_decode_max_grouped_tokens),
                                 dtype=jnp.int32,
@@ -1790,7 +1816,9 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
                             seq_len = int(tokens_s.shape[0])
                             audio_start_mask_s = tokens_s == self.audio_start_id
-                            audio_start_idx = jnp.where(audio_start_mask_s.any(), jnp.argmax(audio_start_mask_s), seq_len - 1)
+                            audio_start_idx = jnp.where(
+                                audio_start_mask_s.any(), jnp.argmax(audio_start_mask_s), seq_len - 1
+                            )
                             prompt_len = audio_start_idx + 1 + snapped_keep_count
 
                             def expensive_replace(_: Array) -> Array:
@@ -1812,12 +1840,14 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
                                         max_new_tokens=grouped_new_tokens,
                                         initial_generated_count=snapped_keep_count,
                                     )
-                                    grouped_valid_pred_mask_s = (
-                                        (generated_tokens_s >= q0_min_id) & (generated_tokens_s < q0_max_id)
+                                    grouped_valid_pred_mask_s = (generated_tokens_s >= q0_min_id) & (
+                                        generated_tokens_s < q0_max_id
                                     )
-                                    hybrid_pred_input_s = jnp.where(grouped_valid_pred_mask_s, generated_tokens_s, pred_input_s)
-                                    hybrid_valid_pred_mask_s = (
-                                        (hybrid_pred_input_s >= q0_min_id) & (hybrid_pred_input_s < q0_max_id)
+                                    hybrid_pred_input_s = jnp.where(
+                                        grouped_valid_pred_mask_s, generated_tokens_s, pred_input_s
+                                    )
+                                    hybrid_valid_pred_mask_s = (hybrid_pred_input_s >= q0_min_id) & (
+                                        hybrid_pred_input_s < q0_max_id
                                     )
                                     replace_suffix_s = q0_input_mask_s & (q0_rank_s > snapped_keep_count)
                                     replace_mask_s = replace_suffix_s & hybrid_valid_pred_mask_s
@@ -1830,8 +1860,8 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
                                     max_new_tokens=q0_input_count - snapped_keep_count,
                                     initial_generated_count=snapped_keep_count,
                                 )
-                                expensive_valid_pred_mask_s = (
-                                    (generated_tokens_s >= q0_min_id) & (generated_tokens_s < q0_max_id)
+                                expensive_valid_pred_mask_s = (generated_tokens_s >= q0_min_id) & (
+                                    generated_tokens_s < q0_max_id
                                 )
                                 replace_suffix_s = q0_input_mask_s & (q0_rank_s > snapped_keep_count)
                                 replace_mask_s = replace_suffix_s & expensive_valid_pred_mask_s
@@ -2208,13 +2238,11 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         input_tokens_s = candidate_tokens_s[:-1]
         targets_s = candidate_tokens_s[1:]
         target_pos_s = jnp.arange(targets_s.shape[0], dtype=jnp.int32)
-        generated_target_mask_s = (
-            (target_pos_s >= jnp.asarray(prompt_len - 1, dtype=jnp.int32))
-            & (target_pos_s < (candidate_pos - 1))
+        generated_target_mask_s = (target_pos_s >= jnp.asarray(prompt_len - 1, dtype=jnp.int32)) & (
+            target_pos_s < (candidate_pos - 1)
         )
-        semantic_target_mask_s = (
-            ((targets_s >= self.first_q0_id) & (targets_s < q0_max_id))
-            | (targets_s == self.audio_end_id)
+        semantic_target_mask_s = ((targets_s >= self.first_q0_id) & (targets_s < q0_max_id)) | (
+            targets_s == self.audio_end_id
         )
         score_mask_s = generated_target_mask_s & semantic_target_mask_s
         targets_extra_s = jnp.where(score_mask_s, targets_s - base_vocab_size, 0)
@@ -2317,14 +2345,11 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
                 max_frames + 1,  # +1 to allow the EOS token.
             )
 
-            use_blockwise_decode = (
-                model.semantic.future_q0_heads is not None
-                and (
-                    self.config.semantic_block_decode_size > 1
-                    or (
-                        self.config.semantic_block_decode_schedule is not None
-                        and self.config.semantic_block_decode_schedule.strip() != ""
-                    )
+            use_blockwise_decode = model.semantic.future_q0_heads is not None and (
+                self.config.semantic_block_decode_size > 1
+                or (
+                    self.config.semantic_block_decode_schedule is not None
+                    and self.config.semantic_block_decode_schedule.strip() != ""
                 )
             )
             if use_blockwise_decode:
@@ -2710,9 +2735,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             raw_repeats = max(0, int(self.config.text_source_weighted_raw_repeats))
             total_weight = norm_repeats + raw_repeats
             if total_weight <= 0:
-                raise ValueError(
-                    f"text_source={text_source} requires at least one normalized or raw repeat."
-                )
+                raise ValueError(f"text_source={text_source} requires at least one normalized or raw repeat.")
             sampled_passes = int(self.config.text_source_weighted_sampled_passes)
             if sampled_passes <= 0:
                 sampled_passes = total_weight
@@ -2730,7 +2753,9 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         else:
             raise ValueError(
                 "Invalid text_source: "
-                f"{self.config.text_source!r} (expected normalized, raw, both, both_plus_normalized, both_weighted, both_weighted_sampled, or both_weighted_sampled_diff)"
+                f"{self.config.text_source!r} (expected normalized, raw, "
+                "both, both_plus_normalized, both_weighted, "
+                "both_weighted_sampled, or both_weighted_sampled_diff)"
             )
         cols_to_keep = ["codes", "audio_codes"]
         cols_to_remove = [c for c in result.column_names if c not in cols_to_keep]
