@@ -17,7 +17,6 @@ dependencies = [
     "datasets",
     "equinox",
     "etils",
-    "importlib-resources",
     "jax",
     "jaxtyping",
     "optax",
@@ -108,13 +107,6 @@ xax = [
     "*.py",
     "*.txt",
     "py.typed",
-    "agents/**/*.md",
-    "agents/**/*.txt",
-    "agents/**/*.json",
-    "agents/**/*.yaml",
-    "agents/**/*.yml",
-    "agents/**/*.csv",
-    "agents/**/*.py",
 ]
 
 [tool.setuptools.dynamic]

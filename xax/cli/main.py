@@ -30,11 +30,6 @@ SUBCOMMANDS: tuple[_Subcommand, ...] = (
         module_name="xax.cli.queue",
     ),
     _Subcommand(
-        name="install-skills",
-        help="Install bundled Codex skills into .agents",
-        module_name="xax.cli.install_skills",
-    ),
-    _Subcommand(
         name="edit-config",
         help="Edit checkpoint configs in-place",
         module_name="xax.cli.edit_config",
