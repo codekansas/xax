@@ -59,6 +59,7 @@ def load_ckpt(
     part: Literal["all"],
     model_templates: Sequence[PyTree],
     opt_state_templates: Sequence[optax.OptState],
+    partial_restore: bool = False,
 ) -> tuple[list[PyTree], list[optax.OptState], State, dict[str, Any]]: ...
 
 
@@ -68,6 +69,7 @@ def load_ckpt(
     *,
     part: Literal["model_state_config"],
     model_templates: Sequence[PyTree],
+    partial_restore: bool = False,
 ) -> tuple[list[PyTree], State, dict[str, Any]]: ...
 
 
@@ -77,6 +79,7 @@ def load_ckpt(
     *,
     part: Literal["model"],
     model_templates: Sequence[PyTree],
+    partial_restore: bool = False,
 ) -> list[PyTree]: ...
 
 
@@ -86,15 +89,26 @@ def load_ckpt(
     *,
     part: Literal["opt_state"],
     opt_state_templates: Sequence[optax.OptState],
+    partial_restore: bool = False,
 ) -> list[optax.OptState]: ...
 
 
 @overload
-def load_ckpt(path: Path, *, part: Literal["state"]) -> State: ...
+def load_ckpt(
+    path: Path,
+    *,
+    part: Literal["state"],
+    partial_restore: bool = False,
+) -> State: ...
 
 
 @overload
-def load_ckpt(path: Path, *, part: Literal["config"]) -> dict[str, Any]: ...
+def load_ckpt(
+    path: Path,
+    *,
+    part: Literal["config"],
+    partial_restore: bool = False,
+) -> dict[str, Any]: ...
 
 
 def load_ckpt(
@@ -103,6 +117,7 @@ def load_ckpt(
     part: CheckpointPart = "model",
     model_templates: Sequence[PyTree] | None = None,
     opt_state_templates: Sequence[optax.OptState] | None = None,
+    partial_restore: bool = False,
 ) -> (
     tuple[list[PyTree], list[optax.OptState], State, dict[str, Any]]
     | tuple[list[PyTree], State, dict[str, Any]]
@@ -122,7 +137,11 @@ def load_ckpt(
             model_path = ckpt_path / f"model_{i}"
             if not model_path.exists():
                 raise ValueError(f"Checkpoint does not contain a model file: {model_path}")
-            restored_arrays = checkpointer.restore(model_path, item=model_template)
+            restored_arrays = checkpointer.restore(
+                model_path,
+                item=model_template,
+                partial_restore=partial_restore,
+            )
             models.append(eqx.combine(restored_arrays, model_template))
         return models
 
@@ -134,7 +153,11 @@ def load_ckpt(
             opt_state_path = ckpt_path / f"opt_state_{i}"
             if not opt_state_path.exists():
                 raise ValueError(f"Checkpoint does not contain an optimizer state file: {opt_state_path}")
-            restored_opt_state = checkpointer.restore(opt_state_path, item=opt_state_template)
+            restored_opt_state = checkpointer.restore(
+                opt_state_path,
+                item=opt_state_template,
+                partial_restore=partial_restore,
+            )
             opt_states.append(restored_opt_state)
         return opt_states
 

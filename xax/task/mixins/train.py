@@ -104,6 +104,7 @@ class TrainConfig(
     step_kind: str = field("step", help=f"How to measure a step; one of [{', '.join(get_args(StepKind))}]")
     precision: PrecisionConfig = field(PrecisionConfig, help="Config specifying floating point precisions")
     random_seed: int = field(1337, help="Random seed for the task")
+    partial_restore: bool = field(False, help="Whether to partially restore the checkpoint")
 
 
 Config = TypeVar("Config", bound=TrainConfig)
@@ -302,7 +303,12 @@ class TrainMixin(
                 trainable_templates.append(jax.tree.map(as_shape_dtype, trainable))
 
             # Restore trainable params from checkpoint
-            trainable_restored = load_ckpt(init_ckpt_path, part="model", model_templates=trainable_templates)
+            trainable_restored = load_ckpt(
+                init_ckpt_path,
+                part="model",
+                model_templates=trainable_templates,
+                partial_restore=self.config.partial_restore,
+            )
 
             # Combine restored trainable params with the full models
             restored_models = []
@@ -326,7 +332,14 @@ class TrainMixin(
                 return models, state
 
             optimizers = self._get_optimizers()
-            opt_states = self.load_ckpt(init_ckpt_path, params, part="opt_state", models=models, optimizers=optimizers)
+            opt_states = self.load_ckpt(
+                init_ckpt_path,
+                params,
+                part="opt_state",
+                models=models,
+                optimizers=optimizers,
+                partial_restore=self.config.partial_restore,
+            )
             return models, optimizers, opt_states, state
 
         logger.info("Starting a new training run")
@@ -355,6 +368,7 @@ class TrainMixin(
         init_params: InitParamsT,
         *,
         part: Literal["all"],
+        partial_restore: bool = False,
     ) -> tuple[list[PyTree], list[optax.OptState], State, Config]: ...
 
     @overload
@@ -364,6 +378,7 @@ class TrainMixin(
         init_params: InitParamsT,
         *,
         part: Literal["model_state_config"],
+        partial_restore: bool = False,
     ) -> tuple[list[PyTree], State, Config]: ...
 
     @overload
@@ -373,6 +388,7 @@ class TrainMixin(
         init_params: InitParamsT,
         *,
         part: Literal["model"],
+        partial_restore: bool = False,
     ) -> list[PyTree]: ...
 
     @overload
@@ -384,6 +400,7 @@ class TrainMixin(
         part: Literal["opt_state"],
         models: list[PyTree] | None = None,
         optimizers: list[Optimizer] | None = None,
+        partial_restore: bool = False,
     ) -> list[optax.OptState]: ...
 
     @overload
@@ -393,6 +410,7 @@ class TrainMixin(
         init_params: InitParamsT,
         *,
         part: Literal["state"],
+        partial_restore: bool = False,
     ) -> list[State]: ...
 
     @overload
@@ -402,6 +420,7 @@ class TrainMixin(
         init_params: InitParamsT,
         *,
         part: Literal["config"],
+        partial_restore: bool = False,
     ) -> list[Config]: ...
 
     def load_ckpt(
@@ -412,6 +431,7 @@ class TrainMixin(
         part: CheckpointPart = "all",
         models: list[PyTree] | None = None,
         optimizers: list[Optimizer] | None = None,
+        partial_restore: bool = False,
     ) -> (
         tuple[list[PyTree], list[optax.OptState], State, Config]
         | tuple[list[PyTree], State, Config]
@@ -429,24 +449,34 @@ class TrainMixin(
                     models_specs = jax.tree_util.tree_map(as_shape_dtype, models_shape)
                 else:
                     models_specs = jax.tree_util.tree_map(as_shape_dtype, models)
-                models, state, config = load_ckpt(path, part="model_state_config", model_templates=models_specs)
+                models, state, config = load_ckpt(
+                    path,
+                    part="model_state_config",
+                    model_templates=models_specs,
+                    partial_restore=partial_restore,
+                )
                 config = self.get_config(config, use_cli=False)
                 return models, state, config
 
             case "model":
                 model_shape = eqx.filter_eval_shape(self._get_models, init_params)
                 model_specs = jax.tree_util.tree_map(as_shape_dtype, model_shape)
-                return load_ckpt(path, part="model", model_templates=model_specs)
+                return load_ckpt(path, part="model", model_templates=model_specs, partial_restore=partial_restore)
 
             case "opt_state":
                 if models is None:
                     model_shape = eqx.filter_eval_shape(self._get_models, init_params)
                     model_specs = jax.tree_util.tree_map(as_shape_dtype, model_shape)
-                    models = load_ckpt(path, part="model", model_templates=model_specs)
+                    models = load_ckpt(path, part="model", model_templates=model_specs, partial_restore=partial_restore)
                 if optimizers is None:
                     optimizers = self._get_optimizers()
                 opt_state_specs = eqx.filter_eval_shape(self.get_initial_opt_state, models, optimizers)
-                return load_ckpt(path, part="opt_state", opt_state_templates=opt_state_specs)
+                return load_ckpt(
+                    path,
+                    part="opt_state",
+                    opt_state_templates=opt_state_specs,
+                    partial_restore=partial_restore,
+                )
 
             case "state":
                 return load_ckpt(path, part="state")
@@ -458,11 +488,21 @@ class TrainMixin(
                 if models is None:
                     models_shape = eqx.filter_eval_shape(self._get_models, init_params)
                     models_specs = jax.tree_util.tree_map(as_shape_dtype, models_shape)
-                    models = load_ckpt(path, part="model", model_templates=models_specs)
+                    models = load_ckpt(
+                        path,
+                        part="model",
+                        model_templates=models_specs,
+                        partial_restore=partial_restore,
+                    )
                 if optimizers is None:
                     optimizers = self._get_optimizers()
                 opt_state_specs = eqx.filter_eval_shape(self.get_initial_opt_state, models, optimizers)
-                opt_states = load_ckpt(path, part="opt_state", opt_state_templates=opt_state_specs)
+                opt_states = load_ckpt(
+                    path,
+                    part="opt_state",
+                    opt_state_templates=opt_state_specs,
+                    partial_restore=partial_restore,
+                )
                 state = load_ckpt(path, part="state")
                 config = self.get_config(load_ckpt(path, part="config"), use_cli=False)
                 return models, opt_states, state, config
