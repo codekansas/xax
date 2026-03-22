@@ -56,7 +56,7 @@ class Experiment:
 @dataclass(kw_only=True)
 class Directories:
     runs: str | None = _field(None, help="Directory containing all training runs")
-    experiments: str | None = _field(None, help="Directory containing experiment-monitor sessions")
+    experiments: str | None = _field(None, help="Directory containing experiment logs or session data")
     data: str | None = _field(None, help="The data directory")
     pretrained_models: str | None = _field(None, help="The models directory")
 

@@ -1,7 +1,5 @@
 """Tests for the top-level xax CLI dispatcher."""
 
-from pathlib import Path
-
 import pytest
 
 from xax.cli.main import main
@@ -31,11 +29,3 @@ def test_xax_cli_rejects_removed_experiment_subcommand(capsys: pytest.CaptureFix
 
     assert system_exit.value.code == 2
     assert "Invalid subcommand" in capsys.readouterr().err
-
-
-def test_xax_cli_install_skills(tmp_path: Path) -> None:
-    destination_agents_dir = tmp_path / ".agents"
-    with pytest.raises(SystemExit) as system_exit:
-        main(["install-skills", "--dest", str(destination_agents_dir)])
-    assert system_exit.value.code == 0
-    assert (destination_agents_dir / "skills" / "experiment-monitor" / "SKILL.md").exists()
