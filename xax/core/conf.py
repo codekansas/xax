@@ -196,8 +196,7 @@ def get_data_dir() -> Path:
     config = load_user_config().directories
     if is_missing(config, "data"):
         raise RuntimeError(
-            "The data directory has not been set! You should set it in your config file "
-            f"in {user_config_path()}."
+            f"The data directory has not been set! You should set it in your config file in {user_config_path()}."
         )
     data_value = config.data
     if data_value is None:
@@ -209,8 +208,7 @@ def get_pretrained_models_dir() -> Path:
     config = load_user_config().directories
     if is_missing(config, "pretrained_models"):
         raise RuntimeError(
-            "The models directory has not been set! You should set it in your config file "
-            f"in {user_config_path()}."
+            f"The models directory has not been set! You should set it in your config file in {user_config_path()}."
         )
     models_value = config.pretrained_models
     if models_value is None:

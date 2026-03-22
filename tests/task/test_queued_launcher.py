@@ -107,8 +107,7 @@ def test_queued_launcher_ignores_config_runs_dir_for_queue_run_ids(
         assert queued_run_dirs[0] == expected_task_root / "run_000"
         assert queued_run_dirs[1] == expected_task_root / "run_001"
         assert all(
-            provided_runs_dir not in run_dir.parents and run_dir != provided_runs_dir
-            for run_dir in queued_run_dirs
+            provided_runs_dir not in run_dir.parents and run_dir != provided_runs_dir for run_dir in queued_run_dirs
         )
     finally:
         clear_observer(observer_pid)

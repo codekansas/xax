@@ -103,8 +103,7 @@ class CliOutput:
         title_color: Color = _TABLE_TITLE_COLOR,
     ) -> None:
         header_blocks = [
-            TextBlock(header, color=header_color if self.use_color else None, bold=True)
-            for header in headers
+            TextBlock(header, color=header_color if self.use_color else None, bold=True) for header in headers
         ]
         body_blocks = [[TextBlock(cell) for cell in row] for row in rows]
         block_rows = [header_blocks, *body_blocks]
