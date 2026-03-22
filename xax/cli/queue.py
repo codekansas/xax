@@ -315,8 +315,7 @@ def _resolve_queue_gpu_devices(
     gpu_indices = _discover_gpu_indices()
     if not gpu_indices:
         raise RuntimeError(
-            "Could not auto-detect GPUs with nvidia-smi for --queue-num-gpus. "
-            "Pass --queue-gpus explicitly instead."
+            "Could not auto-detect GPUs with nvidia-smi for --queue-num-gpus. Pass --queue-gpus explicitly instead."
         )
     if resolved_queue_num_gpus > len(gpu_indices):
         raise ValueError(
@@ -515,8 +514,7 @@ def _spawn_job_process(
 
     with open(observer_log_path, "a", encoding="utf-8") as observer_log_file:
         observer_log_file.write(
-            f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] starting {job_id} "
-            f"(python={submitter_python})\n"
+            f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] starting {job_id} (python={submitter_python})\n"
         )
         observer_log_file.flush()
         proc = subprocess.Popen(
@@ -1462,11 +1460,7 @@ def _show_queue_help(out: "xax.CliOutput") -> None:
     out.table(
         title="Queue Commands",
         headers=["command", "description"],
-        rows=[
-            [command_name, spec.description]
-            for command_name, spec in COMMAND_SPECS.items()
-            if spec.visible
-        ],
+        rows=[[command_name, spec.description] for command_name, spec in COMMAND_SPECS.items() if spec.visible],
     )
     out.plain("Run `xax queue <command> --help` for command usage.")
 

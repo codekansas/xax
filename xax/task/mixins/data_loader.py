@@ -426,7 +426,7 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
             The dataset to train on.
         """
 
-    def _get_dataset_hash(self, name: str) -> str:
+    def get_dataset_hash(self, name: str) -> str:
         """Get the hash for a dataset, including dependency hashes."""
         if name not in self.dataset_functions:
             raise ValueError(f"Dataset '{name}' is not registered. Available: {list(self.dataset_functions.keys())}")
@@ -441,7 +441,7 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
         fn_hash = _hash_function(ds_fn.dataset_fn)
 
         # Include dependency hashes
-        dep_hashes = sorted(self._get_dataset_hash(dep) for dep in ds_fn.dependencies)
+        dep_hashes = sorted(self.get_dataset_hash(dep) for dep in ds_fn.dependencies)
         combined = fn_hash + "".join(dep_hashes)
 
         return hashlib.sha256(combined.encode()).hexdigest()[:16]
@@ -488,7 +488,7 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
             raise ValueError(f"Dataset '{name}' is not registered. Available: {list(self.dataset_functions.keys())}")
 
         ds_fn = self.dataset_functions[name]
-        current_hash = self._get_dataset_hash(name)
+        current_hash = self.get_dataset_hash(name)
         cache_path = self._get_dataset_path(name, current_hash)
 
         if cache_path.exists() and not ignore_cache:
