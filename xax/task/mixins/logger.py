@@ -52,7 +52,7 @@ def get_env_var(name: str, default: bool) -> bool:
     return os.environ[name].strip() == "1"
 
 
-class LoggerMixin(ArtifactsMixin[Config], Generic[Config]):
+class LoggerMixin[Config](ArtifactsMixin[Config]):
     logger: Logger
 
     def __init__(self, config: Config) -> None:

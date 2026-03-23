@@ -109,7 +109,7 @@ class TrainConfig(
 Config = TypeVar("Config", bound=TrainConfig)
 
 
-class TrainMixin(
+class TrainMixin[Config, InitParamsT](
     ParallelMixin[Config],
     CheckpointingMixin[Config],
     DataloadersMixin[Config],
@@ -117,7 +117,6 @@ class TrainMixin(
     StepContextMixin[Config],
     ArtifactsMixin[Config],
     RunnableMixin[Config],
-    Generic[Config, InitParamsT],
     ABC,
 ):
     state_timer: StateTimer

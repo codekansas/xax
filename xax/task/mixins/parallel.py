@@ -27,7 +27,7 @@ class ParallelConfig(BaseConfig):
 Config = TypeVar("Config", bound=ParallelConfig)
 
 
-class ParallelMixin(BaseTask[Config], Generic[Config], ABC):
+class ParallelMixin[Config](BaseTask[Config]):
     def __init__(self, config: Config) -> None:
         super().__init__(config)
 

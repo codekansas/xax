@@ -25,7 +25,7 @@ class ProcessConfig(BaseConfig):
 Config = TypeVar("Config", bound=ProcessConfig)
 
 
-class ProcessMixin(BaseTask[Config], Generic[Config]):
+class ProcessMixin[Config](BaseTask[Config]):
     """Defines a base trainer mixin for handling monitoring processes."""
 
     _mp_ctx: BaseContext | None

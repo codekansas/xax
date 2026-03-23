@@ -11,7 +11,6 @@ from abc import ABC
 from dataclasses import dataclass
 from threading import Thread
 from typing import (
-    Generic,
     Iterator,
     Sequence,
     TypeVar,
@@ -51,11 +50,7 @@ class SupervisedConfig(TrainConfig):
 Config = TypeVar("Config", bound=SupervisedConfig)
 
 
-class SupervisedMixin(
-    TrainMixin[Config, InitParams],
-    Generic[Config],
-    ABC,
-):
+class SupervisedMixin[Config](TrainMixin[Config, InitParams], ABC):
     def compute_loss(
         self,
         model: PyTree,

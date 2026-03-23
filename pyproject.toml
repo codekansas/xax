@@ -131,7 +131,7 @@ profile = "black"
 [tool.ruff]
 
 line-length = 120
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
 

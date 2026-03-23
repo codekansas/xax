@@ -226,7 +226,7 @@ class CPUStatsMonitor:
         self._cpu_stats = None
 
 
-class CPUStatsMixin(ProcessMixin[Config], LoggerMixin[Config], Generic[Config]):
+class CPUStatsMixin[Config](ProcessMixin[Config], LoggerMixin[Config]):
     """Defines a task mixin for getting CPU statistics."""
 
     _cpu_stats_monitor: CPUStatsMonitor | None

@@ -58,7 +58,7 @@ ConfigT = TypeVar("ConfigT", bound=Config)
 InitParamsT = TypeVar("InitParamsT", bound=InitParams)
 
 
-class Task(
+class Task[ConfigT, InitParamsT](
     TrainMixin[ConfigT, InitParamsT],
     CheckpointingMixin[ConfigT],
     CompileMixin[ConfigT],
@@ -71,7 +71,6 @@ class Task(
     ArtifactsMixin[ConfigT],
     RunnableMixin[ConfigT],
     BaseTask[ConfigT],
-    Generic[ConfigT, InitParamsT],
 ):
     pass
 
@@ -88,9 +87,8 @@ class SupervisedConfig(
 SupervisedConfigT = TypeVar("SupervisedConfigT", bound=SupervisedConfig)
 
 
-class SupervisedTask(
+class SupervisedTask[SupervisedConfigT](
     BaseSupervisedMixin[SupervisedConfigT],
     Task[SupervisedConfigT, InitParams],
-    Generic[SupervisedConfigT],
 ):
     pass

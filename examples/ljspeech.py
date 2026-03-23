@@ -370,7 +370,7 @@ class Config(xax.SupervisedConfig):
     warmup_steps: int = xax.field(100, help="Number of warmup steps")
     length_percentile: float = xax.field(0.95, help="Percentile to use for padding lengths")
     text_source: str = xax.field(
-        "normalized",
+        "raw",
         help=(
             "Which LJSpeech text field to use for conditioning. "
             "`normalized` matches keithito/lj_speech normalized_text. "
@@ -1101,11 +1101,11 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
 
     @override
     def get_dataset(self) -> Dataset:
-        return cast(Dataset, self.load_dataset("train"))
+        return cast(Dataset, self.load_dataset("train_dataset"))
 
-    @xax.dataset_fn("train", dependencies=["unpadded"], use_hash=False)
+    @Config.dataset_fn(dependencies=["unpadded_dataset"])
     def train_dataset(self) -> Dataset:
-        ds = cast(Dataset, self.load_dataset("unpadded"))
+        ds = cast(Dataset, self.load_dataset("unpadded_dataset"))
 
         code_lengths = np.array([len(c) for c in ds["codes"]])
         audio_lengths = np.array([len(c) for c in ds["audio_codes"]])
@@ -1149,9 +1149,9 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
         ds = cast(Dataset, ds.map(pad_sample, desc="Padding"))
         return ds
 
-    @xax.dataset_fn("unpadded", dependencies=["tokenized"], use_hash=False)
+    @Config.dataset_fn(dependencies=["tokenized_dataset"], hash_fn=lambda cfg: cfg.text_source)
     def unpadded_dataset(self) -> Dataset:
-        ds = cast(Dataset, self.load_dataset("tokenized"))
+        ds = cast(Dataset, self.load_dataset("tokenized_dataset"))
 
         def prepare_sample_with_text(example: dict, text: str) -> dict:
             text_tokens = np.asarray(self.tokenizer.encode(text), dtype=np.int32)
@@ -1193,7 +1193,7 @@ class LJSpeechTTS(xax.SupervisedTask[Config]):
             result = result.remove_columns(cols_to_remove)
         return cast(Dataset, result)
 
-    @xax.dataset_fn("tokenized", use_hash=False)
+    @Config.dataset_fn()
     def tokenized_dataset(self) -> Dataset:
         columns = ["text_norm", "text_raw", "audio_codes"]
 

@@ -84,7 +84,7 @@ class CompileConfig(BaseConfig):
 Config = TypeVar("Config", bound=CompileConfig)
 
 
-class CompileMixin(BaseTask[Config], Generic[Config]):
+class CompileMixin[Config](BaseTask[Config]):
     """Defines a task mixin for controlling JAX compilation behavior."""
 
     def __init__(self, config: Config) -> None:
