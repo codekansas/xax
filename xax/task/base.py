@@ -14,7 +14,7 @@ import sys
 from dataclasses import dataclass, is_dataclass
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Generic, Self, Sequence, TypeVar, cast
+from typing import Any, Self, Sequence, TypeVar, cast
 
 import jax
 
@@ -124,7 +124,7 @@ def _missing_field_paths(value: object, prefix: str = "") -> list[str]:
     return []
 
 
-class BaseTask(Generic[Config]):
+class BaseTask[Config]:
     config: Config
 
     def __init__(self, config: Config) -> None:

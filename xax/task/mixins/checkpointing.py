@@ -168,7 +168,7 @@ def load_ckpt(
             raise ValueError(f"Invalid checkpoint part: {part}")
 
 
-class CheckpointingMixin(ArtifactsMixin[Config], Generic[Config]):
+class CheckpointingMixin[Config](ArtifactsMixin[Config]):
     def __init__(self, config: Config) -> None:
         super().__init__(config)
 

@@ -1,7 +1,7 @@
 """Composes various mixins into a single script interface."""
 
 from dataclasses import dataclass
-from typing import Generic, TypeVar
+from typing import TypeVar
 
 import jax
 
@@ -39,7 +39,7 @@ class ScriptConfig(
 ConfigT = TypeVar("ConfigT", bound=ScriptConfig)
 
 
-class Script(
+class Script[ConfigT](
     CPUStatsMixin[ConfigT],
     GPUStatsMixin[ConfigT],
     ProcessMixin[ConfigT],
@@ -47,6 +47,5 @@ class Script(
     ArtifactsMixin[ConfigT],
     RunnableMixin[ConfigT],
     BaseTask[ConfigT],
-    Generic[ConfigT],
 ):
     pass

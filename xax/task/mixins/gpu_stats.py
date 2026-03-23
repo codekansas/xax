@@ -285,7 +285,7 @@ class GPUStatsMonitor:
         self._proc = None
 
 
-class GPUStatsMixin(ProcessMixin[Config], LoggerMixin[Config], Generic[Config]):
+class GPUStatsMixin[Config](ProcessMixin[Config], LoggerMixin[Config]):
     """Defines a task mixin for getting GPU statistics."""
 
     _gpu_stats_monitor: GPUStatsMonitor | None

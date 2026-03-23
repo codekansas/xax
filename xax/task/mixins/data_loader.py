@@ -11,7 +11,7 @@ from graphlib import TopologicalSorter
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Event, Thread
-from typing import Any, Callable, Collection, Generic, Iterator, TypeVar
+from typing import Any, Callable, Collection, Hashable, Iterator, TypeVar, cast
 
 import jax
 import jax.numpy as jnp
@@ -51,22 +51,34 @@ def fix_object_dtype(x: Any) -> Any:  # noqa: ANN401
         )
     return x
 
+def _hash_hashable(value: Hashable) -> str:
+    """Convert a hashable object into a fixed-size digest contribution."""
+    return hashlib.sha256(str(hash(value)).encode()).hexdigest()[:16]
 
-def _hash_function(fn: Callable) -> str:
-    """Generate a hash from a function's source code."""
-    try:
-        source = inspect.getsource(fn)
-    except (OSError, TypeError):
-        # Fallback if source is not available
-        source = getattr(fn, "__name__", fn.__class__.__name__)
-    return hashlib.sha256(source.encode()).hexdigest()[:16]
+
+class _DatasetFunctionDecorator:
+    def __init__(
+        self,
+        dependencies: Collection[str],
+        hash_fn: Callable[[object], Hashable] | None = None,
+    ) -> None:
+        self.dependencies = frozenset(dependencies)
+        self.hash_fn = hash_fn
+
+    def __call__[F: Callable[..., object]](self, fn: F) -> F:
+        # Store metadata on the function for registration during __init__
+        fn._dataset_fn_metadata = {  # type: ignore[attr-defined]
+            "dependencies": self.dependencies,
+            "hash_fn": self.hash_fn,
+        }
+        return fn
 
 
 @dataclass(frozen=True)
 class DatasetFunction:
     dataset_fn: Callable[[], DatasetType]
     dependencies: frozenset[str]
-    manual_hash: str | None
+    hash_fn: Callable[[object], Hashable] | None = None
 
 
 @jax.tree_util.register_dataclass
@@ -79,6 +91,19 @@ class DataloadersConfig(ProcessConfig, BaseConfig):
     dataset_workers: int = field(-1, help="Number of workers for loading training samples")
     shuffle_seed: int = field(1337, help="Seed for the shuffle")
     debug_dataloader: bool = field(False, help="Debug dataloaders")
+
+    @classmethod
+    def dataset_fn[ConfigT: "DataloadersConfig"](
+        cls: type[ConfigT],
+        *,
+        dependencies: Collection[str] = (),
+        hash_fn: Callable[[ConfigT], Hashable] | None = None,
+    ) -> _DatasetFunctionDecorator:
+        del cls
+        return _DatasetFunctionDecorator(
+            dependencies=dependencies,
+            hash_fn=cast(Callable[[object], Hashable] | None, hash_fn),
+        )
 
 
 Config = TypeVar("Config", bound=DataloadersConfig)
@@ -399,7 +424,7 @@ def load_dataset_in_memory(
     return batched_data
 
 
-class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], ABC):
+class DataloadersMixin[Config](ProcessMixin[Config], BaseTask[Config], ABC):
     def __init__(self, config: Config) -> None:
         super().__init__(config)
 
@@ -413,9 +438,13 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
         )
 
     @property
+    def dataloaders_config(self) -> DataloadersConfig:
+        return cast(DataloadersConfig, self.config)
+
+    @property
     def batch_size(self) -> int:
-        if self.config.batch_size is not None:
-            return self.config.batch_size
+        if self.dataloaders_config.batch_size is not None:
+            return self.dataloaders_config.batch_size
         return self.get_batch_size()
 
     @abstractmethod
@@ -433,17 +462,17 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
 
         ds_fn = self.dataset_functions[name]
 
-        # Use manual hash if provided
-        if ds_fn.manual_hash is not None:
-            return ds_fn.manual_hash
-
-        # Hash the function source
-        fn_hash = _hash_function(ds_fn.dataset_fn)
-
         # Include dependency hashes
         dep_hashes = sorted(self.get_dataset_hash(dep) for dep in ds_fn.dependencies)
-        combined = fn_hash + "".join(dep_hashes)
 
+        base_hash = DEFAULT_HASH
+        if ds_fn.hash_fn is not None:
+            base_hash = _hash_hashable(ds_fn.hash_fn(self.dataloaders_config))
+
+        if not dep_hashes:
+            return base_hash
+
+        combined = base_hash + "".join(dep_hashes)
         return hashlib.sha256(combined.encode()).hexdigest()[:16]
 
     def _get_dataset_path(self, name: str, hash_val: str) -> Path:
@@ -453,7 +482,6 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
     def load_dataset(
         self,
         name: str,
-        hash_val: str | None = None,
         generate: bool = False,
         process_dependencies: bool = True,
         ignore_cache: bool = False,
@@ -462,9 +490,6 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
 
         Args:
             name: Name of the dataset to load.
-            hash_val: A specific hash to load. If this is specified, we just check
-                if the hashed path exists, and throw an error if it doesn't
-                (since we don't know what the hash corresponds to).
             generate: If set, we generate the dataset; otherwise, we show the
                 user a warning telling them to pre-generate the dataset before
                 running training.
@@ -475,14 +500,6 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
         Returns:
             The loaded dataset.
         """
-        if hash_val is not None:
-            # Load specific hash - must exist
-            cache_path = self._get_dataset_path(name, hash_val)
-            if not cache_path.exists():
-                raise FileNotFoundError(f"Dataset '{name}' with hash '{hash_val}' not found at {cache_path}")
-            logger.info("Loading cached dataset '%s' from %s", name, cache_path)
-            return load_from_disk(str(cache_path))
-
         # Check if dataset function is registered
         if name not in self.dataset_functions:
             raise ValueError(f"Dataset '{name}' is not registered. Available: {list(self.dataset_functions.keys())}")
@@ -610,8 +627,8 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
             ds=ds,
             batch_size=self.batch_size,
             sharding=sharding,
-            prefetch_size=self.config.prefetch_buffer_size,
-            seed=self.config.shuffle_seed,
+            prefetch_size=self.dataloaders_config.prefetch_buffer_size,
+            seed=self.dataloaders_config.shuffle_seed,
             data_dtype=data_dtype,
         )
 
@@ -657,13 +674,11 @@ class DataloadersMixin(ProcessMixin[Config], BaseTask[Config], Generic[Config], 
 
         return InMemoryBatchIterator(batched_data=batched_data, key=key)
 
-
-def dataset_fn(
-    name: str,
+def dataset_fn[Config](
+    *,
     dependencies: Collection[str] = (),
-    hash: str | None = None,
-    use_hash: bool = True,
-) -> Callable[[Callable[..., DatasetType]], Callable[..., DatasetType]]:
+    hash_fn: Callable[[Config], Hashable] | None = None,
+) -> _DatasetFunctionDecorator:
     """Decorator for registering a function for generating a dataset.
 
     We check that the decorated function return type matches the DatasetType
@@ -673,37 +688,22 @@ def dataset_fn(
     to make sure we don't have a circular dependency.
 
     Args:
-        name: Name of the dataset.
         dependencies: Dependency datasets for this dataset. If a dataset has
             dependencies, we will first refresh their caches before we generate
             the current dataset. If the caches for any of the dependencies are
             invalidated, then we invalidate the cache for this dataset too.
-        hash: Manual hash to use for the dataset. If not provided, we hash the
-            function code when building the cached dataset path. This is useful
-            if you want to generate a few different versions of datasets with
-            known names.
-        use_hash: If true, we will invalidate the cache if we don't have a
-            hashed version. This is simply shorthand for setting `hash` to
-            a default string.
+        hash_fn: Function to generate a unique hash value from the current
+            config. If provided, this value becomes the dataset cache key
+            contribution. Otherwise, the dataset uses a fixed default hash
+            contribution.
 
     Returns:
         A decorator that registers the function as a dataset function.
     """
-    deps_set = frozenset(dependencies)
-
-    if not use_hash:
-        hash = DEFAULT_HASH
-
-    def decorator(fn: Callable[..., DatasetType]) -> Callable[..., DatasetType]:
-        # Store metadata on the function for registration during __init__
-        fn._dataset_fn_metadata = {  # type: ignore[attr-defined]
-            "name": name,
-            "dependencies": deps_set,
-            "manual_hash": hash,
-        }
-        return fn
-
-    return decorator
+    return _DatasetFunctionDecorator(
+        dependencies=dependencies,
+        hash_fn=cast(Callable[[object], Hashable] | None, hash_fn),
+    )
 
 
 def _register_dataset_functions(instance: "DataloadersMixin") -> None:
@@ -726,7 +726,7 @@ def _register_dataset_functions(instance: "DataloadersMixin") -> None:
         # Use static lookup to find decorated methods without triggering
         # descriptors such as cached_property during task initialization.
         attr = getattr(instance, attr_name)
-        ds_name = metadata["name"]
+        ds_name = attr_name
 
         if ds_name in instance.dataset_functions:
             raise ValueError(f"Duplicate dataset function name: '{ds_name}'")
@@ -734,5 +734,5 @@ def _register_dataset_functions(instance: "DataloadersMixin") -> None:
         instance.dataset_functions[ds_name] = DatasetFunction(
             dataset_fn=attr,
             dependencies=metadata["dependencies"],
-            manual_hash=metadata["manual_hash"],
+            hash_fn=metadata["hash_fn"],
         )
